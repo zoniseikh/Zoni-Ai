@@ -1,0 +1,94 @@
+@import "tailwindcss";
+
+@layer base {
+  html,
+  body {
+    background-color: #020617;
+    color: #ecfeff;
+    font-family: 'Hind Siliguri', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    overscroll-behavior-y: none;
+    -webkit-tap-highlight-color: transparent;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  button,
+  a,
+  input {
+    touch-action: manipulation;
+  }
+}
+
+.font-sci-fi {
+  font-family: 'Orbitron', 'Rajdhani', system-ui, sans-serif;
+}
+
+.font-hud {
+  font-family: 'Rajdhani', 'Hind Siliguri', system-ui, sans-serif;
+}
+
+.hud-grid {
+  background-image:
+    linear-gradient(to right, rgba(6, 182, 212, 0.09) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(6, 182, 212, 0.09) 1px, transparent 1px);
+  background-size: 36px 36px;
+}
+
+.hud-scanline {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    rgba(6, 182, 212, 0.025) 0px,
+    rgba(6, 182, 212, 0.025) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+}
+
+@keyframes zoni-spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes zoni-spin-reverse {
+  from {
+    transform: rotate(360deg);
+  }
+  to {
+    transform: rotate(0deg);
+  }
+}
+
+.animate-spin-slow {
+  animation: zoni-spin-slow 26s linear infinite;
+}
+
+.animate-spin-reverse-slow {
+  animation: zoni-spin-reverse 20s linear infinite;
+}
+
+.animate-spin-medium {
+  animation: zoni-spin-slow 13s linear infinite;
+}
+
+/* Custom sleek dark scrollbars for Android WebView & desktop */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(2, 6, 23, 0.7);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(6, 182, 212, 0.35);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(236, 72, 153, 0.55);
+}

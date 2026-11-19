@@ -1,0 +1,6 @@
+{
+  "name": "Zoni AI — Jarvis Android Assistant",
+  "description": "Full Android & WebAPK Jarvis-style AI companion and mobile voice assistant by Zoni Seikh with Gemini Live duplex voice, native Android hardware controls (flashlight, calls, SMS, WhatsApp, floating orb, accessibility), and Bengali/Hindi/English support.",
+  "requestFramePermissions": ["microphone", "geolocation", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

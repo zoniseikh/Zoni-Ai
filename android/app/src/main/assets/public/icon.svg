@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bgGrad" cx="50%" cy="50%" r="70%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </radialGradient>
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="50%" stop-color="#ec4899"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+    <radialGradient id="coreGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ec4899" stop-opacity="0.45"/>
+      <stop offset="60%" stop-color="#06b6d4" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#020617" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)"/>
+  <circle cx="256" cy="256" r="210" fill="url(#coreGlow)"/>
+  <circle cx="256" cy="256" r="196" fill="none" stroke="#06b6d4" stroke-opacity="0.35" stroke-width="4"/>
+  <circle cx="256" cy="256" r="172" fill="none" stroke="url(#ringGrad)" stroke-width="10" stroke-dasharray="28 14"/>
+  <circle cx="256" cy="256" r="138" fill="none" stroke="#ec4899" stroke-opacity="0.65" stroke-width="5"/>
+  <circle cx="256" cy="256" r="112" fill="#082f49" fill-opacity="0.7" stroke="#22d3ee" stroke-width="6"/>
+  <path d="M256 322 C256 322 184 274 184 226 C184 198 206 180 230 180 C244 180 252 188 256 196 C260 188 268 180 282 180 C306 180 328 198 328 226 C328 274 256 322 256 322 Z" fill="url(#ringGrad)"/>
+  <circle cx="256" cy="60" r="6" fill="#22d3ee"/>
+  <circle cx="452" cy="256" r="6" fill="#ec4899"/>
+  <circle cx="256" cy="452" r="6" fill="#22d3ee"/>
+  <circle cx="60" cy="256" r="6" fill="#ec4899"/>
+</svg>
