@@ -15,7 +15,8 @@ class AppLauncher(private val context: Context) {
 
     private val packageManager: PackageManager = context.packageManager
 
-    private val BENGALI_APP_NAME_MAP = mapOf(
+    private val LOCALIZED_APP_NAME_MAP = mapOf(
+        // Bengali aliases
         "ইউটিউব" to "YouTube",
         "হোয়াটসঅ্যাপ" to "WhatsApp",
         "হোয়াটসঅ্যাপ" to "WhatsApp",
@@ -32,7 +33,22 @@ class AppLauncher(private val context: Context) {
         "ঘড়ি" to "Clock",
         "ঘড়ি" to "Clock",
         "মেসেজ" to "Messages",
-        "সেটিংস" to "Settings"
+        "সেটিংস" to "Settings",
+        // Hindi aliases
+        "यूट्यूब" to "YouTube",
+        "व्हाट्सएप" to "WhatsApp",
+        "व्हाट्सऐप" to "WhatsApp",
+        "क्रोम" to "Chrome",
+        "कैमरा" to "Camera",
+        "कैलकुलेटर" to "Calculator",
+        "कैलेंडर" to "Calendar",
+        "गैलरी" to "Gallery",
+        "मैप्स" to "Maps",
+        "जीमेल" to "Gmail",
+        "प्ले स्टोर" to "Play Store",
+        "फेसबुक" to "Facebook",
+        "इंस्टाग्राम" to "Instagram",
+        "सेटिंग्स" to "Settings"
     )
 
     fun launchAppByVoiceQuery(query: String): AppLaunchResult {
@@ -41,8 +57,8 @@ class AppLauncher(private val context: Context) {
             return AppLaunchResult.AppNotFound(trimmed)
         }
 
-        // Translate Bengali query if mapped
-        val resolvedName = BENGALI_APP_NAME_MAP[trimmed.lowercase()] ?: trimmed
+        // Translate Bengali/Hindi query if mapped
+        val resolvedName = LOCALIZED_APP_NAME_MAP[trimmed.lowercase()] ?: trimmed
 
         // Query all installed launcher activities
         val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
@@ -81,6 +97,43 @@ class AppLauncher(private val context: Context) {
         }
 
         return AppLaunchResult.MultipleMatches(trimmed, matchedApps)
+    }
+
+    fun launchAppAsJson(query: String): String {
+        return when (val result = launchAppByVoiceQuery(query)) {
+            is AppLaunchResult.Success -> org.json.JSONObject()
+                .put("status", "success")
+                .put("appLabel", result.appLabel)
+                .put("packageName", result.packageName)
+                .put("message", "Opened ${result.appLabel}.")
+                .toString()
+            is AppLaunchResult.AppNotFound -> org.json.JSONObject()
+                .put("status", "not_found")
+                .put("query", result.query)
+                .put("message", "Could not find an installed app matching \"${result.query}\".")
+                .toString()
+            is AppLaunchResult.MultipleMatches -> {
+                val candidates = org.json.JSONArray()
+                result.matches.take(6).forEach { (label, pkg) ->
+                    candidates.put(
+                        org.json.JSONObject()
+                            .put("label", label)
+                            .put("packageName", pkg)
+                    )
+                }
+                org.json.JSONObject()
+                    .put("status", "multiple_matches")
+                    .put("query", result.query)
+                    .put("candidates", candidates)
+                    .put("message", "Multiple apps match \"${result.query}\". Please specify which one to open.")
+                    .toString()
+            }
+            is AppLaunchResult.LaunchFailed -> org.json.JSONObject()
+                .put("status", "failed")
+                .put("appLabel", result.appLabel)
+                .put("message", result.reason)
+                .toString()
+        }
     }
 
     private fun executeLaunch(label: String, packageName: String): AppLaunchResult {

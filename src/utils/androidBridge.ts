@@ -9,12 +9,34 @@
 export interface NativeAndroidBridge {
   setFlashlight?: (enable: boolean) => boolean;
   placeCall?: (phoneNumber: string) => boolean;
+  callContactDetailedJson?: (queryOrNumber: string) => string;
+  searchContactsJson?: (query: string) => string;
+  getLocalCallHistoryJson?: () => string;
+  clearLocalCallHistory?: () => boolean;
   sendSms?: (phoneNumber: string, message: string) => boolean;
   openWhatsApp?: (phoneNumber: string, message: string) => boolean;
+  prepareWhatsAppContactJson?: (contactOrNumber: string, message: string) => string;
   vibrate?: (durationMs: number) => boolean;
+  openCamera?: () => boolean;
+  adjustVolumeJson?: (action: string) => string;
   getBatteryStatusJson?: () => string;
   launchApp?: (appQuery: string) => boolean;
+  launchAppDetailedJson?: (appQuery: string) => string;
   openSystemSettings?: (target: string) => boolean;
+  requestRuntimePermission?: (permissionKey: string) => boolean;
+  requestScreenCaptureConsent?: () => boolean;
+  isScreenCaptureActive?: () => boolean;
+  captureScreenFrameJson?: () => string;
+  stopScreenCapture?: () => boolean;
+  getVisibleScreenText?: () => string;
+  performAccessibilityAction?: (command: string) => boolean;
+  scrollScreen?: (direction: string) => boolean;
+  enterAccessibleText?: (targetHint: string, text: string) => boolean;
+  getRecentNotificationsJson?: () => string;
+  replyToNotification?: (notificationKey: string, replyText: string) => boolean;
+  getAutoReplyRulesJson?: () => string;
+  saveAutoReplyRulesJson?: (rulesJson: string) => boolean;
+  setAutoReplyEnabled?: (enabled: boolean) => boolean;
   setFloatingOrbEnabled?: (enable: boolean) => boolean;
   isFloatingOrbEnabled?: () => boolean;
   showNotification?: (title: string, body: string) => boolean;
@@ -36,6 +58,7 @@ export interface AndroidDeviceInfo {
   sdkInt: number;
   release: string;
   appVersion: string;
+  packageName?: string;
 }
 
 export interface NativePermissionSnapshot {
@@ -46,10 +69,35 @@ export interface NativePermissionSnapshot {
   sendSms: boolean;
   location: boolean;
   notifications: boolean;
+  bluetooth?: boolean;
   batteryOptimizationIgnored: boolean;
   overlayAllowed: boolean;
   notificationListenerEnabled: boolean;
   accessibilityEnabled: boolean;
+  screenCaptureActive?: boolean;
+}
+
+export interface NativeNotificationItem {
+  key: string;
+  packageName: string;
+  appName: string;
+  title: string;
+  text: string;
+  isWhatsApp: boolean;
+  canReply: boolean;
+  timestampMillis: number;
+}
+
+export interface NativeDetailedActionResponse {
+  status: string;
+  message: string;
+  contactName?: string;
+  phoneNumber?: string;
+  usedDirectCall?: boolean;
+  appLabel?: string;
+  packageName?: string;
+  numbers?: string[];
+  candidates?: Array<{ id?: string; name?: string; label?: string; phone?: string; packageName?: string }>;
 }
 
 declare global {
@@ -115,25 +163,33 @@ export function isRunningOnNativeAndroid(): boolean {
 export const ANDROID_APP_PACKAGES: Record<string, string> = {
   youtube: 'com.google.android.youtube',
   ইউটিউব: 'com.google.android.youtube',
+  यूट्यूब: 'com.google.android.youtube',
   whatsapp: 'com.whatsapp',
   হোয়াটসঅ্যাপ: 'com.whatsapp',
+  व्हाट्सएप: 'com.whatsapp',
   chrome: 'com.android.chrome',
   ক্রোম: 'com.android.chrome',
+  क्रोम: 'com.android.chrome',
   maps: 'com.google.android.apps.maps',
   ম্যাপ: 'com.google.android.apps.maps',
+  मैप्स: 'com.google.android.apps.maps',
   gmail: 'com.google.android.gm',
   জিমেইল: 'com.google.android.gm',
+  जीमेल: 'com.google.android.gm',
   facebook: 'com.facebook.katana',
   ফেসবুক: 'com.facebook.katana',
+  फेसबुक: 'com.facebook.katana',
   instagram: 'com.instagram.android',
   telegram: 'org.telegram.messenger',
   spotify: 'com.spotify.music',
   camera: 'com.android.camera',
   ক্যামেরা: 'com.android.camera',
+  कैमरा: 'com.android.camera',
   clock: 'com.google.android.deskclock',
   calculator: 'com.google.android.calculator',
   settings: 'com.android.settings',
   সেটিংস: 'com.android.settings',
+  सेटिंग्स: 'com.android.settings',
 };
 
 export function resolveAndroidPackageForQuery(appQuery: string): string | null {
@@ -201,6 +257,131 @@ export function toggleNativeFloatingOrb(enable: boolean): boolean {
   if (bridge?.setFloatingOrbEnabled) {
     try {
       return Boolean(bridge.setFloatingOrbEnabled(enable));
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+export function callContactViaNativeBridge(queryOrNumber: string): NativeDetailedActionResponse | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.callContactDetailedJson) return null;
+  try {
+    return JSON.parse(bridge.callContactDetailedJson(queryOrNumber)) as NativeDetailedActionResponse;
+  } catch {
+    return null;
+  }
+}
+
+export function prepareWhatsAppContactViaNativeBridge(
+  contactOrNumber: string,
+  message: string
+): NativeDetailedActionResponse | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.prepareWhatsAppContactJson) return null;
+  try {
+    return JSON.parse(
+      bridge.prepareWhatsAppContactJson(contactOrNumber, message)
+    ) as NativeDetailedActionResponse;
+  } catch {
+    return null;
+  }
+}
+
+export function launchAppDetailedViaNativeBridge(appQuery: string): NativeDetailedActionResponse | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.launchAppDetailedJson) return null;
+  try {
+    return JSON.parse(bridge.launchAppDetailedJson(appQuery)) as NativeDetailedActionResponse;
+  } catch {
+    return null;
+  }
+}
+
+export function getRecentNativeNotifications(): NativeNotificationItem[] {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getRecentNotificationsJson) return [];
+  try {
+    const parsed = JSON.parse(bridge.getRecentNotificationsJson());
+    return Array.isArray(parsed) ? (parsed as NativeNotificationItem[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function replyToNativeNotification(notificationKey: string, replyText: string): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.replyToNotification) return false;
+  try {
+    return Boolean(bridge.replyToNotification(notificationKey, replyText));
+  } catch {
+    return false;
+  }
+}
+
+export function captureNativeScreenSnapshot(): {
+  imageBase64: string;
+  visibleText: string;
+  error?: string;
+} {
+  const bridge = getNativeAndroidBridge();
+  const visibleText = bridge?.getVisibleScreenText ? String(bridge.getVisibleScreenText() || '') : '';
+  let imageBase64 = '';
+  let error: string | undefined;
+
+  if (bridge?.captureScreenFrameJson) {
+    try {
+      const parsed = JSON.parse(bridge.captureScreenFrameJson());
+      if (parsed?.success && parsed.base64Jpeg) {
+        imageBase64 = parsed.base64Jpeg;
+      } else if (parsed?.error) {
+        error = parsed.error;
+      }
+    } catch {
+      error = 'Could not parse native screen capture result.';
+    }
+  }
+
+  return { imageBase64, visibleText, error };
+}
+
+export function adjustNativeVolume(action: 'up' | 'down' | 'mute' | 'unmute' | 'max' | 'status'): {
+  success: boolean;
+  volumePercent?: number;
+  message: string;
+} {
+  const bridge = getNativeAndroidBridge();
+  if (bridge?.adjustVolumeJson) {
+    try {
+      return JSON.parse(bridge.adjustVolumeJson(action));
+    } catch {
+      return { success: false, message: 'Failed to parse native volume response.' };
+    }
+  }
+  return {
+    success: false,
+    message: 'Hardware volume control is available inside the native Android APK.',
+  };
+}
+
+export function openNativeCamera(): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (bridge?.openCamera) {
+    try {
+      return Boolean(bridge.openCamera());
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+export function performNativeAccessibilityCommand(command: string): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (bridge?.performAccessibilityAction) {
+    try {
+      return Boolean(bridge.performAccessibilityAction(command));
     } catch {
       return false;
     }

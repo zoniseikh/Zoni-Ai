@@ -99,4 +99,51 @@ class ZoniEngineUnitTest {
         assertEquals("sim", session.channel)
         assertFalse(session.recordingEnabled)
     }
+
+    @Test
+    fun autoReplyRuleMatcherEnforcesMasterToggleAndFilters() {
+        val rules = listOf(
+            com.zoni.jarvis.assistant.service.AutoReplyRule(
+                id = "r1",
+                enabled = true,
+                keyword = "busy",
+                senderFilter = "rahul",
+                replyText = "I am in a meeting, will call back soon.",
+                whatsappOnly = true
+            )
+        )
+
+        // Master switch OFF -> never triggers
+        assertNull(
+            com.zoni.jarvis.assistant.service.AutoReplyRuleMatcher.findMatchingRule(
+                rules = rules,
+                masterEnabled = false,
+                sender = "Rahul Sharma",
+                messageText = "Are you busy?",
+                isWhatsApp = true
+            )
+        )
+
+        // Non-WhatsApp message with whatsappOnly=true -> skipped
+        assertNull(
+            com.zoni.jarvis.assistant.service.AutoReplyRuleMatcher.findMatchingRule(
+                rules = rules,
+                masterEnabled = true,
+                sender = "Rahul Sharma",
+                messageText = "Are you busy?",
+                isWhatsApp = false
+            )
+        )
+
+        // Exact match when master switch ON -> returns rule
+        val matched = com.zoni.jarvis.assistant.service.AutoReplyRuleMatcher.findMatchingRule(
+            rules = rules,
+            masterEnabled = true,
+            sender = "Rahul Sharma",
+            messageText = "Are you busy right now?",
+            isWhatsApp = true
+        )
+        assertNotNull(matched)
+        assertEquals("r1", matched?.id)
+    }
 }

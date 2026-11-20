@@ -13,6 +13,18 @@ import {
   Terminal,
   CheckCircle2,
   Copy,
+  Camera,
+  Volume2,
+  VolumeX,
+  Monitor,
+  Bell,
+  Sparkles,
+  Plus,
+  Trash2,
+  ArrowUp,
+  ArrowDown,
+  CornerUpLeft,
+  Home,
 } from 'lucide-react';
 import {
   executeCall,
@@ -22,6 +34,22 @@ import {
   triggerVibration,
   getDeviceBattery,
 } from '../utils/mobileAssistant';
+import {
+  getNativeAndroidBridge,
+  captureNativeScreenSnapshot,
+  getRecentNativeNotifications,
+  replyToNativeNotification,
+  adjustNativeVolume,
+  openNativeCamera,
+  performNativeAccessibilityCommand,
+  NativeNotificationItem,
+} from '../utils/androidBridge';
+import {
+  AutoReplyConfig,
+  loadAutoReplyConfig,
+  saveAutoReplyConfig,
+} from '../utils/autoReplyRules';
+import { getApiBaseUrl } from '../utils/apiConfig';
 import { playProceduralSfx } from '../utils/audio';
 
 interface ApkExportModalProps {
@@ -49,6 +77,22 @@ export const ApkExportModal: React.FC<ApkExportModalProps> = ({
   const [batteryInfo, setBatteryInfo] = useState<{ level: number; charging: boolean } | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
 
+  // Extended Native Android Assistant state (Screen Awareness, Notifications, Smart Reply, Auto-Reply Rules)
+  const [actionFeedback, setActionFeedback] = useState<string>('');
+  const [screenAnalysis, setScreenAnalysis] = useState<string>('');
+  const [isAnalyzingScreen, setIsAnalyzingScreen] = useState(false);
+  const [notifications, setNotifications] = useState<NativeNotificationItem[]>([]);
+  const [smartReplies, setSmartReplies] = useState<{
+    key: string;
+    summary: string;
+    options: string[];
+  } | null>(null);
+  const [isGeneratingReply, setIsGeneratingReply] = useState(false);
+  const [autoReplyConfig, setAutoReplyConfig] = useState<AutoReplyConfig>(() => loadAutoReplyConfig());
+  const [newRuleKeyword, setNewRuleKeyword] = useState('');
+  const [newRuleSender, setNewRuleSender] = useState('');
+  const [newRuleReply, setNewRuleReply] = useState('');
+
   useEffect(() => {
     setTestMsg(`Hello ${selectedAffectionName || 'Boss'}, Zoni Assistant is active! ❤️`);
   }, [selectedAffectionName]);
@@ -58,6 +102,8 @@ export const ApkExportModal: React.FC<ApkExportModalProps> = ({
       getDeviceBattery().then((res) => {
         if (res) setBatteryInfo(res);
       });
+      setNotifications(getRecentNativeNotifications());
+      setAutoReplyConfig(loadAutoReplyConfig());
     }
   }, [isOpen]);
 
@@ -91,6 +137,132 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
     setCopiedCode(true);
     if (soundFxEnabled) playProceduralSfx('click');
     setTimeout(() => setCopiedCode(false), 2500);
+  };
+
+  const handleAnalyzeScreen = async () => {
+    if (soundFxEnabled) playProceduralSfx('click');
+    setIsAnalyzingScreen(true);
+    setActionFeedback('');
+    try {
+      const snap = captureNativeScreenSnapshot();
+      const visibleText =
+        snap.visibleText ||
+        (typeof document !== 'undefined' ? document.body?.innerText?.slice(0, 2000) || '' : '');
+      const res = await fetch(`${getApiBaseUrl()}/api/screen/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageBase64: snap.imageBase64,
+          visibleText,
+          affectionName: currentAffection,
+          lang: 'bn-BD',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setScreenAnalysis(data.error || 'Could not analyze screen.');
+      } else {
+        setScreenAnalysis(data.explanation || 'Screen analyzed.');
+      }
+    } catch {
+      setScreenAnalysis('Network error while analyzing screen.');
+    } finally {
+      setIsAnalyzingScreen(false);
+    }
+  };
+
+  const handleRequestScreenConsent = () => {
+    if (soundFxEnabled) playProceduralSfx('click');
+    const bridge = getNativeAndroidBridge();
+    if (bridge?.requestScreenCaptureConsent) {
+      bridge.requestScreenCaptureConsent();
+      setActionFeedback('Requested transparent Android MediaProjection consent.');
+    } else {
+      setActionFeedback('MediaProjection runs inside the native Android APK; web preview analyzes visible DOM text.');
+    }
+  };
+
+  const handleRefreshNotifications = () => {
+    if (soundFxEnabled) playProceduralSfx('click');
+    const list = getRecentNativeNotifications();
+    setNotifications(list);
+    setActionFeedback(
+      list.length > 0
+        ? `Loaded ${list.length} recent Android notifications.`
+        : 'No notifications captured yet. Enable Notification Access inside Android Settings.'
+    );
+  };
+
+  const handleGenerateSmartReply = async (item: NativeNotificationItem) => {
+    if (soundFxEnabled) playProceduralSfx('click');
+    setIsGeneratingReply(true);
+    try {
+      const res = await fetch(`${getApiBaseUrl()}/api/notifications/smart-reply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sender: item.title,
+          message: item.text,
+          appName: item.appName,
+          affectionName: currentAffection,
+          lang: 'bn-BD',
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setSmartReplies({
+          key: item.key,
+          summary: data.summary || '',
+          options: Array.isArray(data.suggestedReplies) ? data.suggestedReplies : [],
+        });
+      } else {
+        setActionFeedback(data.error || 'Failed to generate Smart Replies.');
+      }
+    } catch {
+      setActionFeedback('Network error generating Smart Replies.');
+    } finally {
+      setIsGeneratingReply(false);
+    }
+  };
+
+  const handleSendApprovedReply = (notificationKey: string, replyText: string) => {
+    if (soundFxEnabled) playProceduralSfx('click');
+    const sent = replyToNativeNotification(notificationKey, replyText);
+    setActionFeedback(
+      sent
+        ? 'Approved reply sent via official Android Notification Reply action.'
+        : 'Notification reply action is unavailable or expired.'
+    );
+  };
+
+  const updateAutoReply = (next: AutoReplyConfig) => {
+    setAutoReplyConfig(next);
+    saveAutoReplyConfig(next);
+  };
+
+  const handleAddAutoReplyRule = () => {
+    const replyText = newRuleReply.trim();
+    if (!replyText) return;
+    if (soundFxEnabled) playProceduralSfx('click');
+    const next: AutoReplyConfig = {
+      ...autoReplyConfig,
+      rules: [
+        ...autoReplyConfig.rules,
+        {
+          id: `rule_${Date.now()}`,
+          enabled: true,
+          keyword: newRuleKeyword.trim(),
+          senderFilter: newRuleSender.trim(),
+          replyText,
+          whatsappOnly: true,
+        },
+      ],
+    };
+    updateAutoReply(next);
+    setNewRuleKeyword('');
+    setNewRuleSender('');
+    setNewRuleReply('');
+    setActionFeedback('Auto-reply rule saved.');
   };
 
   return (
@@ -374,6 +546,288 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`}
                   </span>
                 </div>
               </div>
+
+              {actionFeedback && (
+                <div className="p-2.5 rounded-lg bg-cyan-950/60 border border-cyan-500/40 text-xs text-cyan-200 font-hud">
+                  {actionFeedback}
+                </div>
+              )}
+
+              {/* Camera, Volume & Accessibility Controls */}
+              <div className="p-3.5 rounded-xl bg-slate-900/60 border border-cyan-500/25 space-y-2.5">
+                <div className="text-[11px] font-hud font-bold text-cyan-300 uppercase tracking-wider">
+                  Device, Camera, Volume &amp; Accessibility Control
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => {
+                      const ok = openNativeCamera();
+                      setActionFeedback(ok ? 'Opened Android Camera.' : 'Camera intent runs inside native Android APK.');
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-cyan-500/30 text-xs text-cyan-200 flex items-center gap-1.5"
+                  >
+                    <Camera className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>Open Camera</span>
+                  </button>
+                  <button
+                    onClick={() => setActionFeedback(adjustNativeVolume('up').message)}
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-cyan-500/30 text-xs text-cyan-200 flex items-center gap-1"
+                  >
+                    <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Vol +</span>
+                  </button>
+                  <button
+                    onClick={() => setActionFeedback(adjustNativeVolume('down').message)}
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-cyan-500/30 text-xs text-cyan-200 flex items-center gap-1"
+                  >
+                    <Volume2 className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Vol -</span>
+                  </button>
+                  <button
+                    onClick={() => setActionFeedback(adjustNativeVolume('mute').message)}
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-cyan-500/30 text-xs text-cyan-200 flex items-center gap-1"
+                  >
+                    <VolumeX className="w-3.5 h-3.5 text-pink-400" />
+                    <span>Mute</span>
+                  </button>
+                  <button
+                    onClick={() =>
+                      setActionFeedback(
+                        performNativeAccessibilityCommand('scroll_up')
+                          ? 'Scrolled up via Accessibility.'
+                          : 'Enable Zoni Accessibility Service on Android to scroll.'
+                      )
+                    }
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-pink-500/30 text-xs text-pink-200 flex items-center gap-1"
+                  >
+                    <ArrowUp className="w-3.5 h-3.5" />
+                    <span>Scroll Up</span>
+                  </button>
+                  <button
+                    onClick={() =>
+                      setActionFeedback(
+                        performNativeAccessibilityCommand('scroll_down')
+                          ? 'Scrolled down via Accessibility.'
+                          : 'Enable Zoni Accessibility Service on Android to scroll.'
+                      )
+                    }
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-pink-500/30 text-xs text-pink-200 flex items-center gap-1"
+                  >
+                    <ArrowDown className="w-3.5 h-3.5" />
+                    <span>Scroll Down</span>
+                  </button>
+                  <button
+                    onClick={() =>
+                      setActionFeedback(
+                        performNativeAccessibilityCommand('back')
+                          ? 'Triggered Android Back.'
+                          : 'Enable Zoni Accessibility Service on Android.'
+                      )
+                    }
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-pink-500/30 text-xs text-pink-200 flex items-center gap-1"
+                  >
+                    <CornerUpLeft className="w-3.5 h-3.5" />
+                    <span>Back</span>
+                  </button>
+                  <button
+                    onClick={() =>
+                      setActionFeedback(
+                        performNativeAccessibilityCommand('home')
+                          ? 'Navigated to Home.'
+                          : 'Enable Zoni Accessibility Service on Android.'
+                      )
+                    }
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-pink-500/30 text-xs text-pink-200 flex items-center gap-1"
+                  >
+                    <Home className="w-3.5 h-3.5" />
+                    <span>Home</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Screen Awareness (User-Authorized MediaProjection + Gemini Multimodal) */}
+              <div className="p-3.5 rounded-xl bg-slate-900/60 border border-cyan-500/25 space-y-2.5">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="text-xs font-hud font-bold text-cyan-200 flex items-center gap-1.5">
+                    <Monitor className="w-4 h-4 text-cyan-400" />
+                    Screen Awareness (MediaProjection + Gemini)
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleRequestScreenConsent}
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-cyan-500/40 text-[11px] font-hud text-cyan-200"
+                    >
+                      Authorize Screen
+                    </button>
+                    <button
+                      onClick={handleAnalyzeScreen}
+                      disabled={isAnalyzingScreen}
+                      className="px-2.5 py-1 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-[11px] font-hud font-bold text-white"
+                    >
+                      {isAnalyzingScreen ? 'Analyzing...' : 'Explain Screen'}
+                    </button>
+                  </div>
+                </div>
+                {screenAnalysis && (
+                  <p className="text-xs text-slate-200 bg-slate-950/70 p-2.5 rounded-lg border border-cyan-500/20 leading-relaxed">
+                    {screenAnalysis}
+                  </p>
+                )}
+              </div>
+
+              {/* Notification Reader & WhatsApp Smart Reply */}
+              <div className="p-3.5 rounded-xl bg-slate-900/60 border border-emerald-500/25 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-hud font-bold text-emerald-200 flex items-center gap-1.5">
+                    <Bell className="w-4 h-4 text-emerald-400" />
+                    Notifications &amp; Smart Reply
+                  </span>
+                  <button
+                    onClick={handleRefreshNotifications}
+                    className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-emerald-500/40 text-[11px] font-hud text-emerald-200"
+                  >
+                    Read Recent
+                  </button>
+                </div>
+
+                {notifications.length === 0 ? (
+                  <p className="text-[11px] text-slate-400">
+                    Incoming WhatsApp/SMS notifications captured via Notification Access appear here with Gemini Smart Reply options.
+                  </p>
+                ) : (
+                  <div className="space-y-2 max-h-40 overflow-y-auto">
+                    {notifications.slice(0, 5).map((item) => (
+                      <div
+                        key={item.key}
+                        className="p-2.5 rounded-lg bg-slate-950/70 border border-emerald-500/20 space-y-1.5"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-bold text-cyan-200 truncate">
+                            {item.appName} — {item.title}
+                          </span>
+                          <button
+                            onClick={() => handleGenerateSmartReply(item)}
+                            disabled={isGeneratingReply}
+                            className="px-2 py-0.5 rounded bg-pink-600/80 hover:bg-pink-500 text-[10px] font-hud text-white flex items-center gap-1 shrink-0"
+                          >
+                            <Sparkles className="w-3 h-3" />
+                            <span>Smart Reply</span>
+                          </button>
+                        </div>
+                        <p className="text-[11px] text-slate-300">{item.text}</p>
+                        {smartReplies && smartReplies.key === item.key && (
+                          <div className="pt-1 space-y-1">
+                            <p className="text-[11px] text-emerald-300">{smartReplies.summary}</p>
+                            <div className="flex flex-wrap gap-1.5">
+                              {smartReplies.options.map((opt, idx) => (
+                                <button
+                                  key={idx}
+                                  onClick={() => handleSendApprovedReply(item.key, opt)}
+                                  className="px-2 py-1 rounded bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/40 text-[11px] text-emerald-200 text-left"
+                                >
+                                  Send: {opt}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Rule-Based Auto Reply (Explicit User Opt-In Only) */}
+              <div className="p-3.5 rounded-xl bg-slate-900/60 border border-pink-500/25 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <span className="text-xs font-hud font-bold text-pink-200 block">
+                      Rule-Based Auto Reply (WhatsApp / Notification)
+                    </span>
+                    <span className="text-[10px] text-slate-400">
+                      Off by default. Replies via official Android Notification RemoteInput only when enabled.
+                    </span>
+                  </div>
+                  <button
+                    onClick={() =>
+                      updateAutoReply({ ...autoReplyConfig, enabled: !autoReplyConfig.enabled })
+                    }
+                    className={`px-3 py-1 rounded-lg text-[11px] font-hud font-bold border transition-all ${
+                      autoReplyConfig.enabled
+                        ? 'bg-emerald-950/80 border-emerald-400 text-emerald-300'
+                        : 'bg-slate-800 border-slate-600 text-slate-300'
+                    }`}
+                  >
+                    {autoReplyConfig.enabled ? 'AUTO-REPLY ON' : 'AUTO-REPLY OFF'}
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <input
+                    type="text"
+                    value={newRuleKeyword}
+                    onChange={(e) => setNewRuleKeyword(e.target.value)}
+                    placeholder="Keyword (e.g. busy / কোথায়)"
+                    aria-label="Auto-reply keyword"
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-cyan-500/30 text-xs text-cyan-100"
+                  />
+                  <input
+                    type="text"
+                    value={newRuleSender}
+                    onChange={(e) => setNewRuleSender(e.target.value)}
+                    placeholder="Sender filter (optional)"
+                    aria-label="Auto-reply sender filter"
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-cyan-500/30 text-xs text-cyan-100"
+                  />
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      value={newRuleReply}
+                      onChange={(e) => setNewRuleReply(e.target.value)}
+                      placeholder="Auto reply text"
+                      aria-label="Auto-reply response text"
+                      className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-pink-500/30 text-xs text-pink-100"
+                    />
+                    <button
+                      onClick={handleAddAutoReplyRule}
+                      aria-label="Add auto-reply rule"
+                      className="px-2.5 py-1.5 rounded-lg bg-pink-600 hover:bg-pink-500 text-white"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  {autoReplyConfig.rules.map((rule) => (
+                    <div
+                      key={rule.id}
+                      className="flex items-center justify-between gap-2 p-2 rounded-lg bg-slate-950/70 border border-slate-800 text-[11px]"
+                    >
+                      <div className="min-w-0">
+                        <span className="text-cyan-300 font-mono">
+                          {rule.keyword ? `If "${rule.keyword}"` : 'Any message'}
+                          {rule.senderFilter ? ` from ${rule.senderFilter}` : ''}
+                        </span>
+                        <span className="text-slate-400"> → </span>
+                        <span className="text-pink-200">{rule.replyText}</span>
+                      </div>
+                      <button
+                        onClick={() =>
+                          updateAutoReply({
+                            ...autoReplyConfig,
+                            rules: autoReplyConfig.rules.filter((r) => r.id !== rule.id),
+                          })
+                        }
+                        aria-label={`Delete rule ${rule.keyword || rule.id}`}
+                        className="p-1 text-slate-400 hover:text-rose-400 shrink-0"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
 
@@ -388,15 +842,17 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono">
                 {[
                   { name: 'RECORD_AUDIO', desc: 'Gemini লাইভ অডিও রেকর্ডিং' },
-                  { name: 'CALL_PHONE', desc: 'সরাসরি ফোন কল করার পারমিশন' },
+                  { name: 'CALL_PHONE', desc: 'সরাসরি সিম ফোন কল করার পারমিশন' },
                   { name: 'SEND_SMS', desc: 'সরাসরি মেসেজ পাঠানো' },
-                  { name: 'READ_CONTACTS', desc: 'কন্টাক্ট লিস্ট যাচাই' },
-                  { name: 'CAMERA & FLASHLIGHT', desc: 'মোবাইল ফ্ল্যাশলাইট অন/অফ' },
+                  { name: 'READ_CONTACTS', desc: 'কন্টাক্ট লিস্ট যাচাই (SIM ও WhatsApp)' },
+                  { name: 'CAMERA & FLASHLIGHT', desc: 'ক্যামেরা ও মোবাইল ফ্ল্যাশলাইট অন/অফ' },
+                  { name: 'FOREGROUND_SERVICE_MEDIA_PROJECTION', desc: 'ইউজার-অনুমোদিত স্ক্রিন অ্যাওয়ারনেস' },
+                  { name: 'BIND_NOTIFICATION_LISTENER_SERVICE', desc: 'নোটিফিকেশন পড়া ও অফিসিয়াল স্মার্ট রিপ্লাই' },
+                  { name: 'BIND_ACCESSIBILITY_SERVICE', desc: 'স্ক্রল, ব্যাক, ট্যাপ ও ভিজিবল স্ক্রিন রিডিং' },
                   { name: 'SYSTEM_ALERT_WINDOW', desc: 'অন্যান্য অ্যাপের উপর ফ্লোটিং অ্যাসিস্ট্যান্ট' },
                   { name: 'VIBRATE', desc: 'হ্যাপটিক ভাইব্রেশন ফিডব্যাক' },
                   { name: 'POST_NOTIFICATIONS', desc: 'সিস্টেম নোটিফিকেশন অ্যালার্ট' },
-                  { name: 'FOREGROUND_SERVICE', desc: 'ব্যাকগ্রাউন্ড অ্যাসিস্ট্যান্ট রানিং' },
-                  { name: 'WHATSAPP QUERIES', desc: 'হোয়াটসঅ্যাপ ইন্টেন্ট হ্যান্ডলিং' },
+                  { name: 'WHATSAPP QUERIES', desc: 'অফিশিয়াল হোয়াটসঅ্যাপ ইন্টেন্ট হ্যান্ডলিং' },
                 ].map((item, idx) => (
                   <div
                     key={idx}

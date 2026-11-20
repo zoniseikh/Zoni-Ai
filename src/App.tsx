@@ -40,6 +40,17 @@ import {
 } from './utils/permissionManager';
 import { getApiBaseUrl, getLiveWsUrl } from './utils/apiConfig';
 import {
+  callContactViaNativeBridge,
+  prepareWhatsAppContactViaNativeBridge,
+  launchAppDetailedViaNativeBridge,
+  captureNativeScreenSnapshot,
+  getRecentNativeNotifications,
+  adjustNativeVolume,
+  openNativeCamera,
+  performNativeAccessibilityCommand,
+} from './utils/androidBridge';
+import { buildStructuredTaskPlan } from './utils/taskExecutionEngine';
+import {
   WsConnectionStatus,
   buildClientTextPayload,
   extractActionTagFromText,
@@ -1018,7 +1029,137 @@ export default function App() {
         return;
       }
 
-      // 2. Direct execution of detected mobile assistant actions without confirmation popup
+      // 2. Structured personal assistant task orchestration (contact SIM call, WhatsApp draft, screen awareness, notifications, accessibility, volume, camera, apps, flashlight)
+      const taskPlan = buildStructuredTaskPlan(cleanText);
+      if (taskPlan.blockedReason) {
+        const blockedMsg: ChatMessage = {
+          id: `${clientMsgId}-blocked`,
+          role: 'assistant',
+          text: taskPlan.blockedReason,
+          timestamp: new Date(),
+          lang: activeLanguage,
+        };
+        setMessages((prev) => [
+          ...prev,
+          { id: clientMsgId, role: 'user', text: cleanText, timestamp: new Date(), lang: activeLanguage },
+          blockedMsg,
+        ]);
+        setLatestTranscript(taskPlan.blockedReason);
+        return;
+      }
+
+      if (taskPlan.steps.length === 1) {
+        const step = taskPlan.steps[0];
+        const appendDirectTurn = (replyText: string) => {
+          setMessages((prev) => [
+            ...prev,
+            { id: clientMsgId, role: 'user', text: cleanText, timestamp: new Date(), lang: activeLanguage },
+            { id: `${clientMsgId}-reply`, role: 'assistant', text: replyText, timestamp: new Date(), lang: activeLanguage },
+          ]);
+          setLatestTranscript(replyText);
+          setAssistantState('idle');
+        };
+
+        if (step.tool === 'sim_call') {
+          const target = String(step.args.contactQuery || step.args.phoneNumber || step.args.target || '').trim();
+          const nativeRes = callContactViaNativeBridge(target);
+          if (nativeRes) {
+            appendDirectTurn(nativeRes.message);
+            return;
+          }
+        } else if (step.tool === 'whatsapp_prepare') {
+          const contact = String(step.args.contactQuery || step.args.phoneNumber || '').trim();
+          const msgBody = String(step.args.message || '').trim();
+          const nativeRes = prepareWhatsAppContactViaNativeBridge(contact, msgBody);
+          if (nativeRes) {
+            appendDirectTurn(nativeRes.message);
+            return;
+          }
+        } else if (step.tool === 'open_app') {
+          const appQuery = String(step.args.appQuery || '').trim();
+          const nativeRes = launchAppDetailedViaNativeBridge(appQuery);
+          if (nativeRes) {
+            appendDirectTurn(nativeRes.message);
+            return;
+          }
+        } else if (step.tool === 'screen_analyze') {
+          setMessages((prev) => [
+            ...prev,
+            { id: clientMsgId, role: 'user', text: cleanText, timestamp: new Date(), lang: activeLanguage },
+          ]);
+          setAssistantState('thinking');
+          try {
+            const snap = captureNativeScreenSnapshot();
+            const visibleText =
+              snap.visibleText ||
+              (typeof document !== 'undefined' ? document.body?.innerText?.slice(0, 2000) || '' : '');
+            const res = await fetch(`${getApiBaseUrl()}/api/screen/analyze`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                imageBase64: snap.imageBase64,
+                visibleText,
+                question: cleanText,
+                lang: activeLanguage,
+                affectionName: selectedAffectionName,
+              }),
+            });
+            const data = await res.json();
+            const replyText = res.ok
+              ? data.explanation
+              : data.error || 'Could not analyze the current screen.';
+            setMessages((prev) => [
+              ...prev,
+              { id: `${clientMsgId}-screen`, role: 'assistant', text: replyText, timestamp: new Date(), lang: activeLanguage },
+            ]);
+            setLatestTranscript(replyText);
+          } catch {
+            setLatestTranscript('Network error while analyzing the screen.');
+          } finally {
+            setAssistantState('idle');
+          }
+          return;
+        } else if (step.tool === 'notification_read') {
+          const list = getRecentNativeNotifications();
+          const filtered = step.args.whatsappOnly ? list.filter((n) => n.isWhatsApp) : list;
+          const summaryText =
+            filtered.length === 0
+              ? activeLanguage === 'bn-BD'
+                ? `${selectedAffectionName}, এখন কোনো নতুন নোটিফিকেশন নেই অথবা অ্যান্ড্রয়েড Notification Access চালু করা নেই।`
+                : `No recent notifications found, ${selectedAffectionName}. Make sure Notification Access is enabled in Android settings.`
+              : filtered
+                  .slice(0, 4)
+                  .map((n) => `${n.appName} (${n.title}): ${n.text}`)
+                  .join(' | ');
+          appendDirectTurn(summaryText);
+          return;
+        } else if (step.tool === 'accessibility_action') {
+          const cmd = String(step.args.command || '');
+          const ok = performNativeAccessibilityCommand(cmd);
+          appendDirectTurn(
+            ok
+              ? `Accessibility action "${cmd}" completed.`
+              : `Please enable Zoni Accessibility Service in Android settings to perform "${cmd}".`
+          );
+          return;
+        } else if (step.tool === 'camera_open') {
+          const ok = openNativeCamera();
+          appendDirectTurn(
+            ok
+              ? activeLanguage === 'bn-BD'
+                ? `${selectedAffectionName}, ক্যামেরা চালু করা হয়েছে।`
+                : `Opened your Android camera, ${selectedAffectionName}.`
+              : 'Camera launch requires the native Android APK.'
+          );
+          return;
+        } else if (step.tool === 'volume_control') {
+          const volRes = adjustNativeVolume(String(step.args.action || 'status') as any);
+          appendDirectTurn(volRes.message);
+          return;
+        }
+      }
+
+      // Direct execution fallback for web/PWA hardware intents (flashlight, numeric dial, wa.me, battery, settings)
       const detectedIntent = detectAssistantIntent(cleanText);
       if (detectedIntent) {
         if (detectedIntent.type === 'flashlight') {

@@ -156,6 +156,14 @@ class AndroidHardwareController(private val context: Context) {
         return appLauncher.launchAppByVoiceQuery(appQuery) is AppLaunchResult.Success
     }
 
+    fun launchInstalledAppDetailedJson(appQuery: String): String {
+        return appLauncher.launchAppAsJson(appQuery)
+    }
+
+    fun openCamera(): Boolean = deviceActionExecutor.openCamera()
+
+    fun adjustVolume(action: String): String = deviceActionExecutor.adjustVolume(action)
+
     fun openSystemSettings(target: String): Boolean {
         val key = target.trim().lowercase()
         val intent = when {
@@ -168,6 +176,7 @@ class AndroidHardwareController(private val context: Context) {
                 Intent(Settings.ACTION_ACTION_NOTIFICATION_LISTENER_SETTINGS)
             key == "assistant" || key == "default_assistant" -> Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
             key == "battery" -> Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+            key == "location" -> Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
             key == "app_details" -> Intent(
                 Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                 Uri.parse("package:${context.packageName}")

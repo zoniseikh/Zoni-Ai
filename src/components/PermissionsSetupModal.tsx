@@ -7,6 +7,10 @@ import {
   checkAllPermissions,
   PermissionState,
 } from '../utils/permissionManager';
+import {
+  getNativeAndroidBridge,
+  getNativePermissionsSnapshot,
+} from '../utils/androidBridge';
 import { playProceduralSfx } from '../utils/audio';
 import {
   Key,
@@ -37,6 +41,7 @@ import {
   Check,
   Shield,
   HelpCircle,
+  Monitor,
 } from 'lucide-react';
 
 interface PermissionsSetupModalProps {
@@ -128,8 +133,50 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
     }
     return false;
   });
+  const [screenCaptureEnabled, setScreenCaptureEnabled] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('zoni_screen_capture_enabled') === 'true';
+    }
+    return false;
+  });
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Sync live native Android permission statuses when running inside the Android APK
+  useEffect(() => {
+    if (!isOpen) return;
+    const syncNative = () => {
+      const snap = getNativePermissionsSnapshot();
+      if (!snap) return;
+      setExtraPermissions((prev) => ({
+        ...prev,
+        camera: snap.camera,
+        calls: snap.callPhone,
+        contacts: snap.readContacts,
+        sms: snap.sendSms,
+        bluetooth: Boolean(snap.bluetooth),
+      }));
+      setBatteryOptimisationOff(snap.batteryOptimizationIgnored);
+      setDisplayOverApps(snap.overlayAllowed);
+      setNotificationAccess(snap.notificationListenerEnabled);
+      setAccessibilityService(snap.accessibilityEnabled);
+      setScreenCaptureEnabled(Boolean(snap.screenCaptureActive));
+    };
+    syncNative();
+    const handleScreenEvent = (e: Event) => {
+      const active = Boolean((e as CustomEvent)?.detail?.active);
+      setScreenCaptureEnabled(active);
+      localStorage.setItem('zoni_screen_capture_enabled', String(active));
+    };
+    window.addEventListener('zoni:native-permissions-updated', syncNative);
+    window.addEventListener('zoni:screen-capture-changed', handleScreenEvent);
+    window.addEventListener('focus', syncNative);
+    return () => {
+      window.removeEventListener('zoni:native-permissions-updated', syncNative);
+      window.removeEventListener('zoni:screen-capture-changed', handleScreenEvent);
+      window.removeEventListener('focus', syncNative);
+    };
+  }, [isOpen]);
 
   // Persist extra permissions on change
   useEffect(() => {
@@ -229,6 +276,12 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
 
   const handleToggleExtraPerm = (key: string, name: string) => {
     if (soundFxEnabled) playProceduralSfx('click');
+    const bridge = getNativeAndroidBridge();
+    if (bridge?.requestRuntimePermission) {
+      bridge.requestRuntimePermission(key);
+      showToast(`Requested Android ${name} permission.`);
+      return;
+    }
     setExtraPermissions((prev) => {
       const nextVal = !prev[key];
       showToast(`${name} ${nextVal ? 'allowed' : 'disabled'}`);
@@ -239,6 +292,11 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
   const handleAllowAllPermissions = async () => {
     if (soundFxEnabled) playProceduralSfx('boot');
     showToast('Authorizing all permissions for Zoni Ai...');
+
+    const bridge = getNativeAndroidBridge();
+    if (bridge?.requestRuntimePermission) {
+      bridge.requestRuntimePermission('all');
+    }
 
     // 1. Microphone
     const micRes = await requestMicrophoneAccess();
@@ -255,16 +313,18 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
       onLocationInitialized?.(geoRes.coords);
     }
 
-    // 4. Mark all mobile/hardware features as allowed
-    setExtraPermissions({
-      camera: true,
-      calls: true,
-      contacts: true,
-      sms: true,
-      gallery: true,
-      manageCalls: true,
-      bluetooth: true,
-    });
+    // 4. Mark all mobile/hardware features as allowed (in web preview)
+    if (!bridge?.requestRuntimePermission) {
+      setExtraPermissions({
+        camera: true,
+        calls: true,
+        contacts: true,
+        sms: true,
+        gallery: true,
+        manageCalls: true,
+        bluetooth: true,
+      });
+    }
 
     const fresh = await checkAllPermissions();
     onUpdateReport(fresh);
@@ -276,6 +336,12 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
   // --- Step 3 Handlers ---
   const handleToggleBattery = () => {
     if (soundFxEnabled) playProceduralSfx('click');
+    const bridge = getNativeAndroidBridge();
+    if (bridge?.openSystemSettings) {
+      bridge.openSystemSettings('battery');
+      showToast('Opening Android Battery Optimization settings for Zoni Ai.');
+      return;
+    }
     const nextVal = !batteryOptimisationOff;
     setBatteryOptimisationOff(nextVal);
     localStorage.setItem('zoni_battery_unconstrained', String(nextVal));
@@ -288,6 +354,12 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
 
   const handleToggleOverlay = () => {
     if (soundFxEnabled) playProceduralSfx('click');
+    const bridge = getNativeAndroidBridge();
+    if (bridge?.openSystemSettings) {
+      bridge.openSystemSettings('overlay');
+      showToast('Opening Display over other apps settings.');
+      return;
+    }
     const nextVal = !displayOverApps;
     setDisplayOverApps(nextVal);
     localStorage.setItem('zoni_display_over_apps', String(nextVal));
@@ -296,6 +368,12 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
 
   const handleToggleNotifAccess = () => {
     if (soundFxEnabled) playProceduralSfx('click');
+    const bridge = getNativeAndroidBridge();
+    if (bridge?.openSystemSettings) {
+      bridge.openSystemSettings('notifications');
+      showToast('Opening Android Notification Listener settings.');
+      return;
+    }
     const nextVal = !notificationAccess;
     setNotificationAccess(nextVal);
     localStorage.setItem('zoni_notif_access_enabled', String(nextVal));
@@ -304,6 +382,12 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
 
   const handleToggleAccessibility = () => {
     if (soundFxEnabled) playProceduralSfx('click');
+    const bridge = getNativeAndroidBridge();
+    if (bridge?.openSystemSettings) {
+      bridge.openSystemSettings('accessibility');
+      showToast('Opening Android Accessibility settings.');
+      return;
+    }
     const nextVal = !accessibilityService;
     setAccessibilityService(nextVal);
     localStorage.setItem('zoni_accessibility_service_enabled', String(nextVal));
@@ -312,10 +396,36 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
 
   const handleToggleDefaultAssistant = () => {
     if (soundFxEnabled) playProceduralSfx('click');
+    const bridge = getNativeAndroidBridge();
+    if (bridge?.openSystemSettings) {
+      bridge.openSystemSettings('default_assistant');
+      showToast('Opening Android Default Digital Assistant settings.');
+      return;
+    }
     const nextVal = !defaultAssistant;
     setDefaultAssistant(nextVal);
     localStorage.setItem('zoni_default_assistant_enabled', String(nextVal));
     showToast(`Default assistant ${nextVal ? 'assigned to Zoni Ai' : 'disabled'}`);
+  };
+
+  const handleToggleScreenCapture = () => {
+    if (soundFxEnabled) playProceduralSfx('click');
+    const bridge = getNativeAndroidBridge();
+    if (bridge?.requestScreenCaptureConsent && bridge?.stopScreenCapture) {
+      if (screenCaptureEnabled) {
+        bridge.stopScreenCapture();
+        setScreenCaptureEnabled(false);
+        showToast('Screen capture stopped.');
+      } else {
+        bridge.requestScreenCaptureConsent();
+        showToast('Requesting transparent Android MediaProjection screen consent.');
+      }
+      return;
+    }
+    const nextVal = !screenCaptureEnabled;
+    setScreenCaptureEnabled(nextVal);
+    localStorage.setItem('zoni_screen_capture_enabled', String(nextVal));
+    showToast(`Screen awareness consent ${nextVal ? 'ready (native APK MediaProjection)' : 'disabled'}`);
   };
 
   const handleFinish = () => {
@@ -1059,6 +1169,44 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                     ) : (
                       <span className="inline-flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-hud font-bold bg-slate-800 border border-slate-700 text-slate-400">
                         PENDING
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* 6. Screen Awareness (Optional MediaProjection) */}
+                <div
+                  onClick={handleToggleScreenCapture}
+                  role="button"
+                  tabIndex={0}
+                  className={`p-3.5 rounded-xl border transition-all cursor-pointer flex items-center justify-between gap-3 ${
+                    screenCaptureEnabled
+                      ? 'bg-slate-900/60 border-cyan-500/40'
+                      : 'bg-slate-900/40 border-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="p-2.5 rounded-lg bg-cyan-950/60 border border-cyan-400/40 text-cyan-300 shrink-0">
+                      <Monitor className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <span className="font-hud font-bold text-sm text-cyan-100 block">
+                        Screen awareness (MediaProjection)
+                      </span>
+                      <p className="text-xs text-slate-400 mt-0.5">
+                        Optional. Transparently lets Zoni read or explain your current screen only when you ask.
+                      </p>
+                    </div>
+                  </div>
+                  <div>
+                    {screenCaptureEnabled ? (
+                      <span className="inline-flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-hud font-bold bg-emerald-950/80 border border-emerald-500/50 text-emerald-300">
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        ACTIVE
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-hud font-bold bg-slate-800 border border-slate-700 text-slate-400">
+                        OPTIONAL
                       </span>
                     )}
                   </div>

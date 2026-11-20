@@ -8,7 +8,11 @@ import com.zoni.jarvis.assistant.BuildConfig
 import com.zoni.jarvis.assistant.calling.SimCallManager
 import com.zoni.jarvis.assistant.data.SecureKeyManager
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
+import com.zoni.jarvis.assistant.screen.ScreenCaptureManager
+import com.zoni.jarvis.assistant.service.AutoReplyRuleManager
 import com.zoni.jarvis.assistant.service.FloatingOrbService
+import com.zoni.jarvis.assistant.service.ZoniAccessibilityService
+import com.zoni.jarvis.assistant.service.ZoniNotificationListenerService
 import com.zoni.jarvis.assistant.ui.onboarding.OnboardingActivity
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
@@ -16,19 +20,27 @@ import org.json.JSONObject
 /**
  * Typed, allowlisted Android WebView @JavascriptInterface exposed as `window.ZoniAndroidBridge`,
  * connecting the preserved original Zoni AI React dashboard directly to native Android hardware,
- * Contacts, Telecom SIM calling, Room DB history, and system services.
+ * Contacts, Telecom SIM calling, WhatsApp contact drafts, Screen Awareness (MediaProjection + Accessibility),
+ * Notification Listener + RemoteInput replies + Rule-Based Auto Reply, Room DB history, and system services.
  */
 class ZoniWebAppInterface(
     private val context: Context,
     private val hardware: AndroidHardwareController,
     private val simCallManager: SimCallManager = SimCallManager(context),
-    private val keyManager: SecureKeyManager = SecureKeyManager(context)
+    private val keyManager: SecureKeyManager = SecureKeyManager(context),
+    private val autoReplyManager: AutoReplyRuleManager = AutoReplyRuleManager(context),
+    private val onRequestRuntimePermissions: ((Array<String>) -> Unit)? = null,
+    private val onRequestScreenCaptureConsent: (() -> Unit)? = null
 ) {
     @JavascriptInterface
     fun setFlashlight(enable: Boolean): Boolean = hardware.setFlashlight(enable)
 
     @JavascriptInterface
     fun placeCall(phoneNumber: String): Boolean = simCallManager.initiateSimCallAndLog(phoneNumber)
+
+    @JavascriptInterface
+    fun callContactDetailedJson(queryOrNumber: String): String =
+        simCallManager.resolveAndCallContactAsJson(queryOrNumber)
 
     @JavascriptInterface
     fun searchContactsJson(query: String): String = simCallManager.searchContactsAsJson(query)
@@ -51,7 +63,17 @@ class ZoniWebAppInterface(
     fun openWhatsApp(phoneNumber: String, message: String): Boolean = hardware.openWhatsApp(phoneNumber, message)
 
     @JavascriptInterface
+    fun prepareWhatsAppContactJson(contactOrNumber: String, message: String): String =
+        simCallManager.prepareWhatsAppForContactAsJson(contactOrNumber, message)
+
+    @JavascriptInterface
     fun vibrate(durationMs: Long): Boolean = hardware.vibrate(durationMs)
+
+    @JavascriptInterface
+    fun openCamera(): Boolean = hardware.openCamera()
+
+    @JavascriptInterface
+    fun adjustVolumeJson(action: String): String = hardware.adjustVolume(action)
 
     @JavascriptInterface
     fun getBatteryStatusJson(): String {
@@ -66,7 +88,136 @@ class ZoniWebAppInterface(
     fun launchApp(appQuery: String): Boolean = hardware.launchInstalledApp(appQuery)
 
     @JavascriptInterface
+    fun launchAppDetailedJson(appQuery: String): String = hardware.launchInstalledAppDetailedJson(appQuery)
+
+    @JavascriptInterface
     fun openSystemSettings(target: String): Boolean = hardware.openSystemSettings(target)
+
+    @JavascriptInterface
+    fun requestRuntimePermission(permissionKey: String): Boolean {
+        val cb = onRequestRuntimePermissions ?: return false
+        val perms = when (permissionKey.trim().lowercase()) {
+            "microphone", "audio", "record_audio" -> arrayOf(android.Manifest.permission.RECORD_AUDIO)
+            "camera" -> arrayOf(android.Manifest.permission.CAMERA)
+            "calls", "call_phone" -> arrayOf(android.Manifest.permission.CALL_PHONE)
+            "contacts", "read_contacts" -> arrayOf(android.Manifest.permission.READ_CONTACTS)
+            "sms", "send_sms" -> arrayOf(android.Manifest.permission.SEND_SMS)
+            "location" -> arrayOf(
+                android.Manifest.permission.ACCESS_FINE_LOCATION,
+                android.Manifest.permission.ACCESS_COARSE_LOCATION
+            )
+            "notifications", "post_notifications" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                arrayOf(android.Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                emptyArray()
+            }
+            "bluetooth" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT)
+            } else {
+                emptyArray()
+            }
+            "manage_calls", "managecalls" -> arrayOf(
+                android.Manifest.permission.READ_PHONE_STATE,
+                android.Manifest.permission.ANSWER_PHONE_CALLS
+            )
+            "gallery" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                arrayOf(android.Manifest.permission.READ_MEDIA_IMAGES)
+            } else {
+                emptyArray()
+            }
+            "all" -> buildList {
+                add(android.Manifest.permission.RECORD_AUDIO)
+                add(android.Manifest.permission.CAMERA)
+                add(android.Manifest.permission.CALL_PHONE)
+                add(android.Manifest.permission.READ_CONTACTS)
+                add(android.Manifest.permission.SEND_SMS)
+                add(android.Manifest.permission.ACCESS_FINE_LOCATION)
+                add(android.Manifest.permission.READ_PHONE_STATE)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    add(android.Manifest.permission.POST_NOTIFICATIONS)
+                    add(android.Manifest.permission.READ_MEDIA_IMAGES)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    add(android.Manifest.permission.BLUETOOTH_CONNECT)
+                }
+            }.toTypedArray()
+            else -> emptyArray()
+        }
+        if (perms.isEmpty()) return false
+        cb.invoke(perms)
+        return true
+    }
+
+    // --- Screen Awareness (User-Authorized MediaProjection + Accessibility Text) ---
+
+    @JavascriptInterface
+    fun requestScreenCaptureConsent(): Boolean {
+        val cb = onRequestScreenCaptureConsent ?: return false
+        cb.invoke()
+        return true
+    }
+
+    @JavascriptInterface
+    fun isScreenCaptureActive(): Boolean = ScreenCaptureManager.isActive()
+
+    @JavascriptInterface
+    fun captureScreenFrameJson(): String {
+        val res = ScreenCaptureManager.captureSingleFrameBase64(context)
+        return JSONObject()
+            .put("success", res.success)
+            .put("base64Jpeg", res.base64Jpeg)
+            .put("width", res.width)
+            .put("height", res.height)
+            .put("error", res.error)
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun stopScreenCapture(): Boolean {
+        ScreenCaptureManager.stopCapture(context)
+        return true
+    }
+
+    @JavascriptInterface
+    fun getVisibleScreenText(): String = ZoniAccessibilityService.getVisibleScreenText(80)
+
+    // --- Accessibility Actions ---
+
+    @JavascriptInterface
+    fun performAccessibilityAction(command: String): Boolean =
+        ZoniAccessibilityService.performExplicitAction(command)
+
+    @JavascriptInterface
+    fun scrollScreen(direction: String): Boolean =
+        ZoniAccessibilityService.performScroll(direction)
+
+    @JavascriptInterface
+    fun enterAccessibleText(targetHint: String, text: String): Boolean =
+        ZoniAccessibilityService.enterText(targetHint, text)
+
+    // --- Notification Awareness, Official RemoteInput Reply & Rule-Based Auto Reply ---
+
+    @JavascriptInterface
+    fun getRecentNotificationsJson(): String =
+        ZoniNotificationListenerService.getRecentNotificationsJson(15)
+
+    @JavascriptInterface
+    fun replyToNotification(notificationKey: String, replyText: String): Boolean =
+        ZoniNotificationListenerService.sendReply(context, notificationKey, replyText)
+
+    @JavascriptInterface
+    fun getAutoReplyRulesJson(): String = autoReplyManager.getRulesJson()
+
+    @JavascriptInterface
+    fun saveAutoReplyRulesJson(rulesJson: String): Boolean = autoReplyManager.saveRulesJson(rulesJson)
+
+    @JavascriptInterface
+    fun setAutoReplyEnabled(enabled: Boolean): Boolean {
+        autoReplyManager.setMasterEnabled(enabled)
+        return true
+    }
+
+    // --- Onboarding, Backend Config, Floating Orb & System Status ---
 
     @JavascriptInterface
     fun openOnboardingWizard(): Boolean {
@@ -118,10 +269,12 @@ class ZoniWebAppInterface(
             .put("sendSms", snap.sendSms)
             .put("location", snap.location)
             .put("notifications", snap.postNotifications)
+            .put("bluetooth", snap.bluetooth)
             .put("batteryOptimizationIgnored", snap.batteryOptimizationIgnored)
             .put("overlayAllowed", snap.overlayAllowed)
             .put("notificationListenerEnabled", snap.notificationListenerEnabled)
             .put("accessibilityEnabled", snap.accessibilityEnabled)
+            .put("screenCaptureActive", ScreenCaptureManager.isActive())
             .toString()
     }
 

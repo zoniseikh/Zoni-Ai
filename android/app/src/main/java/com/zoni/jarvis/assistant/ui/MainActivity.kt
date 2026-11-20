@@ -2,8 +2,11 @@ package com.zoni.jarvis.assistant.ui
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
@@ -40,6 +43,7 @@ import com.zoni.jarvis.assistant.bridge.ZoniWebAppInterface
 import com.zoni.jarvis.assistant.calling.SimCallManager
 import com.zoni.jarvis.assistant.data.SecureKeyManager
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
+import com.zoni.jarvis.assistant.service.ScreenCaptureService
 import com.zoni.jarvis.assistant.ui.components.AndroidHardwareHubDialog
 import com.zoni.jarvis.assistant.ui.components.ArcReactorView
 import com.zoni.jarvis.assistant.ui.components.ChatTranscriptDialog
@@ -81,6 +85,40 @@ class MainActivity : ComponentActivity() {
         }
         if (granted && !hasBundledReactDashboard()) {
             viewModel.startLiveVoice()
+        }
+    }
+
+    private val multiPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        viewModel.refreshSystemStatus()
+        dashboardWebView?.post {
+            dashboardWebView?.evaluateJavascript(
+                "window.dispatchEvent(new CustomEvent('zoni:native-permissions-updated'));",
+                null
+            )
+        }
+    }
+
+    private val screenCaptureConsentLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == Activity.RESULT_OK && data != null) {
+            ScreenCaptureService.startWithConsent(applicationContext, result.resultCode, data)
+            dashboardWebView?.post {
+                dashboardWebView?.evaluateJavascript(
+                    "window.dispatchEvent(new CustomEvent('zoni:screen-capture-changed', { detail: { active: true } }));",
+                    null
+                )
+            }
+        } else {
+            dashboardWebView?.post {
+                dashboardWebView?.evaluateJavascript(
+                    "window.dispatchEvent(new CustomEvent('zoni:screen-capture-changed', { detail: { active: false } }));",
+                    null
+                )
+            }
         }
     }
 
@@ -162,7 +200,22 @@ class MainActivity : ComponentActivity() {
                                 context = applicationContext,
                                 hardware = hardwareController,
                                 simCallManager = simCallManager,
-                                keyManager = keyManager
+                                keyManager = keyManager,
+                                onRequestRuntimePermissions = { perms ->
+                                    runOnUiThread {
+                                        if (perms.isNotEmpty()) {
+                                            multiPermissionLauncher.launch(perms)
+                                        }
+                                    }
+                                },
+                                onRequestScreenCaptureConsent = {
+                                    runOnUiThread {
+                                        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
+                                        if (mgr != null) {
+                                            screenCaptureConsentLauncher.launch(mgr.createScreenCaptureIntent())
+                                        }
+                                    }
+                                }
                             ),
                             "ZoniAndroidBridge"
                         )

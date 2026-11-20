@@ -159,11 +159,77 @@ class DeviceActionExecutor(private val context: Context) {
         } catch (_: Exception) {}
     }
 
+    fun openCamera(): Boolean {
+        val cameraIntent = Intent(android.provider.MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        return try {
+            context.startActivity(cameraIntent)
+            true
+        } catch (_: Exception) {
+            appLauncher.launchAppByVoiceQuery("Camera") is com.zoni.jarvis.assistant.device.AppLaunchResult.Success
+        }
+    }
+
+    fun adjustVolume(action: String): String {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+            ?: return """{"success":false,"message":"AudioManager unavailable."}"""
+        val stream = android.media.AudioManager.STREAM_MUSIC
+        val normalized = action.trim().lowercase()
+        return try {
+            when (normalized) {
+                "up", "increase", "raise" -> audioManager.adjustStreamVolume(
+                    stream,
+                    android.media.AudioManager.ADJUST_RAISE,
+                    android.media.AudioManager.FLAG_SHOW_UI
+                )
+                "down", "decrease", "lower" -> audioManager.adjustStreamVolume(
+                    stream,
+                    android.media.AudioManager.ADJUST_LOWER,
+                    android.media.AudioManager.FLAG_SHOW_UI
+                )
+                "mute" -> audioManager.adjustStreamVolume(
+                    stream,
+                    android.media.AudioManager.ADJUST_MUTE,
+                    android.media.AudioManager.FLAG_SHOW_UI
+                )
+                "unmute" -> audioManager.adjustStreamVolume(
+                    stream,
+                    android.media.AudioManager.ADJUST_UNMUTE,
+                    android.media.AudioManager.FLAG_SHOW_UI
+                )
+                "max" -> {
+                    val maxVol = audioManager.getStreamMaxVolume(stream)
+                    audioManager.setStreamVolume(stream, maxVol, android.media.AudioManager.FLAG_SHOW_UI)
+                }
+                else -> Unit
+            }
+            val current = audioManager.getStreamVolume(stream)
+            val max = audioManager.getStreamMaxVolume(stream).coerceAtLeast(1)
+            val percent = ((current * 100f) / max).toInt().coerceIn(0, 100)
+            org.json.JSONObject()
+                .put("success", true)
+                .put("action", normalized)
+                .put("volumePercent", percent)
+                .put("message", "Media volume is now $percent%.")
+                .toString()
+        } catch (e: Exception) {
+            org.json.JSONObject()
+                .put("success", false)
+                .put("message", e.message ?: "Unable to adjust device volume.")
+                .toString()
+        }
+    }
+
     fun openSettings(action: String): Boolean {
         val settingsIntent = when (action.lowercase()) {
             "wifi" -> Intent(Settings.ACTION_WIFI_SETTINGS)
             "bluetooth" -> Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
             "display" -> Intent(Settings.ACTION_DISPLAY_SETTINGS)
+            "location" -> Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+            "notifications_app" -> Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+            }
             else -> Intent(Settings.ACTION_SETTINGS)
         }.apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK

@@ -22,8 +22,9 @@
 -keep class com.zoni.jarvis.assistant.domain.** { *; }
 -keep class com.zoni.jarvis.assistant.calling.** { *; }
 
-# Keep Android Services declared in AndroidManifest.xml
+# Keep Android Services & Screen Capture Manager declared in AndroidManifest.xml
 -keep class com.zoni.jarvis.assistant.service.** { *; }
+-keep class com.zoni.jarvis.assistant.screen.** { *; }
 
 # OkHttp / Kotlin coroutines safety
 -dontwarn okhttp3.**

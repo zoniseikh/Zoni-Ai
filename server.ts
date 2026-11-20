@@ -318,7 +318,162 @@ app.get('/api/status', (req: Request, res: Response) => {
     currentTimeIST: `${istLive.time12} (${istLive.time24})`,
     geminiLiveSupported: true,
     simCallingSupported: true,
+    screenAwarenessSupported: true,
+    notificationSmartReplySupported: true,
   });
+});
+
+function mapGeminiError(err: any): { status: number; message: string } {
+  const clean = sanitizeErrorMessage(err);
+  const lower = clean.toLowerCase();
+  if (lower.includes('api_key_invalid') || lower.includes('api key not valid') || lower.includes('permission_denied') || lower.includes('401') || lower.includes('403')) {
+    return { status: 401, message: 'Gemini API key is missing or invalid. Please check your Gemini API key configuration.' };
+  }
+  if (lower.includes('429') || lower.includes('quota') || lower.includes('resource_exhausted') || lower.includes('rate limit')) {
+    return { status: 429, message: 'Gemini API quota or rate limit reached. Please wait a moment and try again.' };
+  }
+  if (lower.includes('enotfound') || lower.includes('econnreset') || lower.includes('etimedout') || lower.includes('fetch failed')) {
+    return { status: 503, message: 'Temporary network issue contacting Gemini AI. Please check internet connectivity.' };
+  }
+  return { status: 500, message: clean || 'Gemini AI request failed.' };
+}
+
+// Multimodal Screen Awareness Endpoint (User-authorized MediaProjection screenshot + visible text)
+app.post('/api/screen/analyze', async (req: Request, res: Response) => {
+  try {
+    const {
+      imageBase64 = '',
+      mimeType = 'image/jpeg',
+      visibleText = '',
+      question = '',
+      lang = 'bn-BD',
+      affectionName = 'Boss',
+    } = req.body || {};
+
+    const cleanImage = typeof imageBase64 === 'string' ? imageBase64.replace(/^data:image\/[a-z+]+;base64,/i, '').trim() : '';
+    const cleanText = typeof visibleText === 'string' ? visibleText.trim().slice(0, 8000) : '';
+    const cleanQuestion = typeof question === 'string' && question.trim()
+      ? question.trim()
+      : lang === 'bn-BD'
+      ? 'বর্তমানে আমার মোবাইলের স্ক্রিনে কী দেখাচ্ছে তা সংক্ষেপে ও পরিষ্কারভাবে বুঝিয়ে বলো।'
+      : lang === 'hi-IN'
+      ? 'अभी मेरे मोबाइल स्क्रीन पर क्या दिख रहा है, इसे संक्षेप और स्पष्ट रूप से समझाओ।'
+      : 'Clearly summarize and explain what is currently on my phone screen.';
+
+    if (!cleanImage && !cleanText) {
+      return res.status(400).json({
+        error: 'Provide either a captured screen image or visible screen text to analyze.',
+      });
+    }
+
+    const ai = getGeminiClient();
+    const langInstruction =
+      lang === 'bn-BD'
+        ? `Respond in clear, warm, natural Bangladeshi Bengali addressing the user as "${affectionName}".`
+        : lang === 'hi-IN'
+        ? `Respond in clear, warm Hindi/Hinglish addressing the user as "${affectionName}".`
+        : `Respond in clear, warm, concise English addressing the user as "${affectionName}".`;
+
+    const parts: any[] = [];
+    if (cleanImage) {
+      parts.push({
+        inlineData: {
+          mimeType: mimeType || 'image/jpeg',
+          data: cleanImage,
+        },
+      });
+    }
+    const promptLines = [
+      `You are Zoni AI helping the user understand their current Android phone screen.`,
+      langInstruction,
+      `Do NOT fabricate anything not visible on screen. Never read or repeat passwords or sensitive tokens if present. Keep the explanation concise and voice-friendly (2–5 short sentences unless the user asked for full reading).`,
+      `User question: ${cleanQuestion}`,
+    ];
+    if (cleanText) {
+      promptLines.push(`Visible UI text extracted via Accessibility:\n${cleanText}`);
+    }
+    parts.push({ text: promptLines.join('\n\n') });
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: { parts },
+    });
+
+    const explanation =
+      response.text?.trim() ||
+      (lang === 'bn-BD'
+        ? `${affectionName}, স্ক্রিনের তথ্য বিশ্লেষণ করা হয়েছে কিন্তু স্পষ্ট কোনো লেখা পাওয়া যায়নি।`
+        : `I checked the screen, ${affectionName}, but could not find readable content.`);
+
+    res.json({ explanation, lang });
+  } catch (err: any) {
+    const mapped = mapGeminiError(err);
+    console.warn('Screen analyze error:', mapped.message);
+    res.status(mapped.status).json({ error: mapped.message });
+  }
+});
+
+// Notification / WhatsApp Smart Reply Suggestions Endpoint (User approves before sending)
+app.post('/api/notifications/smart-reply', async (req: Request, res: Response) => {
+  try {
+    const {
+      sender = 'Unknown',
+      message = '',
+      appName = 'WhatsApp',
+      lang = 'bn-BD',
+      affectionName = 'Boss',
+    } = req.body || {};
+
+    const cleanMessage = typeof message === 'string' ? message.trim().slice(0, 2000) : '';
+    const cleanSender = typeof sender === 'string' ? sender.trim().slice(0, 120) : 'Contact';
+    if (!cleanMessage) {
+      return res.status(400).json({ error: 'Incoming notification message text is required.' });
+    }
+
+    const ai = getGeminiClient();
+    const replyLangLabel =
+      lang === 'bn-BD' ? 'natural Bengali (বাংলা)' : lang === 'hi-IN' ? 'natural Hindi/Hinglish' : 'natural English';
+
+    const prompt = `Incoming ${appName} notification from "${cleanSender}":
+"${cleanMessage}"
+
+Provide:
+1. "summary": A 1-sentence voice-friendly summary in ${replyLangLabel} telling ${affectionName} what ${cleanSender} wrote.
+2. "suggestedReplies": Exactly 3 short, natural, polite reply options (1 sentence each) that ${affectionName} can approve and send back to ${cleanSender}, matching the language/tone of the incoming message.`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            summary: { type: Type.STRING },
+            suggestedReplies: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+            },
+          },
+          required: ['summary', 'suggestedReplies'],
+        },
+      },
+    });
+
+    const parsed = JSON.parse(response.text || '{}');
+    const summary = typeof parsed.summary === 'string' && parsed.summary.trim()
+      ? parsed.summary.trim()
+      : `${cleanSender}: ${cleanMessage}`;
+    const suggestedReplies = Array.isArray(parsed.suggestedReplies)
+      ? parsed.suggestedReplies.map((r: any) => String(r).trim()).filter(Boolean).slice(0, 4)
+      : [];
+
+    res.json({ summary, suggestedReplies, sender: cleanSender, appName });
+  } catch (err: any) {
+    const mapped = mapGeminiError(err);
+    console.warn('Smart reply error:', mapped.message);
+    res.status(mapped.status).json({ error: mapped.message });
+  }
 });
 
 // Structured Allowlisted Task Execution Planner
@@ -438,8 +593,9 @@ app.post('/api/chat', async (req: Request, res: Response) => {
         : `Main hamesha aapke saath hoon ${activeAffectionName} ❤️`);
     res.json({ reply, lang });
   } catch (err: any) {
-    console.error('Chat error:', err);
-    res.status(500).json({ error: err.message || 'Failed to process chat message' });
+    const mapped = mapGeminiError(err);
+    console.error('Chat error:', mapped.message);
+    res.status(mapped.status).json({ error: mapped.message });
   }
 });
 
