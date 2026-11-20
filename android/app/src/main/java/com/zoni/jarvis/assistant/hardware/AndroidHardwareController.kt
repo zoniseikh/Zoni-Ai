@@ -173,7 +173,7 @@ class AndroidHardwareController(private val context: Context) {
             )
             key == "accessibility" -> Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
             key == "notifications" || key == "notification_listener" ->
-                Intent(Settings.ACTION_ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
             key == "assistant" || key == "default_assistant" -> Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
             key == "battery" -> Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
             key == "location" -> Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
