@@ -1,7 +1,6 @@
 package com.zoni.jarvis.assistant
 
 import com.zoni.jarvis.assistant.calling.ActiveSimCallState
-import com.zoni.jarvis.assistant.calling.VoipSessionState
 import com.zoni.jarvis.assistant.db.CallSessionEntity
 import com.zoni.jarvis.assistant.db.UserPreferencesEntity
 import com.zoni.jarvis.assistant.domain.ActionType
@@ -78,29 +77,26 @@ class ZoniEngineUnitTest {
     }
 
     @Test
-    fun telecomAndRoomPrivacyDefaultsAreEnforced() {
+    fun simTelecomAndRoomPrivacyDefaultsAreEnforced() {
         val simState = ActiveSimCallState()
         assertFalse(simState.isActive)
         assertTrue(simState.note.contains("Android OS"))
-
-        val voipState = VoipSessionState()
-        assertEquals("IDLE", voipState.status)
-        assertFalse(voipState.aiDisclosurePlayed)
 
         val prefs = UserPreferencesEntity()
         assertTrue(prefs.callRecordingDefaultOff)
 
         val session = CallSessionEntity(
-            id = "call_1",
-            channel = "ai_voip",
+            id = "sim_1",
+            channel = "sim",
             direction = "outgoing",
             targetName = "Clinic",
             phoneNumber = "+8801712345678",
-            purpose = "Booking",
+            purpose = "Direct Android SIM call",
             language = "bn-BD",
-            state = "prepared",
-            provider = "unconfigured"
+            state = "active",
+            provider = "android_sim_telecom"
         )
+        assertEquals("sim", session.channel)
         assertFalse(session.recordingEnabled)
     }
 }

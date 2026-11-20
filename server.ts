@@ -16,12 +16,6 @@ import {
   isFlashlightOnCommand,
   isFlashlightOffCommand,
 } from './src/utils/mobileAssistant.ts';
-import {
-  HybridCallOrchestrator,
-  SlidingWindowRateLimiter,
-  CallSessionRecord,
-  CallSummaryRecord,
-} from './src/server/callOrchestrator.ts';
 import { buildStructuredTaskPlan } from './src/utils/taskExecutionEngine.ts';
 
 dotenv.config();
@@ -311,65 +305,6 @@ IMPORTANT GUIDELINES FOR SPOKEN VOICE:
 - Never break character: You are Zoni AI, created by Zoni Seikh, his devoted Jarvis-style AI girlfriend & mobile assistant.`;
 };
 
-// Shared Hybrid Call Orchestrator + Rate Limiter + Optional Bearer Auth
-const callRateLimiter = new SlidingWindowRateLimiter(60, 60_000);
-
-async function generateGeminiCallSummary(session: CallSessionRecord): Promise<CallSummaryRecord> {
-  const ai = getGeminiClient();
-  const transcriptText = session.transcript
-    .map((t) => `[${t.speaker.toUpperCase()}] ${t.text}`)
-    .join('\n')
-    .slice(0, 6000);
-
-  const prompt = `Summarize this ${session.channel.toUpperCase()} call session cleanly in 2 concise sentences and list 1-3 follow-up action items.\nTarget: ${session.targetName} (${session.phoneNumber})\nPurpose: ${session.purpose}\nState: ${session.state}\nDuration: ${session.durationSeconds}s\nTranscript:\n${transcriptText || '(No audio transcript captured)'}`;
-
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: prompt,
-    config: {
-      systemInstruction: 'Return strict JSON with keys: summaryText (string), outcome (string), actionItems (array of strings). Be factual and never fabricate actions that did not happen.',
-      responseMimeType: 'application/json',
-    },
-  });
-
-  const parsed = JSON.parse((response.text || '{}').trim());
-  return {
-    sessionId: session.id,
-    summaryText: String(parsed.summaryText || `${session.channel.toUpperCase()} call to ${session.targetName} (${session.state}).`),
-    outcome: String(parsed.outcome || session.state),
-    actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems.map(String) : [],
-    generatedBy: 'gemini-4-hydrogen',
-    createdAtIso: new Date().toISOString(),
-  };
-}
-
-const callOrchestrator = new HybridCallOrchestrator({
-  summaryGenerator: process.env.GEMINI_API_KEY ? generateGeminiCallSummary : undefined,
-});
-
-function checkCallSecurity(req: Request, res: Response): boolean {
-  const clientIp = req.ip || req.socket.remoteAddress || 'local';
-  const rate = callRateLimiter.allow(clientIp);
-  if (!rate.allowed) {
-    res.status(429).json({
-      error: 'Too many requests. Please wait before retrying.',
-      retryAfterMs: rate.retryAfterMs,
-    });
-    return false;
-  }
-
-  const configuredToken = process.env.ZONI_API_AUTH_TOKEN?.trim();
-  if (configuredToken) {
-    const authHeader = req.headers.authorization || '';
-    const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    if (bearer !== configuredToken) {
-      res.status(401).json({ error: 'Unauthorized: valid Bearer token required.' });
-      return false;
-    }
-  }
-  return true;
-}
-
 // API Status
 app.get('/api/status', (req: Request, res: Response) => {
   const istLive = getLiveTimeInfo('Asia/Kolkata');
@@ -382,95 +317,12 @@ app.get('/api/status', (req: Request, res: Response) => {
     defaultTimezone: 'Asia/Kolkata (IST, UTC+05:30)',
     currentTimeIST: `${istLive.time12} (${istLive.time24})`,
     geminiLiveSupported: true,
-    hybridCallingSupported: true,
-    voipProvider: callOrchestrator.getVoipStatus(),
+    simCallingSupported: true,
   });
-});
-
-// Hybrid Calling Orchestration API (/api/calls/*)
-app.post('/api/calls/prepare', (req: Request, res: Response) => {
-  if (!checkCallSecurity(req, res)) return;
-  const result = callOrchestrator.prepareCall(req.body || {});
-  if (!result.ok) {
-    return res.status(result.statusCode).json({ error: result.error });
-  }
-  res.status(201).json({ session: result.session });
-});
-
-app.post('/api/calls/authorize', (req: Request, res: Response) => {
-  if (!checkCallSecurity(req, res)) return;
-  const result = callOrchestrator.authorizeCall(req.body || {});
-  if (!result.ok) {
-    return res.status(result.statusCode).json({ error: result.error });
-  }
-  res.json({ session: result.session });
-});
-
-app.post('/api/calls/start', async (req: Request, res: Response) => {
-  if (!checkCallSecurity(req, res)) return;
-  const callbackBaseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
-  const result = await callOrchestrator.startCall({
-    sessionId: req.body?.sessionId,
-    callbackBaseUrl,
-  });
-  if (!result.ok) {
-    return res.status(result.statusCode).json({
-      error: result.error,
-      errorCode: result.errorCode,
-      missingEnvVars: result.missingEnvVars,
-      session: result.session,
-    });
-  }
-  res.json({ session: result.session, simDialUri: result.simDialUri });
-});
-
-app.post('/api/calls/transfer', async (req: Request, res: Response) => {
-  if (!checkCallSecurity(req, res)) return;
-  const { sessionId, humanNumber } = req.body || {};
-  const result = await callOrchestrator.transferCallToHuman(sessionId, humanNumber);
-  res.status(result.statusCode).json({
-    ok: result.ok,
-    message: result.message,
-    session: result.session,
-  });
-});
-
-app.post('/api/calls/end', async (req: Request, res: Response) => {
-  if (!checkCallSecurity(req, res)) return;
-  const result = await callOrchestrator.endCall(req.body || {});
-  if (!result.ok) {
-    return res.status(result.statusCode).json({ error: result.error });
-  }
-  res.json({ session: result.session });
-});
-
-app.get('/api/calls/history', (req: Request, res: Response) => {
-  if (!checkCallSecurity(req, res)) return;
-  const limit = Number(req.query.limit || 50);
-  res.json({
-    calls: callOrchestrator.getHistory(Number.isFinite(limit) ? limit : 50),
-    voipProvider: callOrchestrator.getVoipStatus(),
-  });
-});
-
-app.delete('/api/calls/history', (req: Request, res: Response) => {
-  if (!checkCallSecurity(req, res)) return;
-  const cleared = callOrchestrator.clearHistory();
-  res.json({ cleared });
-});
-
-app.get('/api/calls/:id/summary', async (req: Request, res: Response) => {
-  if (!checkCallSecurity(req, res)) return;
-  const result = await callOrchestrator.getSummary(req.params.id);
-  if (!result.ok) {
-    return res.status(result.statusCode).json({ error: result.error });
-  }
-  res.json({ summary: result.summary, session: result.session });
 });
 
 // Structured Allowlisted Task Execution Planner
 app.post('/api/tasks/plan', (req: Request, res: Response) => {
-  if (!checkCallSecurity(req, res)) return;
   const input = String(req.body?.input || '').trim();
   if (!input) {
     return res.status(400).json({ error: 'Task input is required.' });

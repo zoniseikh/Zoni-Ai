@@ -5,7 +5,7 @@ import android.content.Intent
 import android.os.Build
 import android.webkit.JavascriptInterface
 import com.zoni.jarvis.assistant.BuildConfig
-import com.zoni.jarvis.assistant.calling.HybridCallOrchestrator
+import com.zoni.jarvis.assistant.calling.SimCallManager
 import com.zoni.jarvis.assistant.data.SecureKeyManager
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
 import com.zoni.jarvis.assistant.service.FloatingOrbService
@@ -16,58 +16,31 @@ import org.json.JSONObject
 /**
  * Typed, allowlisted Android WebView @JavascriptInterface exposed as `window.ZoniAndroidBridge`,
  * connecting the preserved original Zoni AI React dashboard directly to native Android hardware,
- * Contacts, Telecom SIM calling, Core-Telecom VoIP, Room DB history, and system services.
+ * Contacts, Telecom SIM calling, Room DB history, and system services.
  */
 class ZoniWebAppInterface(
     private val context: Context,
     private val hardware: AndroidHardwareController,
-    private val callOrchestrator: HybridCallOrchestrator = HybridCallOrchestrator(context),
+    private val simCallManager: SimCallManager = SimCallManager(context),
     private val keyManager: SecureKeyManager = SecureKeyManager(context)
 ) {
     @JavascriptInterface
     fun setFlashlight(enable: Boolean): Boolean = hardware.setFlashlight(enable)
 
     @JavascriptInterface
-    fun placeCall(phoneNumber: String): Boolean = callOrchestrator.initiateSimCallAndLog(phoneNumber)
+    fun placeCall(phoneNumber: String): Boolean = simCallManager.initiateSimCallAndLog(phoneNumber)
 
     @JavascriptInterface
-    fun searchContactsJson(query: String): String = callOrchestrator.searchContactsAsJson(query)
-
-    @JavascriptInterface
-    fun startVoipTelecomSession(
-        sessionId: String,
-        targetName: String,
-        phoneNumber: String,
-        purpose: String,
-        disclosureScript: String,
-        authorizedByUser: Boolean,
-        aiIdentityDisclosed: Boolean,
-        recordingConsentGranted: Boolean
-    ): Boolean = callOrchestrator.recordConsentAndStartVoip(
-        sessionId = sessionId,
-        targetName = targetName,
-        phoneNumber = phoneNumber,
-        purpose = purpose,
-        disclosureScript = disclosureScript,
-        authorizedByUser = authorizedByUser,
-        aiIdentityDisclosed = aiIdentityDisclosed,
-        recordingConsentGranted = recordingConsentGranted
-    )
-
-    @JavascriptInterface
-    fun endActiveVoipCall(): Boolean {
-        callOrchestrator.endActiveVoipCall()
-        return true
-    }
+    fun searchContactsJson(query: String): String = simCallManager.searchContactsAsJson(query)
 
     @JavascriptInterface
     fun getLocalCallHistoryJson(): String = runBlocking {
-        callOrchestrator.getLocalCallHistoryJson(50)
+        simCallManager.getLocalCallHistoryJson(50)
     }
 
     @JavascriptInterface
     fun clearLocalCallHistory(): Boolean {
-        callOrchestrator.clearLocalCallHistory()
+        simCallManager.clearLocalCallHistory()
         return true
     }
 

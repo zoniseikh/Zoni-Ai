@@ -8,7 +8,7 @@ import androidx.room.PrimaryKey
 @Entity(tableName = "call_sessions")
 data class CallSessionEntity(
     @PrimaryKey val id: String,
-    val channel: String, // "sim" | "ai_voip"
+    val channel: String, // "sim"
     val direction: String, // "outgoing" | "incoming"
     val targetName: String,
     val phoneNumber: String,

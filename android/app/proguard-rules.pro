@@ -18,7 +18,7 @@
 -keep class * extends androidx.room.RoomDatabase
 -keep class com.zoni.jarvis.assistant.db.** { *; }
 
-# Keep domain models & hybrid calling states
+# Keep domain models & Android SIM calling states
 -keep class com.zoni.jarvis.assistant.domain.** { *; }
 -keep class com.zoni.jarvis.assistant.calling.** { *; }
 

@@ -2,8 +2,6 @@ package com.zoni.jarvis.assistant.calling
 
 import android.content.Context
 import com.zoni.jarvis.assistant.db.CallSessionEntity
-import com.zoni.jarvis.assistant.db.CallSummaryEntity
-import com.zoni.jarvis.assistant.db.ConsentRecordEntity
 import com.zoni.jarvis.assistant.db.ZoniDatabase
 import com.zoni.jarvis.assistant.device.ContactCallManager
 import com.zoni.jarvis.assistant.device.ContactCallResolution
@@ -17,15 +15,13 @@ import org.json.JSONObject
 import java.util.UUID
 
 /**
- * Unified Android Hybrid Call Orchestrator:
- * - SIM Calling: delegates to original ContactCallManager (ContactsContract + Telecom/Dialer)
- * - AI VoIP Calling: delegates to ZoniVoipTelecomManager (Android Core-Telecom) + consent records
- * - Persistence: logs every session, consent record, and summary into Room ZoniDatabase
+ * Native Android SIM Call Manager:
+ * - Outgoing SIM calls & contact resolution via ContactCallManager (ContactsContract + Telecom/Dialer)
+ * - Local SIM call session history persisted in Room ZoniDatabase
  */
-class HybridCallOrchestrator(
+class SimCallManager(
     context: Context,
     private val contactCallManager: ContactCallManager = ContactCallManager(context),
-    private val voipTelecomManager: ZoniVoipTelecomManager = ZoniVoipTelecomManager(context),
     private val database: ZoniDatabase = ZoniDatabase.getInstance(context),
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
 ) {
@@ -58,11 +54,21 @@ class HybridCallOrchestrator(
     }
 
     fun initiateSimCallAndLog(targetOrNumber: String, displayName: String = ""): Boolean {
-        val norm = NumberNormalizer.normalizePhoneNumber(targetOrNumber)
+        val raw = targetOrNumber.trim()
+        if (raw.isEmpty()) return false
+
+        val norm = NumberNormalizer.normalizePhoneNumber(raw)
         val numberToDial = when (norm) {
             is NumberNormalizerResult.ValidCandidate -> norm.normalizedNumber
-            else -> targetOrNumber.trim()
+            else -> {
+                when (val resolved = contactCallManager.resolveContact(raw)) {
+                    is ContactCallResolution.ReadyToCall -> resolved.number
+                    is ContactCallResolution.MultipleNumbersForContact -> resolved.numbers.firstOrNull()
+                    else -> null
+                } ?: raw
+            }
         }
+
         val started = contactCallManager.initiateCall(numberToDial)
         if (started) {
             val sessionId = "sim_${UUID.randomUUID().toString().take(12)}"
@@ -86,71 +92,6 @@ class HybridCallOrchestrator(
         return started
     }
 
-    fun recordConsentAndStartVoip(
-        sessionId: String,
-        targetName: String,
-        phoneNumber: String,
-        purpose: String,
-        disclosureScript: String,
-        authorizedByUser: Boolean,
-        aiIdentityDisclosed: Boolean,
-        recordingConsentGranted: Boolean = false
-    ): Boolean {
-        if (!authorizedByUser || !aiIdentityDisclosed) {
-            return false
-        }
-
-        scope.launch {
-            database.consentRecordDao().insertConsent(
-                ConsentRecordEntity(
-                    consentId = "cns_${UUID.randomUUID().toString().take(10)}",
-                    sessionId = sessionId,
-                    authorizedByUser = true,
-                    aiIdentityDisclosed = true,
-                    recordingConsentGranted = recordingConsentGranted,
-                    disclosureScript = disclosureScript
-                )
-            )
-            database.callSessionDao().upsertSession(
-                CallSessionEntity(
-                    id = sessionId,
-                    channel = "ai_voip",
-                    direction = "outgoing",
-                    targetName = targetName,
-                    phoneNumber = phoneNumber,
-                    purpose = purpose,
-                    language = "bn-BD",
-                    state = "active",
-                    provider = "core_telecom_voip",
-                    recordingEnabled = recordingConsentGranted
-                )
-            )
-        }
-
-        voipTelecomManager.startVoipTelecomSession(
-            sessionId = sessionId,
-            displayName = targetName,
-            phoneAddress = phoneNumber,
-            isIncoming = false,
-            disclosureScript = disclosureScript
-        ) {
-            scope.launch {
-                database.callSessionDao().upsertSummary(
-                    CallSummaryEntity(
-                        sessionId = sessionId,
-                        summaryText = "AI VoIP call to $targetName ($phoneNumber) ended.",
-                        outcome = "ENDED"
-                    )
-                )
-            }
-        }
-        return true
-    }
-
-    fun endActiveVoipCall() {
-        voipTelecomManager.endVoipTelecomSession()
-    }
-
     suspend fun getLocalCallHistoryJson(limit: Int = 50): String {
         val sessions = database.callSessionDao().getRecentSessions(limit)
         val arr = JSONArray()
@@ -165,7 +106,6 @@ class HybridCallOrchestrator(
                     .put("purpose", s.purpose)
                     .put("state", s.state)
                     .put("provider", s.provider)
-                    .put("recordingEnabled", s.recordingEnabled)
                     .put("durationSeconds", s.durationSeconds)
                     .put("createdAtMs", s.createdAtMs)
             )
@@ -176,7 +116,6 @@ class HybridCallOrchestrator(
     fun clearLocalCallHistory() {
         scope.launch {
             database.callSessionDao().deleteAllSessions()
-            database.consentRecordDao().clearAll()
         }
     }
 }

@@ -8,17 +8,15 @@
  * Security Invariants:
  * 1. Strict tool allowlist — NEVER executes arbitrary shell commands.
  * 2. WhatsApp honesty — NEVER claims a message was "sent" merely because WhatsApp opened.
- * 3. External AI VoIP calls ALWAYS require explicit user confirmation & AI disclosure.
+ * 3. Outgoing SIM calls require user confirmation and Android Telecom permissions.
  */
 
 import { detectAssistantIntent } from './mobileAssistant.ts';
-import { normalizePhoneNumber } from './numberNormalizer.ts';
 
 export type AllowedTaskTool =
   | 'open_app'
   | 'contact_lookup'
   | 'sim_call'
-  | 'ai_voip_call'
   | 'whatsapp_prepare'
   | 'sms_compose'
   | 'flashlight'
@@ -33,7 +31,6 @@ export const ALLOWED_TASK_TOOLS: ReadonlySet<AllowedTaskTool> = new Set([
   'open_app',
   'contact_lookup',
   'sim_call',
-  'ai_voip_call',
   'whatsapp_prepare',
   'sms_compose',
   'flashlight',
@@ -127,31 +124,7 @@ export function buildStructuredTaskPlan(rawInput: string): TaskPlan {
 }
 
 function parseSingleSegmentToStep(segment: string, stepId: string): TaskStep | null {
-  const lower = segment.toLowerCase();
-
-  // 1. Explicit AI VoIP call request ("AI call ...", "voip call ...", "জনি কল করে বলো ...")
-  const aiCallMatch = segment.match(
-    /(?:ai\s+call|voip\s+call|ai\s+দিয়ে\s+কল|এআই\s+কল)\s+([+0-9০-৯\s-]{7,20}|[\p{L}\w\s]{2,40})(?:\s+(?:for|about|বলো|জন্য)\s+(.+))?/iu
-  );
-  if (aiCallMatch) {
-    const target = aiCallMatch[1].trim();
-    const purpose = (aiCallMatch[2] || 'Assistant outreach').trim();
-    const norm = normalizePhoneNumber(target);
-    return {
-      stepId,
-      tool: 'ai_voip_call',
-      args: {
-        target,
-        normalizedNumber: norm.status === 'valid' && norm.normalizedNumber ? norm.normalizedNumber : '',
-        purpose,
-      },
-      requiredPermissions: ['RECORD_AUDIO', 'INTERNET'],
-      requiresUserConfirmation: true,
-      honestOutcomeNote: 'Requires explicit user authorization, AI disclosure acknowledgment, and configured VoIP provider.',
-    };
-  }
-
-  // 2. Reminder creation ("remind me to ...", "রিমাইন্ডার সেট করো ...")
+  // 1. Reminder creation ("remind me to ...", "রিমাইন্ডার সেট করো ...")
   const reminderMatch = segment.match(/(?:remind\s+me\s+to|set\s+a?\s*reminder\s+(?:for|to)?|রিমাইন্ডার\s*(?:দাও|সেট\s*করো))\s+(.+)/i);
   if (reminderMatch) {
     return {
@@ -287,8 +260,6 @@ export function formatHonestTaskOutcome(tool: AllowedTaskTool, succeeded: boolea
       return 'WhatsApp-এ আপনার মেসেজ ড্রাফট প্রস্তুত করে খুলে দেওয়া হয়েছে। পাঠাতে অনুগ্রহ করে WhatsApp-এ Send চাপুন।';
     case 'sim_call':
       return detail || 'আপনার ফোনের সিম (SIM) ডায়ালারের মাধ্যমে কল শুরু করা হচ্ছে।';
-    case 'ai_voip_call':
-      return detail || 'আপনার অনুমতি নিয়ে AI VoIP কল সেশন শুরু হয়েছে।';
     case 'sms_compose':
       return detail || 'SMS মেসেজ কম্পোজার প্রস্তুত করা হয়েছে।';
     case 'flashlight':

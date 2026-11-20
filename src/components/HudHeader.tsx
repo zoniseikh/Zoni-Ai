@@ -283,19 +283,19 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
         {/* Direct PWA Install Button (renders when installable / iOS) */}
         <PWAInstallButton />
 
-        {/* Hybrid SIM & AI VoIP Calling Hub Button */}
+        {/* Android SIM Calling Hub Button */}
         {onOpenCallingModal && (
           <button
             onClick={() => {
               if (vitals.soundFxEnabled) playProceduralSfx('click');
               onOpenCallingModal();
             }}
-            aria-label="Open Hybrid SIM and AI VoIP Calling Hub"
+            aria-label="Open Android SIM Calling Hub"
             className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg border border-emerald-500/40 bg-emerald-950/40 hover:bg-emerald-900/50 text-emerald-300 text-xs font-hud tracking-wider transition-all shadow-[0_0_10px_rgba(16,185,129,0.2)]"
-            title="Hybrid SIM & AI VoIP Calling Hub"
+            title="Android SIM Calling & Contacts Hub"
           >
             <PhoneCall className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="hidden md:inline">CALL HUB</span>
+            <span className="hidden md:inline">SIM CALL</span>
           </button>
         )}
 

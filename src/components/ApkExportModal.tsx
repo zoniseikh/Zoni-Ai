@@ -201,7 +201,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
                 </div>
                 <p className="text-xs text-slate-300 leading-relaxed">
                   মূল ZONI AI React ড্যাশবোর্ডটি সম্পূর্ণ অক্ষত রেখেই নেটিভ Android শেলের (<code>WebViewAssetLoader</code> +{' '}
-                  <code>ZoniWebAppInterface</code> + Kotlin Telecom/VoIP/Room DB/Camera2/Foreground Service) ভেতরে প্যাকেজ করা হয়েছে।
+                  <code>ZoniWebAppInterface</code> + Kotlin Telecom/SIM/Room DB/Camera2/Foreground Service) ভেতরে প্যাকেজ করা হয়েছে।
                   GitHub-এ পুশ করলে <code>.github/workflows/android-build.yml</code> স্বয়ংক্রিয়ভাবে আসল APK তৈরি করে:
                 </p>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[10px] font-mono">
@@ -236,8 +236,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`}
                 </pre>
                 <div className="text-[11px] text-pink-200 bg-pink-950/35 p-2.5 rounded-lg border border-pink-500/30">
                   💡 <strong>GitHub Actions:</strong> Repository &gt; <strong>Actions</strong> &gt;{' '}
-                  <strong>Build Zoni AI Android APK &amp; AAB</strong> &gt; Artifacts থেকে সরাসরি{' '}
-                  <code>app-debug.apk</code> ডাউনলোড করে অ্যান্ড্রয়েডে ইনস্টল করুন।
+                  <strong>ZONI AI Android APK Build</strong> &gt; Artifacts থেকে সরাসরি{' '}
+                  <code>ZONI-AI-Debug-APK</code> বা <code>ZONI-AI-Release-APK</code> ডাউনলোড করে অ্যান্ড্রয়েডে ইনস্টল করুন।
                 </div>
               </div>
 

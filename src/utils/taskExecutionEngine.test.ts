@@ -6,9 +6,9 @@ import {
   isToolAllowed,
 } from './taskExecutionEngine.ts';
 
-test('isToolAllowed accepts allowlisted tools and rejects arbitrary shell tools', () => {
+test('isToolAllowed accepts allowlisted tools and rejects arbitrary shell and removed VoIP tools', () => {
   assert.equal(isToolAllowed('sim_call'), true);
-  assert.equal(isToolAllowed('ai_voip_call'), true);
+  assert.equal(isToolAllowed('ai_voip_call'), false);
   assert.equal(isToolAllowed('whatsapp_prepare'), true);
   assert.equal(isToolAllowed('exec_shell'), false);
   assert.equal(isToolAllowed('bash'), false);
@@ -30,11 +30,11 @@ test('buildStructuredTaskPlan parses multi-step Bengali & English instructions',
   assert.equal(plan.requiresConfirmation, false);
 });
 
-test('buildStructuredTaskPlan marks AI VoIP calls as requiring confirmation', () => {
-  const plan = buildStructuredTaskPlan('AI call 01712345678 for doctor appointment');
+test('buildStructuredTaskPlan routes voice calls to normal SIM calling with confirmation', () => {
+  const plan = buildStructuredTaskPlan('কল করো 01712345678');
   assert.equal(plan.steps.length, 1);
-  assert.equal(plan.steps[0].tool, 'ai_voip_call');
-  assert.equal(plan.steps[0].args.normalizedNumber, '+8801712345678');
+  assert.equal(plan.steps[0].tool, 'sim_call');
+  assert.equal(plan.steps[0].args.phoneNumber, '01712345678');
   assert.equal(plan.requiresConfirmation, true);
 });
 

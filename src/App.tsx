@@ -7,7 +7,7 @@ import { ChatTranscriptDrawer } from './components/ChatTranscriptDrawer';
 import { ApkExportModal } from './components/ApkExportModal';
 import { PermissionsSetupModal } from './components/PermissionsSetupModal';
 import { ZoniSettingsModal } from './components/ZoniSettingsModal';
-import { HybridCallingModal } from './components/HybridCallingModal';
+import { SimCallingModal } from './components/SimCallingModal';
 import { OfflineIndicator } from './components/PWAInstallButton';
 import {
   LiveAudioPlayer,
@@ -1248,8 +1248,8 @@ export default function App() {
       />
 
 
-      {/* Hybrid SIM & AI VoIP Calling Hub Modal */}
-      <HybridCallingModal
+      {/* Native Android SIM Calling Hub Modal */}
+      <SimCallingModal
         isOpen={isCallingModalOpen}
         onClose={() => setIsCallingModalOpen(false)}
         soundFxEnabled={vitals.soundFxEnabled}

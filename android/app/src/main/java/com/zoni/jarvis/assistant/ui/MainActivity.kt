@@ -37,7 +37,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.webkit.WebViewAssetLoader
 import com.zoni.jarvis.assistant.bridge.ZoniWebAppInterface
-import com.zoni.jarvis.assistant.calling.HybridCallOrchestrator
+import com.zoni.jarvis.assistant.calling.SimCallManager
 import com.zoni.jarvis.assistant.data.SecureKeyManager
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
 import com.zoni.jarvis.assistant.ui.components.AndroidHardwareHubDialog
@@ -57,7 +57,7 @@ import com.zoni.jarvis.assistant.ui.theme.ZoniTheme
  * - Preserves the EXACT original Zoni AI React/Vite Sci-Fi JARVIS Dashboard as the primary UI,
  *   packaged inside `assets/public/` and served securely via `WebViewAssetLoader`
  *   (`https://appassets.androidplatform.net/assets/public/index.html`).
- * - Exposes full native Android hardware, Contacts, SIM Telecom, Core-Telecom VoIP,
+ * - Exposes full native Android hardware, Contacts, SIM Telecom calling,
  *   Room DB history, Floating Orb, and Foreground Service through `window.ZoniAndroidBridge`.
  * - Gracefully falls back to the synchronized Jetpack Compose HUD if bundled web assets
  *   are not yet synced during local Kotlin-only testing.
@@ -66,7 +66,7 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels()
     private lateinit var hardwareController: AndroidHardwareController
-    private lateinit var hybridCallOrchestrator: HybridCallOrchestrator
+    private lateinit var simCallManager: SimCallManager
     private lateinit var keyManager: SecureKeyManager
     private var dashboardWebView: WebView? = null
     private var pendingWebPermissionRequest: PermissionRequest? = null
@@ -90,7 +90,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         hardwareController = AndroidHardwareController(applicationContext)
-        hybridCallOrchestrator = HybridCallOrchestrator(applicationContext)
+        simCallManager = SimCallManager(applicationContext)
         keyManager = SecureKeyManager(applicationContext)
 
         // Back button navigates inside the original Zoni React dashboard before exiting
@@ -161,7 +161,7 @@ class MainActivity : ComponentActivity() {
                             ZoniWebAppInterface(
                                 context = applicationContext,
                                 hardware = hardwareController,
-                                callOrchestrator = hybridCallOrchestrator,
+                                simCallManager = simCallManager,
                                 keyManager = keyManager
                             ),
                             "ZoniAndroidBridge"
