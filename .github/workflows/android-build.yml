@@ -24,19 +24,20 @@ jobs:
     timeout-minutes: 40
 
     steps:
-      # 1. Checkout Repository
+
+      # 1. Checkout Original Repository
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       # 2. Setup Node.js 20
-      # IMPORTANT: No npm cache because package-lock.json is absent.
+      # npm cache disabled because package-lock.json is absent
       - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # 3. Install Dependencies and Build Original Dashboard
-      - name: Install Frontend Dependencies & Sync Dashboard
+      # 3. Install Frontend Dependencies
+      - name: Install Frontend Dependencies & Sync Original Dashboard into Android Assets
         run: |
           node --version
           npm --version
@@ -47,7 +48,7 @@ jobs:
           npm run lint
           npm run android:sync
 
-      # 4. Setup Java 17
+      # 4. Setup JDK 17
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
