@@ -1,5 +1,6 @@
 package com.zoni.jarvis.assistant.calling
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.net.Uri
 import android.telecom.DisconnectCause
@@ -52,6 +53,7 @@ class ZoniVoipTelecomManager(
         }
     }
 
+    @SuppressLint("MissingPermission")
     fun startVoipTelecomSession(
         sessionId: String,
         displayName: String,
@@ -92,10 +94,10 @@ class ZoniVoipTelecomManager(
             try {
                 callsManager.addCall(
                     attributes,
-                    onAnswer = {
+                    onAnswer = { _ ->
                         _voipState.value = _voipState.value.copy(status = "ACTIVE", aiDisclosurePlayed = true)
                     },
-                    onDisconnect = {
+                    onDisconnect = { _ ->
                         _voipState.value = _voipState.value.copy(status = "ENDED")
                         if (!endDeferred.isCompleted) endDeferred.complete(DisconnectCause.LOCAL)
                     },

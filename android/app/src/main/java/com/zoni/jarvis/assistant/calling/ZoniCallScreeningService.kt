@@ -43,7 +43,7 @@ class ZoniCallScreeningService : CallScreeningService() {
 
     private fun postIncomingCallNotification(number: String) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        val notif = NotificationCompat.Builder(this, ZoniApplication.CHANNEL_ALERTS)
+        val notif = NotificationCompat.Builder(this, ZoniApplication.CHANNEL_ASSISTANT_ALERTS)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle("Zoni AI — Incoming SIM Call")
             .setContentText("Incoming call from $number")

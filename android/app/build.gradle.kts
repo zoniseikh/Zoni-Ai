@@ -8,6 +8,7 @@ plugins {
 android {
     namespace = "com.zoni.jarvis.assistant"
     compileSdk = 34
+    buildToolsVersion = "34.0.0"
 
     defaultConfig {
         applicationId = "com.zoni.jarvis.assistant"

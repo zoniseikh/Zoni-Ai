@@ -20,20 +20,35 @@ jobs:
   android-build:
     name: Build ZONI AI APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       # 1. Checkout source
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. Java 17
+      # 2. Node.js 20 — preserve & bundle original ZONI AI React dashboard into Android assets
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Frontend Dependencies & Sync Original Dashboard into Android Assets
+        run: |
+          npm ci || npm install
+          npm test
+          npm run lint
+          npm run android:sync
+
+      # 3. Java 17 (compatible with AGP 8.5.2 & Gradle 8.7)
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. Android SDK - fixed configuration
+      # 4. Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
@@ -41,81 +56,94 @@ jobs:
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: false
 
-      # 4. Gradle 8.7
-      - name: Setup Gradle
+      # 5. Configure Gradle cache (uses project's own android/gradlew wrapper)
+      - name: Setup Gradle Cache
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.7'
 
-      # 5. Verify Android SDK
-      - name: Verify Android SDK
+      # 6. Verify Android SDK, Java 17, AndroidX & Gradle Wrapper
+      - name: Verify Build Environment & Gradle Wrapper
         run: |
+          chmod +x android/gradlew
           echo "ANDROID_HOME=$ANDROID_HOME"
-          sdkmanager --list_installed
+          test -f android/gradle.properties
+          grep -q "android.useAndroidX=true" android/gradle.properties
           java -version
-          gradle --version
+          ./android/gradlew -p android --version
 
-      # 6. Build Debug APK
+      # 7. Run Android Unit Tests
+      - name: Run Android Unit Tests
+        run: ./android/gradlew -p android --no-daemon :app:testDebugUnitTest --stacktrace
+
+      # 8. Build Debug APK (never requires signing secrets)
       - name: Build Debug APK
-        run: gradle -p android --no-daemon :app:assembleDebug
+        run: |
+          ./android/gradlew -p android --no-daemon :app:assembleDebug --stacktrace
+          test -f android/app/build/outputs/apk/debug/app-debug.apk
+          ls -lh android/app/build/outputs/apk/debug/app-debug.apk
 
-      # 7. Build Release APK
+      # 9. Build Release APK
       - name: Build Release APK
-        run: gradle -p android --no-daemon :app:assembleRelease
+        run: |
+          ./android/gradlew -p android --no-daemon :app:assembleRelease --stacktrace
+          ls -lh android/app/build/outputs/apk/release/
 
-      # 8. Sign Release APK if secrets are configured
-      - name: Sign Release APK
+      # 10. Sign Release APK only when valid signing secrets are configured (no secrets in if:)
+      - name: Sign Release APK (if signing secrets are configured)
         shell: bash
         env:
           ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
           set -euo pipefail
 
           RELEASE_DIR="android/app/build/outputs/apk/release"
           UNSIGNED_APK="$RELEASE_DIR/app-release-unsigned.apk"
+          KEY_B64="${ANDROID_KEY_BASE64:-${ANDROID_KEYSTORE_BASE64:-}}"
+          KS_PASS="${ANDROID_KEYSTORE_PASSWORD:-${ANDROID_KEY_PASSWORD:-}}"
+          KEY_PASS="${ANDROID_KEY_PASSWORD:-${ANDROID_KEYSTORE_PASSWORD:-}}"
+          KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
 
-          if [ -z "$ANDROID_KEY_BASE64" ] || \
-             [ -z "$ANDROID_KEY_PASSWORD" ] || \
-             [ -z "$ANDROID_KEY_ALIAS" ]; then
-            echo "Signing secrets missing."
-            echo "Unsigned Release APK will be uploaded."
+          if [ -z "$KEY_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KEY_PASS" ] || [ -z "$KEY_ALIAS" ]; then
+            echo "Signing secrets not configured; keeping unsigned Release APK."
             exit 0
           fi
 
           if [ ! -f "$UNSIGNED_APK" ]; then
-            echo "Unsigned APK not found: $UNSIGNED_APK"
+            echo "Unsigned APK not found at $UNSIGNED_APK"
             ls -la "$RELEASE_DIR" || true
             exit 1
           fi
 
           KEYSTORE="$RUNNER_TEMP/zoni-release.jks"
+          trap 'rm -f "$KEYSTORE" "$RELEASE_DIR/app-release-aligned.apk"' EXIT
 
-          echo "$ANDROID_KEY_BASE64" | base64 --decode > "$KEYSTORE"
+          printf '%s' "$KEY_B64" | base64 --decode > "$KEYSTORE"
 
           BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
 
-          "$BUILD_TOOLS/zipalign" -v -p 4 \
+          "$BUILD_TOOLS/zipalign" -f -p 4 \
             "$UNSIGNED_APK" \
             "$RELEASE_DIR/app-release-aligned.apk"
 
+          export ZONI_KS_PASS="$KS_PASS"
+          export ZONI_KEY_PASS="$KEY_PASS"
+
           "$BUILD_TOOLS/apksigner" sign \
             --ks "$KEYSTORE" \
-            --ks-key-alias "$ANDROID_KEY_ALIAS" \
-            --ks-pass env:ANDROID_KEY_PASSWORD \
-            --key-pass env:ANDROID_KEY_PASSWORD \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:ZONI_KS_PASS \
+            --key-pass env:ZONI_KEY_PASS \
             --out "$RELEASE_DIR/ZONI-AI-release.apk" \
             "$RELEASE_DIR/app-release-aligned.apk"
 
-          "$BUILD_TOOLS/apksigner" verify \
-            "$RELEASE_DIR/ZONI-AI-release.apk"
+          "$BUILD_TOOLS/apksigner" verify "$RELEASE_DIR/ZONI-AI-release.apk"
 
-          rm -f "$KEYSTORE"
+          echo "Release APK signed and verified successfully."
 
-          echo "Release APK signed successfully."
-
-      # 9. Upload Debug APK
+      # 11. Upload Debug APK
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
@@ -124,7 +152,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # 10. Upload Release APK
+      # 12. Upload Release APK
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:

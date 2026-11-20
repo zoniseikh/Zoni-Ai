@@ -52,6 +52,7 @@ class ZoniApplication : Application() {
     companion object {
         const val CHANNEL_FOREGROUND_SERVICE = "zoni_foreground_service_channel"
         const val CHANNEL_ASSISTANT_ALERTS = "zoni_alerts_channel"
+        const val CHANNEL_ALERTS = CHANNEL_ASSISTANT_ALERTS
 
         @Volatile
         lateinit var instance: ZoniApplication

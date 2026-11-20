@@ -24,6 +24,8 @@ import com.zoni.jarvis.assistant.device.ContactCallManager
 import com.zoni.jarvis.assistant.device.ContactCallResolution
 import com.zoni.jarvis.assistant.device.FlashlightController
 import com.zoni.jarvis.assistant.device.FlashlightResult
+import com.zoni.jarvis.assistant.domain.ActionType
+import com.zoni.jarvis.assistant.domain.AssistantAction
 import com.zoni.jarvis.assistant.domain.NumberNormalizer
 import com.zoni.jarvis.assistant.domain.NumberNormalizerResult
 import com.zoni.jarvis.assistant.service.ZoniAccessibilityService
@@ -45,6 +47,7 @@ data class AndroidPermissionsSnapshot(
     val sendSms: Boolean,
     val location: Boolean,
     val postNotifications: Boolean,
+    val bluetooth: Boolean = false,
     val batteryOptimizationIgnored: Boolean,
     val overlayAllowed: Boolean,
     val notificationListenerEnabled: Boolean,
@@ -163,7 +166,7 @@ class AndroidHardwareController(private val context: Context) {
             key == "accessibility" -> Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
             key == "notifications" || key == "notification_listener" ->
                 Intent(Settings.ACTION_ACTION_NOTIFICATION_LISTENER_SETTINGS)
-            key == "assistant" -> Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
+            key == "assistant" || key == "default_assistant" -> Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
             key == "battery" -> Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
             key == "app_details" -> Intent(
                 Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -183,7 +186,7 @@ class AndroidHardwareController(private val context: Context) {
 
     fun showNotification(title: String, body: String): Boolean {
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return false
-        val notif = NotificationCompat.Builder(context, ZoniApplication.CHANNEL_ALERTS)
+        val notif = NotificationCompat.Builder(context, ZoniApplication.CHANNEL_ASSISTANT_ALERTS)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(title)
             .setContentText(body)
@@ -192,6 +195,34 @@ class AndroidHardwareController(private val context: Context) {
             .build()
         nm.notify((System.currentTimeMillis() % Int.MAX_VALUE).toInt(), notif)
         return true
+    }
+
+    fun executeAction(action: AssistantAction): Boolean = when (action.type) {
+        ActionType.CALL -> placePhoneCall(action.target)
+        ActionType.SMS -> sendSms(action.target, action.payload)
+        ActionType.WHATSAPP -> openWhatsApp(action.target, action.payload)
+        ActionType.FLASHLIGHT -> {
+            val enable = action.payload.equals("on", ignoreCase = true) ||
+                action.target.equals("on", ignoreCase = true)
+            setFlashlight(enable)
+        }
+        ActionType.VIBRATE -> vibrate(action.payload.toLongOrNull() ?: 300L)
+        ActionType.BATTERY -> {
+            val bat = getBatteryStatus()
+            showNotification(
+                "Zoni AI Battery",
+                "Battery: ${bat.level}% (${if (bat.charging) "Charging" else "Not charging"})"
+            )
+        }
+        ActionType.NOTIFICATION -> showNotification(
+            action.target.ifBlank { "Zoni AI" },
+            action.payload.ifBlank { action.label }
+        )
+        ActionType.APP -> launchInstalledApp(action.target)
+        ActionType.SETTINGS -> openSystemSettings(action.target.ifBlank { "main" })
+        ActionType.ACCESSIBILITY -> ZoniAccessibilityService.performExplicitAction(
+            action.target.ifBlank { action.payload }
+        )
     }
 
     fun getPermissionsSnapshot(): AndroidPermissionsSnapshot {
@@ -224,6 +255,12 @@ class AndroidHardwareController(private val context: Context) {
             true
         }
 
+        val bluetoothGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            granted(Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            true
+        }
+
         return AndroidPermissionsSnapshot(
             recordAudio = granted(Manifest.permission.RECORD_AUDIO),
             camera = granted(Manifest.permission.CAMERA),
@@ -233,6 +270,7 @@ class AndroidHardwareController(private val context: Context) {
             location = granted(Manifest.permission.ACCESS_FINE_LOCATION) ||
                 granted(Manifest.permission.ACCESS_COARSE_LOCATION),
             postNotifications = postNotif,
+            bluetooth = bluetoothGranted,
             batteryOptimizationIgnored = batteryIgnored,
             overlayAllowed = overlayAllowed,
             notificationListenerEnabled = notifListener,

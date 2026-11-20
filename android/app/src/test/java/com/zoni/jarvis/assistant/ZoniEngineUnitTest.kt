@@ -6,7 +6,6 @@ import com.zoni.jarvis.assistant.db.CallSessionEntity
 import com.zoni.jarvis.assistant.db.UserPreferencesEntity
 import com.zoni.jarvis.assistant.domain.ActionType
 import com.zoni.jarvis.assistant.domain.BengaliDateTimeEngine
-import com.zoni.jarvis.assistant.domain.DateTimeQueryType
 import com.zoni.jarvis.assistant.domain.MobileAssistantEngine
 import com.zoni.jarvis.assistant.domain.NumberNormalizer
 import com.zoni.jarvis.assistant.domain.NumberNormalizerResult
@@ -22,15 +21,24 @@ class ZoniEngineUnitTest {
 
     @Test
     fun bengaliDateTimeEngineDetectsTimeDateWeekday() {
-        assertEquals(DateTimeQueryType.TIME, BengaliDateTimeEngine.detectQuery("এখন কয়টা বাজে?"))
-        assertEquals(DateTimeQueryType.DATE, BengaliDateTimeEngine.detectQuery("আজ কত তারিখ?"))
-        assertEquals(DateTimeQueryType.WEEKDAY, BengaliDateTimeEngine.detectQuery("আজ কী বার?"))
-        assertNull(BengaliDateTimeEngine.detectQuery("তোমার নাম কী?"))
+        assertEquals(
+            BengaliDateTimeEngine.DateTimeQueryType.TIME,
+            BengaliDateTimeEngine.detectDateTimeQuery("এখন কয়টা বাজে?")
+        )
+        assertEquals(
+            BengaliDateTimeEngine.DateTimeQueryType.DATE,
+            BengaliDateTimeEngine.detectDateTimeQuery("আজ কত তারিখ?")
+        )
+        assertEquals(
+            BengaliDateTimeEngine.DateTimeQueryType.WEEKDAY,
+            BengaliDateTimeEngine.detectDateTimeQuery("আজ কী বার?")
+        )
+        assertNull(BengaliDateTimeEngine.detectDateTimeQuery("তোমার নাম কী?"))
     }
 
     @Test
     fun bengaliDigitsAndDaypartsWorkCorrectly() {
-        assertEquals("২০২৬", BengaliDateTimeEngine.toBengaliDigits(2026))
+        assertEquals("২০২৬", BengaliDateTimeEngine.toBengaliDigits("2026"))
         assertEquals("সকাল", BengaliDateTimeEngine.getBengaliDaypart(9))
         assertEquals("দুপুর", BengaliDateTimeEngine.getBengaliDaypart(13))
         assertEquals("রাত", BengaliDateTimeEngine.getBengaliDaypart(22))

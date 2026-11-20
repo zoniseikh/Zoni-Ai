@@ -1,5 +1,6 @@
 package com.zoni.jarvis.assistant.calling
 
+import android.os.Build
 import android.telecom.Call
 import android.telecom.InCallService
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -30,7 +31,13 @@ class ZoniInCallService : InCallService() {
         super.onCallAdded(call)
         currentCall = call
         call.registerCallback(callCallback)
-        updateCallState(call, call.details.state)
+        val initialState = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            call.details.state
+        } else {
+            @Suppress("DEPRECATION")
+            call.state
+        }
+        updateCallState(call, initialState)
     }
 
     override fun onCallRemoved(call: Call) {
