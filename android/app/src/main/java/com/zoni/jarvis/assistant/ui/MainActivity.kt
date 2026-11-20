@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
+import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -39,6 +40,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.webkit.WebViewAssetLoader
+import com.zoni.jarvis.assistant.BuildConfig
 import com.zoni.jarvis.assistant.bridge.ZoniWebAppInterface
 import com.zoni.jarvis.assistant.calling.SimCallManager
 import com.zoni.jarvis.assistant.data.SecureKeyManager
@@ -53,6 +55,7 @@ import com.zoni.jarvis.assistant.ui.components.ZoniSettingsDialog
 import com.zoni.jarvis.assistant.ui.onboarding.OnboardingActivity
 import com.zoni.jarvis.assistant.ui.theme.ZoniColors
 import com.zoni.jarvis.assistant.ui.theme.ZoniTheme
+import org.json.JSONObject
 
 /**
  * Main Android Activity for Zoni AI (`com.zoni.jarvis.assistant`).
@@ -167,12 +170,51 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun resolveMimeType(assetPath: String): String {
+        val ext = assetPath.substringAfterLast('.', "").lowercase()
+        return when (ext) {
+            "html", "htm" -> "text/html"
+            "js", "mjs" -> "application/javascript"
+            "css" -> "text/css"
+            "json", "webmanifest" -> "application/json"
+            "svg" -> "image/svg+xml"
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            "webp" -> "image/webp"
+            "ico" -> "image/x-icon"
+            "woff2" -> "font/woff2"
+            "woff" -> "font/woff"
+            else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     @androidx.compose.runtime.Composable
     private fun OriginalDashboardWebShell() {
         val assetLoader = remember {
+            val publicAssetsHandler = WebViewAssetLoader.PathHandler { rawPath ->
+                val clean = rawPath.trimStart('/')
+                if (clean.contains("..")) return@PathHandler null
+                val target = if (clean.isEmpty()) "index.html" else clean
+                val assetFullPath = "public/$target"
+                try {
+                    val stream = assets.open(assetFullPath)
+                    WebResourceResponse(resolveMimeType(target), "UTF-8", stream)
+                } catch (_: Exception) {
+                    // SPA route fallback for extensionless client routes
+                    if (!target.contains('.')) {
+                        try {
+                            WebResourceResponse("text/html", "UTF-8", assets.open("public/index.html"))
+                        } catch (_: Exception) {
+                            null
+                        }
+                    } else {
+                        null
+                    }
+                }
+            }
             WebViewAssetLoader.Builder()
-                .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
+                .addPathHandler("/", publicAssetsHandler)
                 .build()
         }
 
@@ -185,6 +227,7 @@ class MainActivity : ComponentActivity() {
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
+                    WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
                     WebView(ctx).apply {
                         setBackgroundColor(android.graphics.Color.parseColor("#020617"))
                         settings.javaScriptEnabled = true
@@ -192,8 +235,16 @@ class MainActivity : ComponentActivity() {
                         settings.databaseEnabled = true
                         settings.mediaPlaybackRequiresUserGesture = false
                         settings.allowFileAccess = false
-                        settings.allowContentAccess = true
-                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                        settings.allowContentAccess = false
+                        @Suppress("DEPRECATION")
+                        settings.allowFileAccessFromFileURLs = false
+                        @Suppress("DEPRECATION")
+                        settings.allowUniversalAccessFromFileURLs = false
+                        settings.mixedContentMode = if (BuildConfig.DEBUG) {
+                            WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                        } else {
+                            WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                        }
 
                         addJavascriptInterface(
                             ZoniWebAppInterface(
@@ -230,9 +281,9 @@ class MainActivity : ComponentActivity() {
 
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
-                                val backendUrl = keyManager.getBackendUrl().replace("'", "")
+                                val quotedBackendUrl = JSONObject.quote(keyManager.getBackendUrl())
                                 view?.evaluateJavascript(
-                                    "window.__ZONI_ANDROID_NATIVE__ = true; if (!localStorage.getItem('zoni_backend_url') && '$backendUrl') { localStorage.setItem('zoni_backend_url', '$backendUrl'); }",
+                                    "window.__ZONI_ANDROID_NATIVE__ = true; if (!localStorage.getItem('zoni_backend_url') && $quotedBackendUrl) { localStorage.setItem('zoni_backend_url', $quotedBackendUrl); }",
                                     null
                                 )
                             }
@@ -241,6 +292,11 @@ class MainActivity : ComponentActivity() {
                         webChromeClient = object : WebChromeClient() {
                             override fun onPermissionRequest(request: PermissionRequest) {
                                 runOnUiThread {
+                                    val originHost = request.origin?.host
+                                    if (originHost != "appassets.androidplatform.net") {
+                                        request.deny()
+                                        return@runOnUiThread
+                                    }
                                     val needsAudio = request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
                                     val hasMic = ContextCompat.checkSelfPermission(
                                         this@MainActivity,
@@ -257,7 +313,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-                        val startUrl = "https://appassets.androidplatform.net/assets/public/index.html"
+                        val startUrl = "https://appassets.androidplatform.net/index.html"
                         loadUrl(startUrl)
                         dashboardWebView = this
                     }

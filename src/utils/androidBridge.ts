@@ -43,6 +43,9 @@ export interface NativeAndroidBridge {
   getPermissionsStatusJson?: () => string;
   requestNativePermissions?: () => boolean;
   getDeviceInfoJson?: () => string;
+  getBackendUrl?: () => string;
+  setBackendUrl?: (url: string) => boolean;
+  openOnboardingWizard?: () => boolean;
 }
 
 export type AndroidRuntimeMode =

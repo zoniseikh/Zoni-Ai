@@ -80,6 +80,6 @@ class SecureKeyManager(context: Context) {
         private const val KEY_RESUMPTION_HANDLE = "zoni_live_resumption_handle"
         private const val KEY_GEMINI_API_KEY = "gemini_api_key_encrypted"
         private const val KEY_ONBOARDING_COMPLETED = "zoni_onboarding_completed"
-        const val DEFAULT_BACKEND_URL = "http://10.0.2.2:3000"
+        const val DEFAULT_BACKEND_URL = ZoniUserSettings.DEFAULT_BACKEND_URL
     }
 }

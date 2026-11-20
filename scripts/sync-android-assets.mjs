@@ -15,6 +15,13 @@ if (!fs.existsSync(distDir)) {
 
 fs.rmSync(androidAssetsDir, { recursive: true, force: true });
 fs.mkdirSync(androidAssetsDir, { recursive: true });
-fs.cpSync(distDir, androidAssetsDir, { recursive: true, force: true });
+fs.cpSync(distDir, androidAssetsDir, {
+  recursive: true,
+  force: true,
+  filter: (src) => {
+    const rel = path.relative(distDir, src).replace(/\\/g, '/');
+    return rel !== 'assets/aistudio' && !rel.startsWith('assets/aistudio/');
+  },
+});
 
 console.log(`[sync-android-assets] Synced original Zoni AI React dashboard from dist/ -> ${path.relative(rootDir, androidAssetsDir)}`);

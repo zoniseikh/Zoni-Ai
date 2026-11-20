@@ -148,8 +148,12 @@ class SimCallManager(
                 .toString()
             is ContactCallResolution.PermissionMissing -> JSONObject()
                 .put("status", "permission_missing")
-                .put("permission", resolved.permission)
+                .put("permission", Manifest.permission.READ_CONTACTS)
                 .put("message", "Contacts permission (READ_CONTACTS) is needed to look up \"${raw}\".")
+                .toString()
+            is ContactCallResolution.CallFailed -> JSONObject()
+                .put("status", "failed")
+                .put("message", resolved.reason)
                 .toString()
         }
     }
@@ -240,8 +244,12 @@ class SimCallManager(
                 .toString()
             is ContactCallResolution.PermissionMissing -> JSONObject()
                 .put("status", "permission_missing")
-                .put("permission", resolved.permission)
+                .put("permission", Manifest.permission.READ_CONTACTS)
                 .put("message", "Contacts permission (READ_CONTACTS) is needed to look up \"${raw}\" for WhatsApp.")
+                .toString()
+            is ContactCallResolution.CallFailed -> JSONObject()
+                .put("status", "failed")
+                .put("message", resolved.reason)
                 .toString()
         }
     }
