@@ -43,7 +43,13 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT = process.env.PORT || 3000;
+const cliArgs = process.argv.slice(2);
+const readCliArg = (flag: string): string | undefined => {
+  const idx = cliArgs.indexOf(flag);
+  return idx >= 0 && idx + 1 < cliArgs.length ? cliArgs[idx + 1] : undefined;
+};
+const PORT = Number(readCliArg('--port') || process.env.PORT || 3000);
+const HOST = readCliArg('--host') || process.env.HOST || '0.0.0.0';
 
 // Shared server-side Gemini client
 const getGeminiClient = () => {
@@ -1130,14 +1136,22 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
 });
 
 // Setup Vite middleware in dev or static files in production
+let viteDevServer: { close: () => Promise<void> } | null = null;
+
 const setupFrontend = async () => {
   const isProduction = process.env.NODE_ENV === 'production';
   if (!isProduction) {
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: { server },
+        watch: hmrDisabled ? null : undefined,
+      },
       appType: 'spa',
     });
+    viteDevServer = vite;
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.resolve(__dirname, 'dist')));
@@ -1147,8 +1161,31 @@ const setupFrontend = async () => {
   }
 };
 
-setupFrontend().then(() => {
-  server.listen(Number(PORT), '0.0.0.0', () => {
-    console.log(`[ZONI-JARVIS] Server listening on port ${PORT}`);
+const shutdown = async () => {
+  try {
+    wss.close();
+    if (viteDevServer) {
+      await viteDevServer.close();
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+  server.close(() => {
+    process.exit(0);
   });
-});
+  setTimeout(() => process.exit(0), 2000).unref();
+};
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+setupFrontend()
+  .then(() => {
+    server.listen(PORT, HOST, () => {
+      console.log(`[ZONI-JARVIS] Server listening on http://${HOST}:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('[ZONI-JARVIS] Failed to start server:', err);
+    process.exit(1);
+  });
