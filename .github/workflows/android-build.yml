@@ -28,37 +28,43 @@ jobs:
     timeout-minutes: 45
 
     steps:
+      # 1. Checkout original project
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 2. Setup Node.js
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
 
+      # 3. Install frontend dependencies
       - name: Install Frontend Dependencies
         run: npm ci
 
+      # 4. Frontend unit tests
       - name: Run Frontend Tests
         run: npm test
 
+      # 5. Frontend lint
       - name: Run Frontend Lint
         run: npm run lint
 
+      # 6. Build and sync React dashboard
       - name: Build Dashboard and Sync Android Assets
         env:
           VITE_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: npm run android:sync
 
+      # 7. Setup Java 17
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # FIX: Use Android SDK setup v4.
-      # Do not install the obsolete SDK package named "tools".
+      # 8. Setup Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
@@ -66,9 +72,11 @@ jobs:
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: false
 
+      # 9. Setup Gradle cache
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # 10. Verify build environment
       - name: Verify Build Environment
         run: |
           chmod +x android/gradlew
@@ -78,25 +86,42 @@ jobs:
           sdkmanager --version
           ./android/gradlew -p android --version
 
+      # 11. Verify Android configuration
       - name: Verify Android Configuration
         run: |
           test -f android/gradle.properties
           grep -q "android.useAndroidX=true" android/gradle.properties
 
+      # 12. Run Android Unit Tests
       - name: Run Android Unit Tests
         env:
           ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: |
-          ./android/gradlew -p android \
+          ./android/gradlew \
+            -p android \
             --no-daemon \
             :app:testDebugUnitTest \
             --stacktrace
 
+      # 13. Upload test reports even when tests fail
+      - name: Upload Android Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZONI-AI-Android-Test-Reports
+          path: |
+            android/app/build/reports/tests/
+            android/app/build/test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # 14. Build Debug APK
       - name: Build Debug APK
         env:
           ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: |
-          ./android/gradlew -p android \
+          ./android/gradlew \
+            -p android \
             --no-daemon \
             :app:assembleDebug \
             --stacktrace
@@ -104,11 +129,13 @@ jobs:
           test -f android/app/build/outputs/apk/debug/app-debug.apk
           ls -lh android/app/build/outputs/apk/debug/
 
+      # 15. Build Release APK
       - name: Build Release APK
         env:
           ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: |
-          ./android/gradlew -p android \
+          ./android/gradlew \
+            -p android \
             --no-daemon \
             :app:assembleRelease \
             --stacktrace
@@ -116,6 +143,7 @@ jobs:
           test -d android/app/build/outputs/apk/release/
           ls -lh android/app/build/outputs/apk/release/
 
+      # 16. Upload Debug APK
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
@@ -124,6 +152,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # 17. Upload Release APK
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
@@ -131,3 +160,12 @@ jobs:
           path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
           retention-days: 14
+
+      # 18. Build summary
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "## ZONI AI Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Frontend tests: see workflow steps" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Android unit tests: see test report artifact" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Debug and Release APK: check artifact upload steps" >> "$GITHUB_STEP_SUMMARY"
