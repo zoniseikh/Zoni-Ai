@@ -210,7 +210,7 @@ class CommandDispatcher {
 
     private fun parseContactCall(raw: String): VoiceCommand.CallContact? {
         // Bengali pattern: "<Name>কে ফোন করো" or "<Name>কে কল করো"
-        val bengaliMatch = Regex("([\\p{L}\\w\\s]+?)(?:কে|রে)?\\s*(?:ফোন\\s*করো|কল\\s*করো)", RegexOption.IGNORE_CASE).find(raw)
+        val bengaliMatch = Regex("^([\\p{L}\\p{M}\\w\\s]+?)(?:কে|রে)?\\s*(?:ফোন\\s*করো|কল\\s*করো)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
         if (bengaliMatch != null) {
             val contact = bengaliMatch.groupValues[1].trim()
             if (contact.isNotBlank() && !contact.contains("নম্বর")) {
@@ -219,7 +219,7 @@ class CommandDispatcher {
         }
 
         // English pattern: "call <Name>" or "phone <Name>"
-        val englishMatch = Regex("^(?:call|phone)\\s+([\\p{L}\\w\\s]+)$", RegexOption.IGNORE_CASE).find(raw)
+        val englishMatch = Regex("^(?:call|phone)\\s+([\\p{L}\\p{M}\\w\\s]+?)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
         if (englishMatch != null) {
             val candidate = englishMatch.groupValues[1].trim()
             // Make sure it's not numbers
@@ -233,7 +233,7 @@ class CommandDispatcher {
 
     private fun parseAppLaunch(raw: String): VoiceCommand.OpenApp? {
         // "YouTube খোলো", "ওয়াতসঅ্যাপ ওপেন করো", "Open YouTube"
-        val openBengaliMatch = Regex("([\\p{L}\\w\\s]+?)\\s*(?:খোলো|ওপেন\\s*করো)", RegexOption.IGNORE_CASE).find(raw)
+        val openBengaliMatch = Regex("^([\\p{L}\\p{M}\\w\\s]+?)\\s*(?:খোলো|ওপেন\\s*করো)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
         if (openBengaliMatch != null) {
             val appQuery = openBengaliMatch.groupValues[1].trim()
             if (appQuery.isNotBlank() && !appQuery.contains("সেটিংস") && !appQuery.contains("টর্চ")) {
@@ -241,7 +241,7 @@ class CommandDispatcher {
             }
         }
 
-        val openEnglishMatch = Regex("^(?:open|launch)\\s+([\\p{L}\\w\\s]+)$", RegexOption.IGNORE_CASE).find(raw)
+        val openEnglishMatch = Regex("^(?:open|launch)\\s+([\\p{L}\\p{M}\\w\\s]+?)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
         if (openEnglishMatch != null) {
             val appQuery = openEnglishMatch.groupValues[1].trim()
             if (appQuery.isNotBlank() && !appQuery.contains("settings") && !appQuery.contains("flashlight")) {

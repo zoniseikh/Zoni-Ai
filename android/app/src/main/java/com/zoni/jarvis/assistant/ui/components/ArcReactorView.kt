@@ -28,7 +28,7 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.AutoAwesome
-import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -269,7 +269,7 @@ fun ArcReactorView(
                 "ZONI SPEAKING (VOICE LINK LIVE)",
                 ZoniColors.Cyan300,
                 ZoniColors.Cyan950.copy(alpha = 0.7f),
-                Icons.Default.VolumeUp
+                Icons.AutoMirrored.Filled.VolumeUp
             )
             AssistantState.THINKING -> Quadruple(
                 "COMPUTING WITH LOVE & INTELLIGENCE...",
