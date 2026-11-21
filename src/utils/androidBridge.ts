@@ -279,7 +279,15 @@ export function executeTypedActionViaNativeBridge(
       arguments: args,
     });
     const raw = bridge.executeTypedActionJson(payload);
-    return JSON.parse(raw) as ToolExecutionReport;
+    const parsed = JSON.parse(raw) as ToolExecutionReport;
+    return {
+      ...parsed,
+      target:
+        parsed.target ||
+        String(parsed.data?.target || parsed.data?.contactName || parsed.data?.title || ''),
+      executionStatus: parsed.executionStatus || parsed.status || 'unknown',
+      status: parsed.status || parsed.executionStatus || 'unknown',
+    };
   } catch {
     return null;
   }

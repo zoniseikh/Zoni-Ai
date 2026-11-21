@@ -7,8 +7,8 @@ import {
   formatLocalizedActionOutcome,
 } from './assistantActionRegistry.ts';
 
-test('Category A & C & E: Registry declares all 25 allowlisted Android personal assistant tools', () => {
-  assert.equal(ASSISTANT_TOOL_SPECS.length, 25);
+test('Category A & C & E: Registry declares all 33 allowlisted Android personal assistant tools', () => {
+  assert.equal(ASSISTANT_TOOL_SPECS.length, 33);
   const expectedTools = [
     'list_installed_apps',
     'open_app',
@@ -35,6 +35,14 @@ test('Category A & C & E: Registry declares all 25 allowlisted Android personal 
     'search_youtube',
     'search_installed_app',
     'cancel_current_task',
+    'click_youtube_video',
+    'click_youtube_search_result',
+    'click_visible_element',
+    'click_whatsapp_contact',
+    'open_whatsapp_chat',
+    'type_whatsapp_message',
+    'send_whatsapp_message',
+    'verify_whatsapp_send',
   ];
   for (const name of expectedTools) {
     assert.equal(isAllowlistedAssistantTool(name), true, `Expected ${name} to be allowlisted`);
@@ -73,26 +81,28 @@ test('Category E: Security policy strictly blocks disallowed tools, shell comman
   assert.equal(jsPayload.valid, false);
 });
 
-test('Category C: Communication tools (WhatsApp, SMS, Call) ALWAYS enforce requiresConfirmation=true', () => {
+test('Category C: Explicit communication & device tools execute directly with requiresConfirmation=false and exact message preservation', () => {
   const wa = validateGeminiToolCall('prepare_whatsapp_message', {
     recipient: 'রাহুল',
-    message: 'আমি আজ আসতে পারব না',
+    message: 'আমি আসছি',
   });
   assert.equal(wa.valid, true);
-  assert.equal(wa.request?.requiresConfirmation, true);
+  assert.equal(wa.request?.requiresConfirmation, false);
   assert.equal(wa.request?.arguments.recipient, 'রাহুল');
-  assert.equal(wa.request?.arguments.message, 'আমি আজ আসতে পারব না');
+  assert.equal(wa.request?.arguments.message, 'আমি আসছি');
 
   const sms = validateGeminiToolCall('prepare_sms', {
-    recipient: 'Baba',
-    message: 'Reaching soon',
+    recipient: 'বাবা',
+    message: 'আমি বাড়ি ফিরছি',
   });
   assert.equal(sms.valid, true);
-  assert.equal(sms.request?.requiresConfirmation, true);
+  assert.equal(sms.request?.requiresConfirmation, false);
+  assert.equal(sms.request?.arguments.recipient, 'বাবা');
+  assert.equal(sms.request?.arguments.message, 'আমি বাড়ি ফিরছি');
 
   const call = validateGeminiToolCall('call_contact', { recipient: 'মা' });
   assert.equal(call.valid, true);
-  assert.equal(call.request?.requiresConfirmation, true);
+  assert.equal(call.request?.requiresConfirmation, false);
 
   const appChat = validateGeminiToolCall('prepare_app_chat_message', {
     app_name: 'Telegram',
@@ -100,8 +110,24 @@ test('Category C: Communication tools (WhatsApp, SMS, Call) ALWAYS enforce requi
     message: 'আমি আসছি',
   });
   assert.equal(appChat.valid, true);
-  assert.equal(appChat.request?.requiresConfirmation, true);
+  assert.equal(appChat.request?.requiresConfirmation, false);
   assert.equal(appChat.request?.arguments.app_name, 'Telegram');
+
+  const openApp = validateGeminiToolCall('open_app', { app_name: 'YouTube' });
+  assert.equal(openApp.valid, true);
+  assert.equal(openApp.request?.requiresConfirmation, false);
+
+  const settings = validateGeminiToolCall('open_system_settings', { target: 'wifi' });
+  assert.equal(settings.valid, true);
+  assert.equal(settings.request?.requiresConfirmation, false);
+
+  const webSearch = validateGeminiToolCall('search_web', { query: 'Dhaka weather' });
+  assert.equal(webSearch.valid, true);
+  assert.equal(webSearch.request?.requiresConfirmation, false);
+
+  const ytSearch = validateGeminiToolCall('search_youtube', { query: 'Bengali song' });
+  assert.equal(ytSearch.valid, true);
+  assert.equal(ytSearch.request?.requiresConfirmation, false);
 });
 
 test('Category A & B & E: Validation enforces required arguments and strict enum constraints', () => {
@@ -125,7 +151,7 @@ test('Category A & B & E: Validation enforces required arguments and strict enum
   assert.equal(invalidSettings.valid, false);
 });
 
-test('Category C, D & E: formatLocalizedActionOutcome enforces honest reporting for WhatsApp drafts, permissions, blocks, and cancellations', () => {
+test('Category C, D & E: formatLocalizedActionOutcome enforces honest reporting for direct calls, SMS, WhatsApp, disambiguation, permissions, blocks, and cancellations', () => {
   const verifiedSendOutcome = formatLocalizedActionOutcome(
     {
       actionId: 'a0',
@@ -140,8 +166,69 @@ test('Category C, D & E: formatLocalizedActionOutcome enforces honest reporting 
     'Boss'
   );
   assert.ok(verifiedSendOutcome.includes('Send'));
-  assert.ok(verifiedSendOutcome.includes('অনুমোদনের পর'));
+  assert.equal(verifiedSendOutcome.includes('অনুমোদনের পর'), false);
   assert.ok(verifiedSendOutcome.includes('ডেলিভারি'));
+
+  const directCallOutcome = formatLocalizedActionOutcome(
+    {
+      actionId: 'a_call',
+      actionType: 'call_contact',
+      success: true,
+      verified: true,
+      status: 'call_initiated',
+      message: 'Call initiated',
+      data: { contactName: 'মা' },
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(directCallOutcome.includes('মা'));
+  assert.ok(directCallOutcome.includes('সরাসরি ফোন কল'));
+
+  const directSmsOutcome = formatLocalizedActionOutcome(
+    {
+      actionId: 'a_sms',
+      actionType: 'prepare_sms',
+      success: true,
+      verified: true,
+      status: 'sms_sent_direct',
+      message: 'SMS sent',
+      data: { contactName: 'বাবা' },
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(directSmsOutcome.includes('বাবা'));
+  assert.ok(directSmsOutcome.includes('SMS'));
+
+  const multipleContactsOutcome = formatLocalizedActionOutcome(
+    {
+      actionId: 'a_multi',
+      actionType: 'call_contact',
+      success: false,
+      verified: true,
+      status: 'multiple_contacts',
+      message: 'Multiple contacts match',
+      data: { query: 'রাহুল' },
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(multipleContactsOutcome.includes('একাধিক কন্টাক্ট'));
+
+  const dupBlockedOutcome = formatLocalizedActionOutcome(
+    {
+      actionId: 'a_dup',
+      actionType: 'prepare_whatsapp_message',
+      success: false,
+      verified: true,
+      status: 'duplicate_blocked',
+      message: 'Duplicate prevented',
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(dupBlockedOutcome.includes('ডুপ্লিকেট'));
 
   const draftOutcome = formatLocalizedActionOutcome(
     {
@@ -233,3 +320,112 @@ test('Category C, D & E: formatLocalizedActionOutcome enforces honest reporting 
   assert.ok(appChatSent.includes('Telegram'));
   assert.ok(appChatSent.includes('Send'));
 });
+
+test('Part 1 & 2: New YouTube Click and WhatsApp Smart Contact/Send tools validate cleanly and report honest outcomes', () => {
+  const ytClick = validateGeminiToolCall('click_youtube_video', { index: 1, target: 'video_1' });
+  assert.equal(ytClick.valid, true);
+  assert.equal(ytClick.request?.requiresConfirmation, false);
+
+  const waContact = validateGeminiToolCall('click_whatsapp_contact', { contact_name: 'রাহুল' });
+  assert.equal(waContact.valid, true);
+  assert.equal(waContact.request?.requiresConfirmation, false);
+
+  const waType = validateGeminiToolCall('type_whatsapp_message', { message: 'আমি আসছি' });
+  assert.equal(waType.valid, true);
+  assert.equal(waType.request?.arguments.message, 'আমি আসছি');
+
+  const waSend = validateGeminiToolCall('send_whatsapp_message', { recipient: 'রাহুল', message: 'আমি আসছি' });
+  assert.equal(waSend.valid, true);
+  assert.equal(waSend.request?.requiresConfirmation, false);
+
+  const ytOpened = formatLocalizedActionOutcome(
+    {
+      actionId: 'yt1',
+      actionType: 'click_youtube_video',
+      target: 'Arijit Singh Bengali Hit Song',
+      success: true,
+      verified: true,
+      status: 'youtube_video_opened',
+      executionStatus: 'youtube_video_opened',
+      message: 'Opened video',
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(ytOpened.includes('YouTube'));
+  assert.ok(ytOpened.includes('Arijit Singh Bengali Hit Song'));
+
+  const ambigOut = formatLocalizedActionOutcome(
+    {
+      actionId: 'yt2',
+      actionType: 'click_youtube_video',
+      success: false,
+      verified: true,
+      status: 'ambiguous_target',
+      message: 'Multiple matching videos',
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(ambigOut.includes('একাধিক'));
+
+  const typedNotSent = formatLocalizedActionOutcome(
+    {
+      actionId: 'wa_type',
+      actionType: 'type_whatsapp_message',
+      success: true,
+      verified: true,
+      status: 'whatsapp_message_typed_not_sent',
+      message: 'Typed only',
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(typedNotSent.includes('লিখে'));
+  assert.ok(typedNotSent.includes('Send চাপা হয়নি'));
+
+  const deliveredOut = formatLocalizedActionOutcome(
+    {
+      actionId: 'wa_del',
+      actionType: 'send_whatsapp_message',
+      target: 'রাহুল',
+      success: true,
+      verified: true,
+      status: 'whatsapp_delivered_confirmed',
+      message: 'Delivered',
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(deliveredOut.includes('Delivered'));
+
+  const pendingOut = formatLocalizedActionOutcome(
+    {
+      actionId: 'wa_pend',
+      actionType: 'send_whatsapp_message',
+      target: 'রাহুল',
+      success: true,
+      verified: true,
+      status: 'whatsapp_sent_pending',
+      message: 'Pending',
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(pendingOut.includes('Pending'));
+
+  const sendBtnMissing = formatLocalizedActionOutcome(
+    {
+      actionId: 'wa_nobtn',
+      actionType: 'send_whatsapp_message',
+      success: false,
+      verified: true,
+      status: 'send_button_not_found',
+      message: 'Send button not found',
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(sendBtnMissing.includes('Send'));
+});
+

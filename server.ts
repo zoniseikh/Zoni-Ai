@@ -319,8 +319,8 @@ You have ${ZONI_ASSISTANT_TOOLS.length} allowlisted native Android personal assi
 CRITICAL TOOL RULES:
 1. Call a declared function IMMEDIATELY in both HTTP chat AND Gemini Live voice sessions whenever the user explicitly requests a concrete Android phone/app/hardware/communication action in Bengali, English, or Hindi (e.g., "WhatsApp খোলো", "আমার ফোনে থাকা Chrome চালু করো", "ফেসবুকটা খুলে দাও", "Open Instagram for me", "আমার মাকে ফোন করো", "ইউটিউবে গান খুঁজে দাও", "ফোনের সেটিংস খোলো", "নিচে স্ক্রল করো", "এই স্ক্রিনে কী আছে পড়ে শোনাও", "রাহুলকে WhatsApp-এ মেসেজ পাঠাও: আমি আজ আসতে পারব না", "টেলিগ্রামে রাহুলকে মেসেজ পাঠাও: আমি আসছি").
 2. NEVER invoke any tool for ordinary conversation, greetings, emotional support, jokes, stories, or general knowledge questions (e.g., "তুমি কেমন আছো?", "আজকের দিনটা কেমন?", "What is photosynthesis?"). Respond naturally in text/voice instead.
-3. NEVER fabricate or hallucinate that an action succeeded, an app opened, or a WhatsApp/SMS/chat message was sent before the real device tool response returns success=true.
-4. For WhatsApp messages, SMS, supported app chat messages (Telegram/Instagram/Messenger), and phone calls, ALWAYS call prepare_whatsapp_message / prepare_sms / prepare_app_chat_message / call_contact so the user can review, edit, and explicitly approve first. If no message body was provided, ask the user what message to write. NEVER claim a message was automatically sent unless verified.
+3. NEVER fabricate or hallucinate that an action succeeded, a YouTube video opened, an app opened, a call was placed, or a WhatsApp/SMS/chat message was sent or delivered before the real device tool response returns verified=true.
+4. PERMANENT DIRECT EXECUTION POLICY: When the user explicitly requests a direct phone call, WhatsApp message, SMS, supported app chat message (Telegram/Instagram/Messenger), app launch, Android settings screen, Google/YouTube search, YouTube video/thumbnail/Play click, or WhatsApp contact/chat click, IMMEDIATELY call the matching tool (call_contact / send_whatsapp_message / prepare_whatsapp_message / prepare_sms / prepare_app_chat_message / open_app / open_system_settings / search_web / search_youtube / click_youtube_video / click_youtube_search_result / click_visible_element / click_whatsapp_contact / open_whatsapp_chat / type_whatsapp_message / verify_whatsapp_send) directly WITHOUT asking for routine second confirmation. Pass the exact unmodified user message text. Use type_whatsapp_message (NOT send_whatsapp_message) when the user asks ONLY to type without sending. Ask ONLY if multiple contacts or ambiguous video targets match. NEVER guess an unknown phone number, and NEVER claim delivery or read status without verified evidence.
 5. For flashlight control in either chat or Live voice sessions, call flashlight_control with enable=true or enable=false and wait for the real device result.
 
 - Current Active Mode: ${mode.toUpperCase()}
@@ -784,10 +784,12 @@ app.post('/api/chat/tool-result', async (req: Request, res: Response) => {
     const sanitizedResults = toolResults.slice(0, 5).map((r: any) => ({
       actionId: String(r?.actionId || ''),
       actionType: String(r?.actionType || ''),
+      target: String(r?.target || ''),
       success: Boolean(r?.success),
       verified: Boolean(r?.verified),
       awaitingConfirmation: Boolean(r?.awaitingConfirmation),
       status: String(r?.status || ''),
+      executionStatus: String(r?.executionStatus || r?.status || ''),
       message: String(r?.message || '').slice(0, 800),
       failureReason: r?.failureReason ? String(r.failureReason).slice(0, 400) : undefined,
       requiredPermissions: Array.isArray(r?.requiredPermissions)
@@ -803,8 +805,12 @@ app.post('/api/chat/tool-result', async (req: Request, res: Response) => {
       JSON.stringify(sanitizedResults, null, 2),
       `INSTRUCTIONS (CRITICAL HONESTY):`,
       `- Report ONLY what actually happened based on the verified JSON above.`,
-      `- If success is false or status is permission_missing/blocked/failed, honestly explain the exact failure or missing permission.`,
-      `- If status is "opened_whatsapp_draft_ready_to_send" or awaitingConfirmation is true, NEVER claim the message was already sent — clearly state the draft is ready for the user to review or tap Send.`,
+      `- If success is false or status is permission_missing/blocked/failed/contact_not_found/duplicate_blocked/send_button_not_found/ambiguous_target, honestly explain the exact failure, missing permission, or ambiguity.`,
+      `- If status is "multiple_contacts" or "multiple_numbers", ask the user to choose the right matching contact — NEVER guess a recipient.`,
+      `- If status is "whatsapp_message_typed_not_sent", state clearly that the message was typed only and NOT sent.`,
+      `- If status is "opened_whatsapp_draft_ready_to_send", "opened_sms_composer_ready_to_send", or "dialer_opened", NEVER claim the message was already sent or call already placed — honestly report what opened and what permission/step is needed.`,
+      `- If status is "whatsapp_sent_pending", "whatsapp_sent_confirmed", "whatsapp_sent_verified", or "whatsapp_delivered_confirmed", report ONLY the verified state (never claim delivered or read unless status is whatsapp_delivered_confirmed).`,
+      `- If status is "youtube_video_opened" or "whatsapp_contact_opened", report concisely that the target was clicked and verified.`,
       `- Reply concisely in 1-3 warm natural sentences in the active language addressing the user as "${activeAffectionName}".`,
     ].join('\n');
 

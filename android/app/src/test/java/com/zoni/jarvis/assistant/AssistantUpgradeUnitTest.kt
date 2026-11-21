@@ -122,35 +122,45 @@ class AssistantUpgradeUnitTest {
 
     @Test
     fun categoryCD_actionProtocolAllowlistAndConfirmationEnforcement() {
-        assertEquals(25, AllowedActionType.entries.size)
+        assertEquals(33, AllowedActionType.entries.size)
         assertEquals(AllowedActionType.CONTACT_SEARCH, AllowedActionType.fromToolName("search_contacts"))
         assertEquals(AllowedActionType.FLASHLIGHT_CONTROL, AllowedActionType.fromToolName("set_flashlight"))
         assertEquals(AllowedActionType.PREPARE_APP_CHAT_MESSAGE, AllowedActionType.fromToolName("prepare_app_chat_message"))
         assertEquals(AllowedActionType.SEARCH_YOUTUBE, AllowedActionType.fromToolName("search_youtube"))
         assertEquals(AllowedActionType.CANCEL_CURRENT_TASK, AllowedActionType.fromToolName("cancel_current_task"))
+        assertEquals(AllowedActionType.CLICK_YOUTUBE_VIDEO, AllowedActionType.fromToolName("click_youtube_video"))
+        assertEquals(AllowedActionType.CLICK_YOUTUBE_SEARCH_RESULT, AllowedActionType.fromToolName("click_youtube_search_result"))
+        assertEquals(AllowedActionType.CLICK_VISIBLE_ELEMENT, AllowedActionType.fromToolName("click_visible_element"))
+        assertEquals(AllowedActionType.CLICK_WHATSAPP_CONTACT, AllowedActionType.fromToolName("click_whatsapp_contact"))
+        assertEquals(AllowedActionType.OPEN_WHATSAPP_CHAT, AllowedActionType.fromToolName("open_whatsapp_chat"))
+        assertEquals(AllowedActionType.TYPE_WHATSAPP_MESSAGE, AllowedActionType.fromToolName("type_whatsapp_message"))
+        assertEquals(AllowedActionType.SEND_WHATSAPP_MESSAGE, AllowedActionType.fromToolName("send_whatsapp_message"))
+        assertEquals(AllowedActionType.VERIFY_WHATSAPP_SEND, AllowedActionType.fromToolName("verify_whatsapp_send"))
 
-        // Communication actions ALWAYS enforce requiresConfirmation = true
+        // Explicit communication actions execute directly without routine confirmation gates
         val (waReq, waErr) = ActionProtocolValidator.validate(
             "prepare_whatsapp_message",
-            mapOf("recipient" to "রাহুল", "message" to "আমি আজ আসতে পারব না")
+            mapOf("recipient" to "রাহুল", "message" to "আমি আসছি")
         )
         assertNull(waErr)
         assertNotNull(waReq)
-        assertTrue(waReq!!.requiresConfirmation)
+        assertFalse(waReq!!.requiresConfirmation)
+        assertEquals("আমি আসছি", waReq.arguments["message"])
 
         val (callReq, callErr) = ActionProtocolValidator.validate(
             "call_contact",
             mapOf("recipient" to "মা")
         )
         assertNull(callErr)
-        assertTrue(callReq!!.requiresConfirmation)
+        assertFalse(callReq!!.requiresConfirmation)
 
         val (smsReq, smsErr) = ActionProtocolValidator.validate(
             "prepare_sms",
-            mapOf("recipient" to "Baba", "message" to "Reaching home")
+            mapOf("recipient" to "বাবা", "message" to "আমি বাড়ি ফিরছি")
         )
         assertNull(smsErr)
-        assertTrue(smsReq!!.requiresConfirmation)
+        assertFalse(smsReq!!.requiresConfirmation)
+        assertEquals("আমি বাড়ি ফিরছি", smsReq.arguments["message"])
 
         val (appChatReq, appChatErr) = ActionProtocolValidator.validate(
             "prepare_app_chat_message",
@@ -158,7 +168,7 @@ class AssistantUpgradeUnitTest {
         )
         assertNull(appChatErr)
         assertNotNull(appChatReq)
-        assertTrue(appChatReq!!.requiresConfirmation)
+        assertFalse(appChatReq!!.requiresConfirmation)
 
         // Disallowed tools & shell/JS injection payloads strictly blocked
         val (shellReq, shellErr) = ActionProtocolValidator.validate("exec_shell", mapOf("cmd" to "ls"))
@@ -211,6 +221,17 @@ class AssistantUpgradeUnitTest {
         assertTrue("Expected PrepareWhatsAppMessage, got $c7", c7 is VoiceCommand.PrepareWhatsAppMessage)
         assertEquals("রাহুল", (c7 as VoiceCommand.PrepareWhatsAppMessage).recipient)
         assertEquals("আমি আজ আসতে পারব না", c7.message)
+
+        // 7b. "বাবাকে SMS পাঠাও: আমি বাড়ি ফিরছি"
+        val c7Sms = dispatcher.parseCommand("বাবাকে SMS পাঠাও: আমি বাড়ি ফিরছি")
+        assertTrue("Expected SendSms, got $c7Sms", c7Sms is VoiceCommand.SendSms)
+        assertEquals("বাবা", (c7Sms as VoiceCommand.SendSms).recipient)
+        assertEquals("আমি বাড়ি ফিরছি", c7Sms.message)
+
+        val c7SmsEn = dispatcher.parseCommand("Send an SMS to Baba saying I am coming home")
+        assertTrue("Expected SendSms, got $c7SmsEn", c7SmsEn is VoiceCommand.SendSms)
+        assertEquals("Baba", (c7SmsEn as VoiceCommand.SendSms).recipient)
+        assertEquals("I am coming home", c7SmsEn.message)
 
         // 8. "মেসেজটা পাঠানোর আগে আমাকে দেখাও।"
         val c8 = dispatcher.parseCommand("মেসেজটা পাঠানোর আগে আমাকে দেখাও।")
@@ -310,6 +331,15 @@ class AssistantUpgradeUnitTest {
         assertFalse(WhatsAppSendDeduplicator.tryAcquire("pend_wa_001"))
         WhatsAppSendDeduplicator.release("pend_wa_001")
         assertTrue(WhatsAppSendDeduplicator.tryAcquire("pend_wa_001"))
+
+        // Short-window direct send duplicate prevention across rapid triggers (WhatsApp & SMS)
+        assertTrue(WhatsAppSendDeduplicator.tryAcquireDirectSend("whatsapp", "+8801712345678", "আমি আসছি", nowMs = 1000L))
+        assertFalse(WhatsAppSendDeduplicator.tryAcquireDirectSend("whatsapp", "+8801712345678", "আমি আসছি", nowMs = 4000L))
+        // Different channel or different message allowed immediately
+        assertTrue(WhatsAppSendDeduplicator.tryAcquireDirectSend("sms", "+8801712345678", "আমি আসছি", nowMs = 4000L))
+        assertTrue(WhatsAppSendDeduplicator.tryAcquireDirectSend("whatsapp", "+8801712345678", "পৌঁছে গেছি", nowMs = 4000L))
+        // Allowed again after deduplication window expires
+        assertTrue(WhatsAppSendDeduplicator.tryAcquireDirectSend("whatsapp", "+8801712345678", "আমি আসছি", nowMs = 10_500L))
     }
 
     @Test

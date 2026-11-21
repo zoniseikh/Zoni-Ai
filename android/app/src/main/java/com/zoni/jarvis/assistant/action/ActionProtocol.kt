@@ -32,21 +32,29 @@ enum class AllowedActionType(
     ENTER_TEXT_IN_VISIBLE_FIELD("enter_text_in_visible_field", listOf("ACCESSIBILITY_SERVICE"), false, 4000L),
     READ_VISIBLE_SCREEN("read_visible_screen", listOf("ACCESSIBILITY_SERVICE"), false, 4000L),
     READ_NOTIFICATIONS("read_notifications", listOf("NOTIFICATION_LISTENER"), false, 3000L),
-    PREPARE_WHATSAPP_MESSAGE("prepare_whatsapp_message", listOf("READ_CONTACTS"), true, 6000L),
-    PREPARE_SMS("prepare_sms", listOf("READ_CONTACTS"), true, 6000L),
-    PREPARE_APP_CHAT_MESSAGE("prepare_app_chat_message", listOf("ACCESSIBILITY_SERVICE"), true, 6000L),
+    PREPARE_WHATSAPP_MESSAGE("prepare_whatsapp_message", listOf("READ_CONTACTS"), false, 6000L),
+    PREPARE_SMS("prepare_sms", listOf("READ_CONTACTS", "SEND_SMS"), false, 6000L),
+    PREPARE_APP_CHAT_MESSAGE("prepare_app_chat_message", listOf("ACCESSIBILITY_SERVICE"), false, 6000L),
     REQUEST_PERMISSION("request_permission", emptyList(), false, 5000L),
     FLASHLIGHT_CONTROL("flashlight_control", listOf("CAMERA"), false, 3000L),
     VOLUME_CONTROL("volume_control", emptyList(), false, 3000L),
     BATTERY_STATUS("battery_status", emptyList(), false, 2000L),
     CAMERA_OPEN("camera_open", listOf("CAMERA"), false, 4000L),
     CONTACT_SEARCH("contact_search", listOf("READ_CONTACTS"), false, 4000L),
-    CALL_CONTACT("call_contact", listOf("READ_CONTACTS", "CALL_PHONE"), true, 6000L),
+    CALL_CONTACT("call_contact", listOf("READ_CONTACTS", "CALL_PHONE"), false, 6000L),
     CREATE_REMINDER("create_reminder", listOf("POST_NOTIFICATIONS"), false, 4000L),
     SEARCH_WEB("search_web", emptyList(), false, 4000L),
     SEARCH_YOUTUBE("search_youtube", emptyList(), false, 5000L),
     SEARCH_INSTALLED_APP("search_installed_app", emptyList(), false, 3000L),
-    CANCEL_CURRENT_TASK("cancel_current_task", emptyList(), false, 2000L);
+    CANCEL_CURRENT_TASK("cancel_current_task", emptyList(), false, 2000L),
+    CLICK_YOUTUBE_VIDEO("click_youtube_video", listOf("ACCESSIBILITY_SERVICE"), false, 5000L),
+    CLICK_YOUTUBE_SEARCH_RESULT("click_youtube_search_result", listOf("ACCESSIBILITY_SERVICE"), false, 5000L),
+    CLICK_VISIBLE_ELEMENT("click_visible_element", listOf("ACCESSIBILITY_SERVICE"), false, 4500L),
+    CLICK_WHATSAPP_CONTACT("click_whatsapp_contact", listOf("ACCESSIBILITY_SERVICE"), false, 6000L),
+    OPEN_WHATSAPP_CHAT("open_whatsapp_chat", listOf("ACCESSIBILITY_SERVICE"), false, 6000L),
+    TYPE_WHATSAPP_MESSAGE("type_whatsapp_message", listOf("ACCESSIBILITY_SERVICE"), false, 6000L),
+    SEND_WHATSAPP_MESSAGE("send_whatsapp_message", listOf("ACCESSIBILITY_SERVICE"), false, 8000L),
+    VERIFY_WHATSAPP_SEND("verify_whatsapp_send", listOf("ACCESSIBILITY_SERVICE"), false, 4000L);
 
     companion object {
         fun fromToolName(name: String?): AllowedActionType? {
@@ -91,18 +99,29 @@ data class TypedActionResult(
     val message: String,
     val failureReason: String? = null,
     val requiredPermissions: List<String> = emptyList(),
-    val data: JSONObject? = null
+    val data: JSONObject? = null,
+    val target: String = "",
+    val executionStatus: String = status
 ) {
     fun toJson(): String {
         val perms = JSONArray()
         requiredPermissions.forEach { perms.put(it) }
+        val resolvedTarget = target.ifBlank {
+            data?.optString("target", "")?.ifBlank {
+                data?.optString("contactName", "")?.ifBlank {
+                    data?.optString("title", "").orEmpty()
+                }.orEmpty()
+            }.orEmpty()
+        }
         val obj = JSONObject()
             .put("actionId", actionId)
             .put("actionType", actionType)
+            .put("target", resolvedTarget)
             .put("success", success)
             .put("verified", verified)
             .put("awaitingConfirmation", awaitingConfirmation)
             .put("status", status)
+            .put("executionStatus", executionStatus.ifBlank { status })
             .put("message", message)
             .put("requiredPermissions", perms)
         if (!pendingActionId.isNullOrBlank()) obj.put("pendingActionId", pendingActionId)

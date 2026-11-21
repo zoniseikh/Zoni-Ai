@@ -21,14 +21,19 @@ data class AccessibilityActionOutcome(
     val activePackage: String = "",
     val message: String,
     val failureReason: String? = null,
-    val data: JSONObject? = null
+    val data: JSONObject? = null,
+    val target: String = "",
+    val executionStatus: String = if (success) "executed" else (failureReason ?: "failed")
 ) {
     fun toJson(): String {
         val obj = JSONObject()
             .put("success", success)
             .put("verified", verified)
             .put("actionType", actionType)
+            .put("target", target)
             .put("activePackage", activePackage)
+            .put("executionStatus", executionStatus)
+            .put("status", executionStatus)
             .put("message", message)
         if (!failureReason.isNullOrBlank()) {
             obj.put("failureReason", failureReason)
@@ -65,10 +70,19 @@ class ZoniAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // Track only the active foreground package name; NEVER scrape screen content in background.
-        val pkg = event?.packageName?.toString()
+        // Track only lightweight foreground package & event timestamps; NEVER scrape screen content in background.
+        if (event == null) return
+        val now = System.currentTimeMillis()
+        val pkg = event.packageName?.toString()
         if (!pkg.isNullOrBlank()) {
             lastForegroundPackage = pkg
+        }
+        lastEventTimestampMs = now
+        lastEventType = event.eventType
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> lastWindowStateChangeMs = now
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> lastWindowContentChangeMs = now
         }
     }
 
@@ -784,19 +798,546 @@ class ZoniAccessibilityService : AccessibilityService() {
         return completed.get()
     }
 
+    // ========================================================================
+    // SNAPSHOT TREE & SMART CLICK HELPERS (YOUTUBE + WHATSAPP)
+    // ========================================================================
+
+    private fun captureNodeSnapshotTree(
+        root: AccessibilityNodeInfo,
+        maxNodes: Int = 350
+    ): Pair<List<AccessibleNodeSnapshot>, Map<Int, AccessibilityNodeInfo>> {
+        val snapshots = mutableListOf<AccessibleNodeSnapshot>()
+        val nodeMap = HashMap<Int, AccessibilityNodeInfo>()
+        var nextId = 1
+
+        fun walk(node: AccessibilityNodeInfo?, parentId: Int?) {
+            if (node == null || snapshots.size >= maxNodes) return
+            if (node.isPassword) return
+
+            val id = nextId++
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                node.hintText?.toString()
+            } else {
+                null
+            }
+
+            val snap = AccessibleNodeSnapshot(
+                nodeId = id,
+                parentId = parentId,
+                viewIdResourceName = node.viewIdResourceName,
+                className = node.className?.toString(),
+                text = node.text?.toString(),
+                contentDescription = node.contentDescription?.toString(),
+                hintText = hint,
+                isClickable = node.isClickable,
+                isEnabled = node.isEnabled,
+                isVisibleToUser = node.isVisibleToUser,
+                isEditable = node.isEditable,
+                isPassword = node.isPassword,
+                bounds = AccessibleRect(rect.left, rect.top, rect.right, rect.bottom)
+            )
+            snapshots.add(snap)
+            nodeMap[id] = node
+
+            for (i in 0 until node.childCount) {
+                walk(node.getChild(i), id)
+                if (snapshots.size >= maxNodes) return
+            }
+        }
+        walk(root, null)
+        return Pair(snapshots, nodeMap)
+    }
+
     /**
-     * Phase 6 — Verified WhatsApp Send Automation (ONLY invoked AFTER explicit user confirmation).
-     *
-     * Safeguards:
-     * 1. Enforces idempotency via WhatsAppSendDeduplicator (never sends the same pendingActionId twice).
-     * 2. Waits cleanly for com.whatsapp / com.whatsapp.w4b to enter foreground.
-     * 3. Runs AccessibilityGuard screen safety checks.
-     * 4. Verifies the visible conversation header matches the approved recipient name or phone.
-     * 5. Verifies the composer contains the approved message (or fills it safely if empty).
-     * 6. Finds the visible, enabled Send button semantically (viewId `:id/send` or localized contentDescription)
-     *    and clicks via AccessibilityNodeInfo.ACTION_CLICK (bounded node gesture fallback only if needed).
-     * 7. Verifies outgoing message appears in conversation or composer cleared — NEVER claims delivered/read.
+     * Executes semantic ACTION_CLICK first (target node -> nearest clickable parent),
+     * falling back to a bounded dispatchGesture ONLY on the verified visible element's exact bounds.
+     * NEVER clicks arbitrary fixed screen coordinates.
      */
+    private fun performSmartClickOnResolvedTarget(
+        targetNode: AccessibilityNodeInfo?,
+        clickableAncestor: AccessibilityNodeInfo?,
+        verifiedBounds: AccessibleRect
+    ): Pair<Boolean, String> {
+        if (targetNode != null && !targetNode.isPassword && targetNode.isClickable && targetNode.isEnabled) {
+            if (targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                return Pair(true, "semantic_node_click")
+            }
+        }
+        if (clickableAncestor != null && !clickableAncestor.isPassword && clickableAncestor.isEnabled) {
+            if (clickableAncestor.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                return Pair(true, "semantic_parent_click")
+            }
+        }
+        // Walk live parent chain as additional safety net
+        var walk: AccessibilityNodeInfo? = targetNode?.parent
+        var depth = 0
+        while (walk != null && depth < 6) {
+            if (walk.isPassword) break
+            if (walk.isClickable && walk.isEnabled) {
+                if (walk.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    return Pair(true, "semantic_parent_click")
+                }
+                break
+            }
+            walk = walk.parent
+            depth++
+        }
+        // Bounded gesture fallback ONLY on verified visible bounds
+        if (verifiedBounds.isValidVisible && verifiedBounds.centerX > 0f && verifiedBounds.centerY > 0f) {
+            val tapped = dispatchTapGesture(verifiedBounds.centerX, verifiedBounds.centerY)
+            if (tapped) {
+                return Pair(true, "bounded_bounds_gesture")
+            }
+        }
+        return Pair(false, "click_rejected")
+    }
+
+    private fun waitForUiTransitionEvent(sinceMs: Long, maxWaitMs: Long = 900L): Boolean {
+        val deadline = System.currentTimeMillis() + maxWaitMs
+        while (System.currentTimeMillis() < deadline) {
+            if (lastWindowStateChangeMs > sinceMs || lastWindowContentChangeMs > sinceMs) {
+                try {
+                    Thread.sleep(220L)
+                } catch (_: InterruptedException) {
+                    // ignore
+                }
+                return true
+            }
+            try {
+                Thread.sleep(90L)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+        return lastWindowStateChangeMs > sinceMs || lastWindowContentChangeMs > sinceMs
+    }
+
+    // ========================================================================
+    // PART 1 — ADVANCED YOUTUBE CLICK ENGINE (LIVE EXECUTION + VERIFICATION)
+    // ========================================================================
+
+    fun clickYouTubeVideo(
+        index: Int? = null,
+        targetHint: String = "",
+        titleQuery: String = "",
+        actionTypeName: String = "click_youtube_video"
+    ): AccessibilityActionOutcome {
+        val root = rootInActiveWindow ?: return AccessibilityActionOutcome(
+            success = false,
+            verified = false,
+            actionType = actionTypeName,
+            activePackage = lastForegroundPackage,
+            message = "No active Android window is accessible to click a YouTube video.",
+            failureReason = "no_active_window",
+            target = titleQuery.ifBlank { targetHint.ifBlank { index?.let { "video #$it" } ?: "youtube_video" } },
+            executionStatus = "failed"
+        )
+        val activePkg = root.packageName?.toString().orEmpty()
+        checkScreenSafety(root, actionTypeName)?.let { return it }
+
+        if (!YouTubeClickEngine.isYouTubePackage(activePkg)) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = actionTypeName,
+                activePackage = activePkg,
+                message = "YouTube is not currently open on screen (active app: ${activePkg.ifBlank { "unknown" }}). Please open YouTube first.",
+                failureReason = "youtube_not_in_foreground",
+                target = titleQuery.ifBlank { targetHint },
+                executionStatus = "youtube_not_in_foreground"
+            )
+        }
+
+        val beforeLabels = collectVisibleLabels(root, 40)
+        val (snapshots, nodeMap) = captureNodeSnapshotTree(root)
+        return when (val resolution = YouTubeClickEngine.resolveVideoTarget(snapshots, index, targetHint, titleQuery)) {
+            is YouTubeTargetResolution.NotFound -> AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = actionTypeName,
+                activePackage = activePkg,
+                message = resolution.reason,
+                failureReason = resolution.failureCode,
+                target = titleQuery.ifBlank { targetHint.ifBlank { index?.toString().orEmpty() } },
+                executionStatus = resolution.failureCode
+            )
+            is YouTubeTargetResolution.Ambiguous -> {
+                val arr = JSONArray()
+                resolution.candidates.forEachIndexed { i, c ->
+                    arr.put(JSONObject().put("index", i + 1).put("title", c.title))
+                }
+                AccessibilityActionOutcome(
+                    success = false,
+                    verified = true,
+                    actionType = actionTypeName,
+                    activePackage = activePkg,
+                    message = "Multiple visible YouTube videos match \"${resolution.query}\". Please specify which one (e.g., first or second video).",
+                    failureReason = "ambiguous_target",
+                    target = resolution.query,
+                    executionStatus = "ambiguous_target",
+                    data = JSONObject().put("candidates", arr).put("query", resolution.query)
+                )
+            }
+            is YouTubeTargetResolution.Matched -> {
+                val cand = resolution.candidate
+                val liveTarget = nodeMap[cand.matchNode.nodeId]
+                val liveClickable = cand.clickableNode?.let { nodeMap[it.nodeId] }
+                val preClickMs = System.currentTimeMillis()
+
+                val (clicked, method) = performSmartClickOnResolvedTarget(liveTarget, liveClickable, cand.bounds)
+                if (!clicked) {
+                    return AccessibilityActionOutcome(
+                        success = false,
+                        verified = false,
+                        actionType = actionTypeName,
+                        activePackage = activePkg,
+                        message = "Found YouTube target \"${cand.title}\", but neither semantic click nor bounded gesture succeeded.",
+                        failureReason = "youtube_click_rejected",
+                        target = cand.title,
+                        executionStatus = "failed"
+                    )
+                }
+
+                val eventObserved = waitForUiTransitionEvent(preClickMs, 1000L)
+                val postRoot = rootInActiveWindow
+                val postPkg = postRoot?.packageName?.toString().orEmpty().ifBlank { getActivePackageName() }
+                val postSnapshots = if (postRoot != null) captureNodeSnapshotTree(postRoot).first else emptyList()
+
+                val verification = YouTubeClickEngine.verifyWatchScreenOpened(
+                    beforeLabels = beforeLabels,
+                    afterNodes = postSnapshots,
+                    clickedTitle = cand.title,
+                    activePackage = postPkg,
+                    accessibilityEventObserved = eventObserved
+                )
+
+                AccessibilityActionOutcome(
+                    success = true,
+                    verified = verification.openedWatchScreen,
+                    actionType = actionTypeName,
+                    activePackage = postPkg,
+                    message = if (verification.openedWatchScreen) {
+                        "Clicked YouTube target \"${cand.title}\" (#${resolution.rankIndex}) via $method. ${verification.evidence}"
+                    } else {
+                        "Clicked YouTube target \"${cand.title}\" (#${resolution.rankIndex}) via $method, but could not verify the video player opened. ${verification.evidence}"
+                    },
+                    failureReason = if (verification.openedWatchScreen) null else "watch_screen_unverified",
+                    target = cand.title,
+                    executionStatus = verification.status,
+                    data = JSONObject()
+                        .put("target", cand.title)
+                        .put("title", cand.title)
+                        .put("rankIndex", resolution.rankIndex)
+                        .put("method", method)
+                        .put("isPlayButton", cand.isPlayButton)
+                        .put("isThumbnail", cand.isThumbnail)
+                        .put("evidence", verification.evidence)
+                )
+            }
+        }
+    }
+
+    fun clickVisibleElementAdvanced(targetText: String, index: Int? = null): AccessibilityActionOutcome {
+        val activePkg = getActivePackageName()
+        val lower = targetText.trim().lowercase()
+        // Route YouTube-specific visible requests (thumbnail / play button / video) to the YouTube Click Engine automatically
+        if (YouTubeClickEngine.isYouTubePackage(activePkg) &&
+            (lower.contains("video") || lower.contains("ভিডিও") || lower.contains("वीडियो") ||
+                lower.contains("thumbnail") || lower.contains("থাম্বনেইল") ||
+                lower.contains("play") || lower.contains("প্লে"))
+        ) {
+            return clickYouTubeVideo(index = index, targetHint = targetText, titleQuery = "", actionTypeName = "click_visible_element")
+        }
+        return tapElementByTextDetailed(targetText).copy(actionType = "click_visible_element", target = targetText)
+    }
+
+    // ========================================================================
+    // PART 2A — WHATSAPP SMART CONTACT & CHAT NAME CLICK ENGINE
+    // ========================================================================
+
+    fun clickWhatsAppContact(
+        contactQuery: String = "",
+        ordinalIndex: Int? = null,
+        searchIfMissing: Boolean = true,
+        actionTypeName: String = "click_whatsapp_contact"
+    ): AccessibilityActionOutcome {
+        // Wait briefly if WhatsApp was just launched
+        var root: AccessibilityNodeInfo? = null
+        var activePkg = ""
+        for (attempt in 0 until 7) {
+            val candidateRoot = rootInActiveWindow
+            val pkg = candidateRoot?.packageName?.toString().orEmpty()
+            if (candidateRoot != null && WhatsAppAutomationValidator.isWhatsAppPackage(pkg)) {
+                root = candidateRoot
+                activePkg = pkg
+                break
+            }
+            try {
+                Thread.sleep(250L)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+
+        val waRoot = root ?: return AccessibilityActionOutcome(
+            success = false,
+            verified = false,
+            actionType = actionTypeName,
+            activePackage = getActivePackageName(),
+            message = "WhatsApp is not currently open on screen. Please open WhatsApp first.",
+            failureReason = "whatsapp_not_in_foreground",
+            target = contactQuery.ifBlank { ordinalIndex?.let { "contact #$it" } ?: "" },
+            executionStatus = "whatsapp_not_in_foreground"
+        )
+
+        checkScreenSafety(waRoot, actionTypeName)?.let { return it }
+
+        val cleanQuery = contactQuery.trim()
+        var (snapshots, nodeMap) = captureNodeSnapshotTree(waRoot)
+        var resolution = WhatsAppSmartContactEngine.resolveContactTarget(snapshots, cleanQuery, ordinalIndex)
+
+        // If contact name is not immediately visible on main chat list and searchIfMissing=true, use WhatsApp's own visible Search field cleanly
+        if (resolution is WhatsAppContactResolution.NotFound && searchIfMissing && cleanQuery.isNotBlank()) {
+            val searchOpened = openWhatsAppInAppSearch(waRoot, MultilingualNameMatcher.cleanPersonQuery(cleanQuery))
+            if (searchOpened) {
+                try {
+                    Thread.sleep(550L)
+                } catch (_: InterruptedException) {
+                    // ignore
+                }
+                val refreshedRoot = rootInActiveWindow ?: waRoot
+                val refreshedTree = captureNodeSnapshotTree(refreshedRoot)
+                snapshots = refreshedTree.first
+                nodeMap = refreshedTree.second
+                resolution = WhatsAppSmartContactEngine.resolveContactTarget(snapshots, cleanQuery, ordinalIndex)
+            }
+        }
+
+        return when (resolution) {
+            is WhatsAppContactResolution.NotFound -> AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = actionTypeName,
+                activePackage = activePkg,
+                message = resolution.reason,
+                failureReason = resolution.failureCode,
+                target = cleanQuery.ifBlank { ordinalIndex?.toString().orEmpty() },
+                executionStatus = resolution.failureCode
+            )
+            is WhatsAppContactResolution.Ambiguous -> {
+                val arr = JSONArray()
+                resolution.candidates.forEach { c ->
+                    arr.put(JSONObject().put("name", c.displayName).put("phone", ""))
+                }
+                AccessibilityActionOutcome(
+                    success = false,
+                    verified = true,
+                    actionType = actionTypeName,
+                    activePackage = activePkg,
+                    message = "Multiple visible WhatsApp contacts match \"${resolution.query}\". Please choose which contact to open.",
+                    failureReason = "multiple_contacts",
+                    target = resolution.query,
+                    executionStatus = "multiple_contacts",
+                    data = JSONObject()
+                        .put("query", resolution.query)
+                        .put("recipient", resolution.query)
+                        .put("candidates", arr)
+                )
+            }
+            is WhatsAppContactResolution.Matched -> {
+                val cand = resolution.candidate
+                val liveNameNode = nodeMap[cand.nameNode.nodeId]
+                val liveClickable = cand.clickableNode?.let { nodeMap[it.nodeId] }
+                val preClickMs = System.currentTimeMillis()
+
+                val (clicked, method) = performSmartClickOnResolvedTarget(liveNameNode, liveClickable, cand.bounds)
+                if (!clicked) {
+                    return AccessibilityActionOutcome(
+                        success = false,
+                        verified = false,
+                        actionType = actionTypeName,
+                        activePackage = activePkg,
+                        message = "Found WhatsApp contact \"${cand.displayName}\", but could not click it safely.",
+                        failureReason = "contact_click_rejected",
+                        target = cand.displayName,
+                        executionStatus = "failed"
+                    )
+                }
+
+                waitForUiTransitionEvent(preClickMs, 950L)
+                val postRoot = rootInActiveWindow
+                val postPkg = postRoot?.packageName?.toString().orEmpty().ifBlank { activePkg }
+                val postSnapshots = if (postRoot != null) captureNodeSnapshotTree(postRoot).first else emptyList()
+                val chatOpened = WhatsAppSmartContactEngine.verifyConversationOpened(
+                    afterNodes = postSnapshots,
+                    expectedName = cand.displayName,
+                    expectedPhone = "",
+                    activePackage = postPkg
+                )
+
+                AccessibilityActionOutcome(
+                    success = true,
+                    verified = chatOpened,
+                    actionType = actionTypeName,
+                    activePackage = postPkg,
+                    message = if (chatOpened) {
+                        "Clicked \"${cand.displayName}\" in WhatsApp via $method and verified the conversation opened."
+                    } else {
+                        "Clicked \"${cand.displayName}\" in WhatsApp via $method, but could not verify the conversation header opened."
+                    },
+                    failureReason = if (chatOpened) null else "conversation_open_unverified",
+                    target = cand.displayName,
+                    executionStatus = if (chatOpened) "whatsapp_contact_opened" else "whatsapp_click_unverified",
+                    data = JSONObject()
+                        .put("contactName", cand.displayName)
+                        .put("target", cand.displayName)
+                        .put("method", method)
+                        .put("conversationVerified", chatOpened)
+                )
+            }
+        }
+    }
+
+    private fun openWhatsAppInAppSearch(root: AccessibilityNodeInfo, query: String): Boolean {
+        val searchNode = findBestSemanticNode(root, "Search")
+            ?: findBestSemanticNode(root, "Ask Meta AI or Search")
+            ?: findBestSemanticNode(root, "খুঁজুন")
+            ?: return false
+
+        val rect = Rect()
+        searchNode.getBoundsInScreen(rect)
+        val (clicked, _) = performSmartClickOnResolvedTarget(
+            searchNode,
+            null,
+            AccessibleRect(rect.left, rect.top, rect.right, rect.bottom)
+        )
+        if (!clicked) return false
+
+        try {
+            Thread.sleep(320L)
+        } catch (_: InterruptedException) {
+            // ignore
+        }
+        val activeRoot = rootInActiveWindow ?: root
+        val searchInput = findEditableNode(activeRoot, "Search") ?: return false
+        if (searchInput.isPassword) return false
+        searchInput.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, query)
+        }
+        return searchInput.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    // ========================================================================
+    // PART 2B — TYPE WHATSAPP MESSAGE ONLY (NEVER CLICKS SEND!)
+    // ========================================================================
+
+    fun typeWhatsAppMessageOnly(
+        expectedRecipient: String,
+        messageText: String
+    ): AccessibilityActionOutcome {
+        val cleanMsg = messageText.trim()
+        if (cleanMsg.isEmpty()) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "type_whatsapp_message",
+                activePackage = getActivePackageName(),
+                message = "No message text was provided to type into WhatsApp.",
+                failureReason = "empty_message",
+                target = expectedRecipient,
+                executionStatus = "missing_message"
+            )
+        }
+
+        val root = rootInActiveWindow
+        val activePkg = root?.packageName?.toString().orEmpty()
+        if (root == null || !WhatsAppAutomationValidator.isWhatsAppPackage(activePkg)) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "type_whatsapp_message",
+                activePackage = activePkg,
+                message = "WhatsApp conversation must be open on screen to type your message.",
+                failureReason = "whatsapp_not_in_foreground",
+                target = expectedRecipient,
+                executionStatus = "whatsapp_not_in_foreground"
+            )
+        }
+        checkScreenSafety(root, "type_whatsapp_message")?.let { return it }
+
+        if (expectedRecipient.isNotBlank()) {
+            val labels = collectVisibleLabels(root, 40)
+            val matched = WhatsAppAutomationValidator.matchesExpectedRecipient(labels, expectedRecipient, "") ||
+                labels.take(12).any { MultilingualNameMatcher.matchesQuery(it, expectedRecipient) }
+            if (!matched) {
+                return AccessibilityActionOutcome(
+                    success = false,
+                    verified = false,
+                    actionType = "type_whatsapp_message",
+                    activePackage = activePkg,
+                    message = "Active WhatsApp conversation header does not match \"$expectedRecipient\". Stopped before typing.",
+                    failureReason = "recipient_verification_failed",
+                    target = expectedRecipient,
+                    executionStatus = "recipient_verification_failed"
+                )
+            }
+        }
+
+        val composer = findWhatsAppComposerNode(root)
+        if (composer == null || composer.isPassword) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "type_whatsapp_message",
+                activePackage = activePkg,
+                message = "Could not locate the visible WhatsApp message composer.",
+                failureReason = "composer_not_found",
+                target = expectedRecipient,
+                executionStatus = "composer_not_found"
+            )
+        }
+
+        composer.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, cleanMsg)
+        }
+        val setOk = composer.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        try {
+            Thread.sleep(220L)
+        } catch (_: InterruptedException) {
+            // ignore
+        }
+        composer.refresh()
+        val refreshedText = (findWhatsAppComposerNode(rootInActiveWindow ?: root) ?: composer).text?.toString()?.trim().orEmpty()
+        val verified = setOk && WhatsAppAutomationValidator.composerMatchesApprovedMessage(refreshedText, cleanMsg)
+
+        return AccessibilityActionOutcome(
+            success = verified,
+            verified = verified,
+            actionType = "type_whatsapp_message",
+            activePackage = activePkg,
+            message = if (verified) {
+                "Typed your exact message in WhatsApp composer (did NOT tap Send because only typing was requested)."
+            } else {
+                "Could not verify the exact message text in the WhatsApp composer."
+            },
+            failureReason = if (verified) null else "composer_verification_failed",
+            target = expectedRecipient,
+            executionStatus = if (verified) "whatsapp_message_typed_not_sent" else "failed",
+            data = JSONObject()
+                .put("contactName", expectedRecipient)
+                .put("messageText", cleanMsg)
+                .put("sent", false)
+        )
+    }
+
+    // ========================================================================
+    // PART 2C & 2D — FIXED WHATSAPP SEND BUTTON RESOLVER + POST-SEND VERIFIER
+    // ========================================================================
+
     fun sendApprovedWhatsAppMessage(
         expectedRecipient: String,
         expectedPhone: String,
@@ -808,10 +1349,12 @@ class ZoniAccessibilityService : AccessibilityService() {
             return AccessibilityActionOutcome(
                 success = false,
                 verified = false,
-                actionType = "whatsapp_send_approved",
+                actionType = "send_whatsapp_message",
                 activePackage = getActivePackageName(),
-                message = "Cannot auto-send an empty WhatsApp message. Please type your message in WhatsApp.",
-                failureReason = "empty_message"
+                message = "Cannot send an empty WhatsApp message.",
+                failureReason = "empty_message",
+                target = expectedRecipient,
+                executionStatus = "empty_message"
             )
         }
 
@@ -819,17 +1362,19 @@ class ZoniAccessibilityService : AccessibilityService() {
             return AccessibilityActionOutcome(
                 success = false,
                 verified = true,
-                actionType = "whatsapp_send_approved",
+                actionType = "send_whatsapp_message",
                 activePackage = getActivePackageName(),
-                message = "Duplicate send prevented: this approved WhatsApp message was already processed.",
-                failureReason = "duplicate_send_prevented"
+                message = "Duplicate send prevented: this WhatsApp message was already processed.",
+                failureReason = "duplicate_send_prevented",
+                target = expectedRecipient,
+                executionStatus = "duplicate_blocked"
             )
         }
 
-        // Wait briefly (up to ~2.4s) for WhatsApp conversation window to come into foreground
+        // 1. Wait up to ~3.0s for WhatsApp conversation window to enter foreground
         var root: AccessibilityNodeInfo? = null
         var activePkg = ""
-        for (attempt in 0 until 8) {
+        for (attempt in 0 until 10) {
             val candidateRoot = rootInActiveWindow
             val pkg = candidateRoot?.packageName?.toString().orEmpty()
             if (candidateRoot != null && WhatsAppAutomationValidator.isWhatsAppPackage(pkg)) {
@@ -849,54 +1394,76 @@ class ZoniAccessibilityService : AccessibilityService() {
             return AccessibilityActionOutcome(
                 success = false,
                 verified = false,
-                actionType = "whatsapp_send_approved",
+                actionType = "send_whatsapp_message",
                 activePackage = getActivePackageName(),
                 message = "WhatsApp did not reach the foreground in time. Your draft is open — please tap Send manually.",
-                failureReason = "whatsapp_window_not_ready"
+                failureReason = "whatsapp_window_not_ready",
+                target = expectedRecipient,
+                executionStatus = "whatsapp_window_not_ready"
             )
         }
 
-        checkScreenSafety(waRoot, "whatsapp_send_approved")?.let { blocked ->
+        checkScreenSafety(waRoot, "send_whatsapp_message")?.let { blocked ->
             WhatsAppSendDeduplicator.release(pendingActionId)
             return blocked
         }
 
-        // Verify recipient header matches approved contact or phone number
+        // 2. Verify conversation header matches expected recipient name/transliteration or phone
         val visibleLabels = collectVisibleLabels(waRoot, 45)
-        val recipientVerified = WhatsAppAutomationValidator.matchesExpectedRecipient(
-            visibleLabels = visibleLabels,
-            expectedRecipient = expectedRecipient,
-            expectedPhone = expectedPhone
-        )
+        val recipientVerified = (expectedRecipient.isBlank() && expectedPhone.isBlank()) ||
+            WhatsAppAutomationValidator.matchesExpectedRecipient(
+                visibleLabels = visibleLabels,
+                expectedRecipient = expectedRecipient,
+                expectedPhone = expectedPhone
+            ) ||
+            (expectedRecipient.isNotBlank() && visibleLabels.take(14).any {
+                MultilingualNameMatcher.matchesQuery(it, expectedRecipient)
+            })
         if (!recipientVerified) {
             WhatsAppSendDeduplicator.release(pendingActionId)
             return AccessibilityActionOutcome(
                 success = false,
                 verified = false,
-                actionType = "whatsapp_send_approved",
+                actionType = "send_whatsapp_message",
                 activePackage = activePkg,
-                message = "Could not verify the active WhatsApp conversation header matches \"$expectedRecipient\". Did not tap Send for your safety — please verify and tap Send manually.",
-                failureReason = "recipient_verification_failed"
+                message = "Could not verify the active WhatsApp conversation header matches \"$expectedRecipient\". Stopped before tapping Send for your safety.",
+                failureReason = "recipient_verification_failed",
+                target = expectedRecipient,
+                executionStatus = "recipient_verification_failed"
             )
         }
 
-        // Locate WhatsApp composer and guarantee it contains EXACTLY the user-approved message
-        val composerNode = findWhatsAppComposerNode(waRoot)
+        // 3. Locate WhatsApp composer and guarantee it contains EXACTLY the user's message
+        var composerNode: AccessibilityNodeInfo? = null
+        for (attempt in 0 until 5) {
+            val liveRoot = rootInActiveWindow ?: waRoot
+            composerNode = findWhatsAppComposerNode(liveRoot)
+            if (composerNode != null) break
+            try {
+                Thread.sleep(220L)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+
         if (composerNode == null || composerNode.isPassword) {
             WhatsAppSendDeduplicator.release(pendingActionId)
             return AccessibilityActionOutcome(
                 success = false,
                 verified = false,
-                actionType = "whatsapp_send_approved",
+                actionType = "send_whatsapp_message",
                 activePackage = activePkg,
                 message = "Could not locate the WhatsApp message composer safely. Please verify and tap Send manually.",
-                failureReason = "composer_not_found"
+                failureReason = "composer_not_found",
+                target = expectedRecipient,
+                executionStatus = "composer_not_found"
             )
         }
 
         val existingComposerText = composerNode.text?.toString()?.trim().orEmpty()
         if (!WhatsAppAutomationValidator.composerMatchesApprovedMessage(existingComposerText, cleanMsg)) {
             composerNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            composerNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             val args = Bundle().apply {
                 putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, cleanMsg)
             }
@@ -906,105 +1473,205 @@ class ZoniAccessibilityService : AccessibilityService() {
                 return AccessibilityActionOutcome(
                     success = false,
                     verified = false,
-                    actionType = "whatsapp_send_approved",
+                    actionType = "send_whatsapp_message",
                     activePackage = activePkg,
-                    message = "Could not safely set the approved message in WhatsApp composer. Did not tap Send — please review and send manually.",
-                    failureReason = "composer_set_text_failed"
+                    message = "Could not enter the exact message in the WhatsApp composer. Stopped before tapping Send.",
+                    failureReason = "composer_set_text_failed",
+                    target = expectedRecipient,
+                    executionStatus = "composer_set_text_failed"
                 )
             }
             try {
-                Thread.sleep(220L)
+                Thread.sleep(260L)
             } catch (_: InterruptedException) {
                 // ignore
             }
         }
 
-        // Refresh node and verify composer text matches the exact approved message before tapping Send
+        // Verify exact message text appears in composer before looking for Send button
         composerNode.refresh()
-        val freshRoot = rootInActiveWindow ?: waRoot
-        val refreshedComposer = findWhatsAppComposerNode(freshRoot) ?: composerNode
+        val postTypeRoot = rootInActiveWindow ?: waRoot
+        val refreshedComposer = findWhatsAppComposerNode(postTypeRoot) ?: composerNode
         val verifiedComposerText = refreshedComposer.text?.toString()?.trim().orEmpty()
         if (!WhatsAppAutomationValidator.composerMatchesApprovedMessage(verifiedComposerText, cleanMsg)) {
             WhatsAppSendDeduplicator.release(pendingActionId)
             return AccessibilityActionOutcome(
                 success = false,
                 verified = false,
-                actionType = "whatsapp_send_approved",
+                actionType = "send_whatsapp_message",
                 activePackage = activePkg,
-                message = "WhatsApp composer text did not match the exact message you approved. Stopped before tapping Send — please review and send manually.",
-                failureReason = "composer_verification_failed"
+                message = "WhatsApp composer text did not match your exact message. Stopped before tapping Send.",
+                failureReason = "composer_verification_failed",
+                target = expectedRecipient,
+                executionStatus = "composer_verification_failed"
             )
         }
 
-        // Locate visible, enabled WhatsApp Send button semantically
-        val sendNode = findWhatsAppSendButton(freshRoot)
-        if (sendNode == null) {
-            WhatsAppSendDeduplicator.release(pendingActionId)
-            return AccessibilityActionOutcome(
-                success = false,
-                verified = false,
-                actionType = "whatsapp_send_approved",
-                activePackage = activePkg,
-                message = "WhatsApp draft is ready, but the Send button was not found on screen. Please tap Send manually.",
-                failureReason = "send_button_not_found"
-            )
-        }
+        // 4. Dedicated WhatsApp Send Button Resolver with event-aware retry loop
+        //    Handles WhatsApp's mic->Send icon swap lag after ACTION_SET_TEXT or wa.me prefill.
+        val composerRawRect = Rect()
+        refreshedComposer.getBoundsInScreen(composerRawRect)
+        val composerBounds = AccessibleRect(
+            composerRawRect.left,
+            composerRawRect.top,
+            composerRawRect.right,
+            composerRawRect.bottom
+        )
 
-        // Trigger Send via semantic ACTION_CLICK first, falling back to bounded node gesture only if rejected
-        var clicked = sendNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        var clickMethod = "semantic_send_click"
-        if (!clicked) {
-            val rect = Rect()
-            sendNode.getBoundsInScreen(rect)
-            if (!rect.isEmpty && rect.centerX() > 0 && rect.centerY() > 0) {
-                clicked = dispatchTapGesture(rect.centerX().toFloat(), rect.centerY().toFloat())
-                clickMethod = "bounded_send_gesture"
+        var resolvedSendMatch: WhatsAppSendButtonMatch? = null
+        var resolvedNodeMap: Map<Int, AccessibilityNodeInfo> = emptyMap()
+
+        for (poll in 0 until 8) {
+            val currentRoot = rootInActiveWindow ?: postTypeRoot
+            val (snapList, snapNodeMap) = captureNodeSnapshotTree(currentRoot)
+            val match = WhatsAppSendButtonResolver.resolveSendButton(snapList, composerBounds)
+            if (match != null) {
+                resolvedSendMatch = match
+                resolvedNodeMap = snapNodeMap
+                break
+            }
+            // On poll 2, refocus composer and re-set the exact text once to trigger WhatsApp's TextWatcher mic->Send swap
+            if (poll == 2) {
+                val cNode = findWhatsAppComposerNode(currentRoot)
+                if (cNode != null && !cNode.isPassword) {
+                    cNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                    val reArgs = Bundle().apply {
+                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, cleanMsg)
+                    }
+                    cNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, reArgs)
+                }
+            }
+            try {
+                Thread.sleep(190L)
+            } catch (_: InterruptedException) {
+                break
             }
         }
 
+        val sendMatch = resolvedSendMatch ?: run {
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "send_whatsapp_message",
+                activePackage = activePkg,
+                message = "Your exact message is in the WhatsApp composer, but the visible Send button could not be reliably identified (stopped safely rather than guessing coordinates).",
+                failureReason = "send_button_not_found",
+                target = expectedRecipient,
+                executionStatus = "send_button_not_found"
+            )
+        }
+
+        // 5. Execute Send via ACTION_CLICK -> clickable parent -> bounded gesture ONLY on verified Send bounds
+        val liveSendBtn = resolvedNodeMap[sendMatch.buttonNode.nodeId]
+        val liveClickableSend = sendMatch.clickableNode?.let { resolvedNodeMap[it.nodeId] }
+        val preSendMs = System.currentTimeMillis()
+        val (clicked, clickMethod) = performSmartClickOnResolvedTarget(
+            targetNode = liveSendBtn,
+            clickableAncestor = liveClickableSend,
+            verifiedBounds = sendMatch.bounds
+        )
+
         if (!clicked) {
             WhatsAppSendDeduplicator.release(pendingActionId)
             return AccessibilityActionOutcome(
                 success = false,
                 verified = false,
-                actionType = "whatsapp_send_approved",
+                actionType = "send_whatsapp_message",
                 activePackage = activePkg,
-                message = "Could not trigger the WhatsApp Send button automatically. Please tap Send manually.",
-                failureReason = "send_click_rejected"
+                message = "Found the WhatsApp Send button (${sendMatch.matchedBy}), but the click could not be executed. Please tap Send manually.",
+                failureReason = "send_click_rejected",
+                target = expectedRecipient,
+                executionStatus = "send_click_rejected"
             )
         }
 
-        // Wait briefly and verify outgoing message appears in conversation AND composer cleared
-        try {
-            Thread.sleep(450L)
-        } catch (_: InterruptedException) {
-            // ignore
-        }
-        val postRoot = rootInActiveWindow
-        val postLabels = if (postRoot != null) collectVisibleLabels(postRoot, 60) else emptyList()
-        val postComposer = if (postRoot != null) findWhatsAppComposerNode(postRoot)?.text?.toString().orEmpty() else ""
-        val sentVerified = WhatsAppAutomationValidator.verifyOutgoingMessageVisible(
-            visibleChatLabels = postLabels,
-            composerText = postComposer,
-            expectedMessage = cleanMsg
-        )
+        // 6. Observe Accessibility events & verify outgoing message state honestly (pending / sent / delivered / unverified)
+        waitForUiTransitionEvent(preSendMs, 950L)
+        val verification = inspectActiveWhatsAppSendState(cleanMsg)
 
+        // Note: Do NOT release deduplicator when click was dispatched to prevent uncertain duplicate sends!
         return AccessibilityActionOutcome(
-            success = true,
-            verified = sentVerified,
-            actionType = "whatsapp_send_approved",
+            success = verification.verified,
+            verified = verification.verified,
+            actionType = "send_whatsapp_message",
             activePackage = activePkg,
-            message = if (sentVerified) {
-                "Send action completed in WhatsApp for $expectedRecipient and verified in chat (sent=verified, delivered/read depends on WhatsApp network)."
+            message = if (verification.verified) {
+                "WhatsApp message sent to $expectedRecipient via $clickMethod (${sendMatch.matchedBy}). ${verification.evidence}"
             } else {
-                "Triggered Send in WhatsApp for $expectedRecipient, but could not visually confirm the outgoing bubble. Please check WhatsApp."
+                "Clicked WhatsApp Send for $expectedRecipient via $clickMethod, but sending could not be verified: ${verification.evidence}"
             },
+            failureReason = if (verification.verified) null else "send_verification_failed",
+            target = expectedRecipient,
+            executionStatus = verification.state.statusCode,
             data = JSONObject()
                 .put("contactName", expectedRecipient)
                 .put("phoneNumber", expectedPhone)
+                .put("messageText", cleanMsg)
                 .put("method", clickMethod)
-                .put("sentVerified", sentVerified)
-                .put("deliveryVerified", false)
+                .put("sendButtonSignals", sendMatch.matchedBy)
+                .put("deliveryState", verification.state.name.lowercase())
+                .put("sentVerified", verification.verified)
+                .put("deliveryVerified", verification.state == WhatsAppDeliveryState.DELIVERED)
+                .put("readVerified", false)
+                .put("evidence", verification.evidence)
+        )
+    }
+
+    private fun inspectActiveWhatsAppSendState(expectedMessage: String): WhatsAppSendVerificationReport {
+        val postRoot = rootInActiveWindow ?: return WhatsAppSendVerificationReport(
+            verified = false,
+            state = WhatsAppDeliveryState.UNVERIFIED,
+            bubbleVisible = false,
+            composerCleared = false,
+            evidence = "No active WhatsApp window available for post-send verification."
+        )
+        val postSnapshots = captureNodeSnapshotTree(postRoot).first
+        val postComposer = findWhatsAppComposerNode(postRoot)?.text?.toString().orEmpty()
+        return WhatsAppSendButtonResolver.verifyPostSendState(
+            afterNodes = postSnapshots,
+            composerText = postComposer,
+            expectedMessage = expectedMessage
+        )
+    }
+
+    fun verifyWhatsAppSendState(
+        expectedRecipient: String,
+        expectedMessage: String
+    ): AccessibilityActionOutcome {
+        val root = rootInActiveWindow
+        val activePkg = root?.packageName?.toString().orEmpty()
+        if (root == null || !WhatsAppAutomationValidator.isWhatsAppPackage(activePkg)) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "verify_whatsapp_send",
+                activePackage = activePkg,
+                message = "WhatsApp is not currently visible on screen to verify message status.",
+                failureReason = "whatsapp_not_in_foreground",
+                target = expectedRecipient,
+                executionStatus = "whatsapp_not_in_foreground"
+            )
+        }
+        checkScreenSafety(root, "verify_whatsapp_send")?.let { return it }
+
+        val report = inspectActiveWhatsAppSendState(expectedMessage)
+        return AccessibilityActionOutcome(
+            success = report.verified,
+            verified = report.verified,
+            actionType = "verify_whatsapp_send",
+            activePackage = activePkg,
+            message = report.evidence,
+            failureReason = if (report.verified) null else "send_verification_failed",
+            target = expectedRecipient,
+            executionStatus = report.state.statusCode,
+            data = JSONObject()
+                .put("contactName", expectedRecipient)
+                .put("messageText", expectedMessage)
+                .put("deliveryState", report.state.name.lowercase())
+                .put("bubbleVisible", report.bubbleVisible)
+                .put("composerCleared", report.composerCleared)
+                .put("deliveryVerified", report.state == WhatsAppDeliveryState.DELIVERED)
                 .put("readVerified", false)
         )
     }
@@ -1268,11 +1935,20 @@ class ZoniAccessibilityService : AccessibilityService() {
     }
 
     private fun findWhatsAppComposerNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var fallbackEditable: AccessibilityNodeInfo? = null
         fun search(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
             if (node == null || node.isPassword) return null
             val vid = node.viewIdResourceName?.lowercase().orEmpty()
-            if (node.isEditable && (vid.endsWith(":id/entry") || vid.contains("message") || vid.contains("compose"))) {
-                return node
+            val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) node.hintText?.toString()?.lowercase().orEmpty() else ""
+            if (node.isEditable && node.isVisibleToUser && !AccessibilityGuard.isSensitiveInputHint(hint)) {
+                if (vid.endsWith(":id/entry") || vid.contains("message") || vid.contains("compose") ||
+                    hint.contains("message") || hint.contains("মেসেজ") || hint.contains("संदेश")
+                ) {
+                    return node
+                }
+                if (fallbackEditable == null && !vid.contains("search")) {
+                    fallbackEditable = node
+                }
             }
             for (i in 0 until node.childCount) {
                 val found = search(node.getChild(i))
@@ -1280,7 +1956,7 @@ class ZoniAccessibilityService : AccessibilityService() {
             }
             return null
         }
-        return search(root)
+        return search(root) ?: fallbackEditable
     }
 
     private fun findWhatsAppSendButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
@@ -1326,6 +2002,18 @@ class ZoniAccessibilityService : AccessibilityService() {
         @Volatile
         private var lastForegroundPackage: String = ""
 
+        @Volatile
+        private var lastEventTimestampMs: Long = 0L
+
+        @Volatile
+        private var lastEventType: Int = 0
+
+        @Volatile
+        private var lastWindowStateChangeMs: Long = 0L
+
+        @Volatile
+        private var lastWindowContentChangeMs: Long = 0L
+
         fun isConnected(): Boolean = instance != null
 
         fun getVisibleScreenText(maxItems: Int = 80): String =
@@ -1359,6 +2047,81 @@ class ZoniAccessibilityService : AccessibilityService() {
             return svc.executeVerifiedWorkflow(stepsJson).toJson()
         }
 
+        fun clickYouTubeVideo(
+            index: Int? = null,
+            targetHint: String = "",
+            titleQuery: String = "",
+            actionTypeName: String = "click_youtube_video"
+        ): AccessibilityActionOutcome {
+            val svc = instance ?: return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = actionTypeName,
+                message = "Zoni Accessibility Service is not enabled. Enable it in Android Accessibility Settings to click YouTube videos.",
+                failureReason = "accessibility_service_disabled",
+                target = titleQuery.ifBlank { targetHint },
+                executionStatus = "permission_missing"
+            )
+            return svc.clickYouTubeVideo(index, targetHint, titleQuery, actionTypeName)
+        }
+
+        fun clickVisibleElementAdvanced(targetText: String, index: Int? = null): AccessibilityActionOutcome {
+            val svc = instance ?: return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "click_visible_element",
+                message = "Zoni Accessibility Service is not enabled. Enable it in Android Accessibility Settings.",
+                failureReason = "accessibility_service_disabled",
+                target = targetText,
+                executionStatus = "permission_missing"
+            )
+            return svc.clickVisibleElementAdvanced(targetText, index)
+        }
+
+        fun clickWhatsAppContact(
+            contactQuery: String = "",
+            ordinalIndex: Int? = null,
+            searchIfMissing: Boolean = true,
+            actionTypeName: String = "click_whatsapp_contact"
+        ): AccessibilityActionOutcome {
+            val svc = instance ?: return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = actionTypeName,
+                message = "Zoni Accessibility Service is not enabled. Enable it in Android Accessibility Settings to click contacts in WhatsApp.",
+                failureReason = "accessibility_service_disabled",
+                target = contactQuery,
+                executionStatus = "permission_missing"
+            )
+            return svc.clickWhatsAppContact(contactQuery, ordinalIndex, searchIfMissing, actionTypeName)
+        }
+
+        fun typeWhatsAppMessageOnly(expectedRecipient: String, messageText: String): AccessibilityActionOutcome {
+            val svc = instance ?: return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "type_whatsapp_message",
+                message = "Zoni Accessibility Service is not enabled. Enable it in Android Accessibility Settings to type messages in WhatsApp.",
+                failureReason = "accessibility_service_disabled",
+                target = expectedRecipient,
+                executionStatus = "permission_missing"
+            )
+            return svc.typeWhatsAppMessageOnly(expectedRecipient, messageText)
+        }
+
+        fun verifyWhatsAppSendState(expectedRecipient: String, expectedMessage: String): AccessibilityActionOutcome {
+            val svc = instance ?: return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "verify_whatsapp_send",
+                message = "Zoni Accessibility Service is not enabled. Enable it in Android Accessibility Settings to verify WhatsApp sending.",
+                failureReason = "accessibility_service_disabled",
+                target = expectedRecipient,
+                executionStatus = "permission_missing"
+            )
+            return svc.verifyWhatsAppSendState(expectedRecipient, expectedMessage)
+        }
+
         fun sendApprovedWhatsAppMessage(
             expectedRecipient: String,
             expectedPhone: String,
@@ -1368,9 +2131,11 @@ class ZoniAccessibilityService : AccessibilityService() {
             val svc = instance ?: return AccessibilityActionOutcome(
                 success = false,
                 verified = false,
-                actionType = "whatsapp_send_approved",
+                actionType = "send_whatsapp_message",
                 message = "Zoni Accessibility Service is not enabled. WhatsApp draft is open — please tap Send manually.",
-                failureReason = "accessibility_service_disabled"
+                failureReason = "accessibility_service_disabled",
+                target = expectedRecipient,
+                executionStatus = "permission_missing"
             )
             return svc.sendApprovedWhatsAppMessage(
                 expectedRecipient = expectedRecipient,
@@ -1615,10 +2380,12 @@ object AppChatAdapterRegistry {
 }
 
 /**
- * Thread-safe idempotency guard ensuring an approved pendingActionId can NEVER be sent twice.
+ * Thread-safe idempotency and duplicate-send guard ensuring the same actionId or the same
+ * recipient+message cannot be double-sent by rapid voice/tool triggers.
  */
 object WhatsAppSendDeduplicator {
     private val processedIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val recentContentSends = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     fun tryAcquire(pendingActionId: String): Boolean {
         val key = pendingActionId.trim()
@@ -1630,7 +2397,45 @@ object WhatsAppSendDeduplicator {
         processedIds.remove(pendingActionId.trim())
     }
 
+    private fun buildContentKey(channel: String, recipientKey: String, message: String): String {
+        val cleanChannel = channel.trim().lowercase()
+        val cleanRecipient = recipientKey.trim().lowercase().replace(Regex("\\s+"), "")
+        val cleanMessage = message.trim().replace(Regex("\\s+"), " ").lowercase()
+        return "$cleanChannel|$cleanRecipient|$cleanMessage"
+    }
+
+    /**
+     * Prevents duplicate direct sends to the same recipient with the same message within [windowMs].
+     */
+    @Synchronized
+    fun tryAcquireDirectSend(
+        channel: String,
+        recipientKey: String,
+        message: String,
+        nowMs: Long = System.currentTimeMillis(),
+        windowMs: Long = 8000L
+    ): Boolean {
+        val key = buildContentKey(channel, recipientKey, message)
+        val lastSent = recentContentSends[key]
+        if (lastSent != null && (nowMs - lastSent) < windowMs) {
+            return false
+        }
+        recentContentSends[key] = nowMs
+        // Prune stale entries older than 60s
+        if (recentContentSends.size > 64) {
+            val cutoff = nowMs - 60_000L
+            recentContentSends.entries.removeIf { it.value < cutoff }
+        }
+        return true
+    }
+
+    @Synchronized
+    fun releaseDirectSend(channel: String, recipientKey: String, message: String) {
+        recentContentSends.remove(buildContentKey(channel, recipientKey, message))
+    }
+
     fun resetForTests() {
         processedIds.clear()
+        recentContentSends.clear()
     }
 }

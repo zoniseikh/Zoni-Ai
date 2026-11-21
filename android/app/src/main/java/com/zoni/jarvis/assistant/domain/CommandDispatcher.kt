@@ -68,13 +68,31 @@ class CommandDispatcher {
             return VoiceCommand.ScreenQuery(cleaned)
         }
 
+        // 2b. Advanced YouTube Click Engine commands (Bengali / English / Hindi)
+        val ytClick = parseYouTubeClickCommand(cleaned, lower)
+        if (ytClick != null) {
+            return ytClick
+        }
+
+        // 2c. WhatsApp Smart Contact & Chat Name Click commands (Bengali / English / Hindi)
+        val waContactClick = parseWhatsAppContactClickCommand(cleaned, lower)
+        if (waContactClick != null) {
+            return waContactClick
+        }
+
         // 3. Scroll & Accessibility Navigation ("নিচে স্ক্রল করো।", "উপরে স্ক্রল করো", "go back", "go home")
         val navCmd = parseAccessibilityNav(cleaned, lower)
         if (navCmd != null) {
             return navCmd
         }
 
-        // 4. WhatsApp / Message draft commands ("রাহুলকে WhatsApp-এ মেসেজ পাঠাও: ...", "রাহুলকে একটা মেসেজ লিখে দাও।", "মাকে WhatsApp-এ বলো ...")
+        // 4a. Direct SMS commands ("বাবাকে SMS পাঠাও: আমি বাড়ি ফিরছি", "Send SMS to Dad: I am coming")
+        val smsCmd = parseSmsCommand(cleaned)
+        if (smsCmd != null) {
+            return smsCmd
+        }
+
+        // 4b. WhatsApp / Message commands ("রাহুলকে WhatsApp-এ মেসেজ পাঠাও: ...", "রাহুলকে একটা মেসেজ লিখে দাও।", "মাকে WhatsApp-এ বলো ...")
         val waCmd = parseWhatsAppDraftCommand(cleaned)
         if (waCmd != null) {
             return waCmd
@@ -166,6 +184,210 @@ class CommandDispatcher {
         val tapBn = Regex("^(.+?)\\s*(?:বাটনে\\s*)?(?:ট্যাপ\\s*করো|ক্লিক\\s*করো|চাপো)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
         if (tapBn != null && tapBn.groupValues[1].isNotBlank()) {
             return VoiceCommand.TapVisibleElement(tapBn.groupValues[1].trim())
+        }
+        return null
+    }
+
+    private fun parseOrdinal(text: String): Int? {
+        val lower = text.lowercase()
+        return when {
+            Regex("(?:প্রথম|পহেলা|1st|\\bfirst\\b|पहला|पहले|प्रथम)").containsMatchIn(lower) -> 1
+            Regex("(?:দ্বিতীয়|দ্বিতীয়|2nd|\\bsecond\\b|दूसरा|दूसरे|दूसरी)").containsMatchIn(lower) -> 2
+            Regex("(?:তৃতীয়|তৃতীয়|3rd|\\bthird\\b|तीसरा|तीसरे)").containsMatchIn(lower) -> 3
+            Regex("(?:চতুর্থ|4th|\\bfourth\\b|चौथा|चौथे)").containsMatchIn(lower) -> 4
+            Regex("(?:পঞ্চম|5th|\\bfifth\\b|पांचवा|पाँचवाँ)").containsMatchIn(lower) -> 5
+            else -> null
+        }
+    }
+
+    private fun parseYouTubeClickCommand(raw: String, lower: String): VoiceCommand? {
+        val clean = raw.trimEnd('।', '.', '!', '?').trim()
+
+        // Play Button ("Play Button চাপো", "Click the Play button", "প্লে বাটন চাপো")
+        if (Regex("(?:play\\s*button|প্লে\\s*বাটন|प्ले\\s*बटन)", RegexOption.IGNORE_CASE).containsMatchIn(clean) &&
+            Regex("(?:click|tap|press|চাপো|ক্লিক|ট্যাপ|दबाओ|क्लिक)", RegexOption.IGNORE_CASE).containsMatchIn(clean)
+        ) {
+            return VoiceCommand.ClickYouTubeVideo(index = null, targetHint = "play_button")
+        }
+
+        // Thumbnail click ("এই ভিডিওর Thumbnail-এ ক্লিক করো", "Click this video's thumbnail")
+        if (Regex("(?:thumbnail|থাম্বনেইল|थंबनेल)", RegexOption.IGNORE_CASE).containsMatchIn(clean) &&
+            Regex("(?:click|tap|open|ক্লিক|ট্যাপ|খোলো|ওপেন|क्लिक)", RegexOption.IGNORE_CASE).containsMatchIn(clean)
+        ) {
+            return VoiceCommand.ClickYouTubeVideo(index = parseOrdinal(clean) ?: 1, targetHint = "thumbnail")
+        }
+
+        // Search Result click ("প্রথম সার্চ রেজাল্টে ক্লিক করো", "Open the first search result")
+        if (Regex("(?:search\\s*result|সার্চ\\s*রেজাল্ট|सर्च\\s*रिजल्ट|सर्च\\s*परिणाम)", RegexOption.IGNORE_CASE).containsMatchIn(clean) &&
+            Regex("(?:click|tap|open|play|ক্লিক|ওপেন|খোলো|চালাও|क्लिक|खोलो)", RegexOption.IGNORE_CASE).containsMatchIn(clean)
+        ) {
+            return VoiceCommand.ClickYouTubeSearchResult(index = parseOrdinal(clean) ?: 1)
+        }
+
+        // Video click/play/open ("প্রথম ভিডিওটি চালাও", "দ্বিতীয় ভিডিওতে ক্লিক করো", "এই ভিডিওটা ওপেন করো",
+        // "Play the first video", "Click the second video", "Open this video",
+        // "पहला वीडियो चलाओ", "दूसरे वीडियो पर क्लिक करो", "इस वीडियो को खोलो")
+        val mentionsVideo = Regex("(?:video|ভিডিও|वीडियो)", RegexOption.IGNORE_CASE).containsMatchIn(clean)
+        val hasVideoAction = Regex("(?:play|click|tap|open|select|চালাও|ক্লিক|ট্যাপ|ওপেন|খোলো|चलाओ|क्लिक|खोलो)", RegexOption.IGNORE_CASE).containsMatchIn(clean)
+        if (mentionsVideo && hasVideoAction && !Regex("(?:youtube|ইউটিউব|यूट्यूब)\\s*(?:এ|पर|में|on|in)\\s+.+(?:খুঁজো|search|खोजो)", RegexOption.IGNORE_CASE).containsMatchIn(clean)) {
+            val ord = parseOrdinal(clean)
+            if (ord != null) {
+                return VoiceCommand.ClickYouTubeVideo(index = ord, targetHint = "video_$ord")
+            }
+            if (Regex("(?:এই\\s*ভিডিও|this\\s+video|current\\s+video|इस\\s*वीडियो)", RegexOption.IGNORE_CASE).containsMatchIn(clean)) {
+                return VoiceCommand.ClickYouTubeVideo(index = 1, targetHint = "current_video")
+            }
+        }
+        return null
+    }
+
+    private fun parseWhatsAppContactClickCommand(raw: String, lower: String): VoiceCommand? {
+        val clean = raw.trimEnd('।', '.', '!', '?').trim()
+        val hasWaContext = Regex("(?:whatsapp|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|व्हाट्सएप|chat|চ্যাট|चैट|contact|কন্টাক্ট|कॉन्टैक्ट|নামের\\s*উপর|নামটিতে)", RegexOption.IGNORE_CASE).containsMatchIn(clean)
+        if (!hasWaContext) return null
+
+        // Do not hijack full message-sending commands ("রাহুলকে WhatsApp-এ মেসেজ পাঠাও: ...")
+        if (Regex("(?:মেসেজ\\s*(?:পাঠাও|পাঠিয়ে|করো|লিখে)|message\\s+(?:to|saying)|मैसेज\\s*(?:भेजो|लिखो))", RegexOption.IGNORE_CASE).containsMatchIn(clean)) {
+            return null
+        }
+
+        // 1. Ordinal chat / contact click ("নিচের দ্বিতীয় নামটিতে ক্লিক করো", "প্রথম Chat ওপেন করো", "Click the second contact", "Open the first chat", "दूसरा चैट खोलो")
+        val ord = parseOrdinal(clean)
+        if (ord != null && Regex("(?:chat|চ্যাট|चैट|contact|কন্টাক্ট|নাম|name)", RegexOption.IGNORE_CASE).containsMatchIn(clean)) {
+            return if (Regex("(?:chat|চ্যাট|चैट)", RegexOption.IGNORE_CASE).containsMatchIn(clean)) {
+                VoiceCommand.OpenWhatsAppChat(contactName = "", index = ord)
+            } else {
+                VoiceCommand.ClickWhatsAppContact(contactName = "", index = ord)
+            }
+        }
+
+        // 2. Bengali: "WhatsApp-এ রাহুলের নামের উপর ক্লিক করো" / "এই Contact-এর নামের উপর ক্লিক করো"
+        val bnClickName = Regex(
+            "^(?:(?:whatsapp|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ)(?:-?এ|\\s*এ)\\s+)?(.+?)\\s*(?:নামের\\s*উপর|নামটিতে|নামে)\\s*(?:ক্লিক\\s*করো|ট্যাপ\\s*করো|চাপো)$",
+            RegexOption.IGNORE_CASE
+        ).find(clean)
+        if (bnClickName != null) {
+            val rawPerson = bnClickName.groupValues[1].trim()
+            val cleanedPerson = com.zoni.jarvis.assistant.service.MultilingualNameMatcher.cleanPersonQuery(rawPerson)
+            if (Regex("^(?:এই\\s*)?(?:contact|কন্টাক্ট)(?:-?এর)?$", RegexOption.IGNORE_CASE).matches(rawPerson)) {
+                return VoiceCommand.ClickWhatsAppContact(contactName = "", index = 1)
+            }
+            if (cleanedPerson.isNotBlank()) {
+                return VoiceCommand.ClickWhatsAppContact(contactName = cleanedPerson)
+            }
+        }
+
+        // 3. Bengali: "মায়ের Chat ওপেন করো" / "জাহিদার Chat খুলে দাও" / "WhatsApp-এ বাবাকে খুঁজে বের করো"
+        val bnOpenChat = Regex(
+            "^(?:(?:whatsapp|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ)(?:-?এ|\\s*এ)\\s+)?(.+?)\\s*(?:chat|চ্যাট)\\s*(?:ওপেন\\s*করো|খুলে\\s*দাও|খোলো)$",
+            RegexOption.IGNORE_CASE
+        ).find(clean)
+        if (bnOpenChat != null) {
+            val person = com.zoni.jarvis.assistant.service.MultilingualNameMatcher.cleanPersonQuery(bnOpenChat.groupValues[1])
+            if (person.isNotBlank()) return VoiceCommand.OpenWhatsAppChat(contactName = person)
+        }
+        val bnFindWa = Regex(
+            "^(?:whatsapp|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ)(?:-?এ|\\s*এ)\\s+(.+?)\\s*(?:খুঁজে\\s*বের\\s*করো|খুঁজে\\s*দাও|খুঁজো)$",
+            RegexOption.IGNORE_CASE
+        ).find(clean)
+        if (bnFindWa != null) {
+            val person = com.zoni.jarvis.assistant.service.MultilingualNameMatcher.cleanPersonQuery(bnFindWa.groupValues[1])
+            if (person.isNotBlank()) return VoiceCommand.ClickWhatsAppContact(contactName = person)
+        }
+
+        // 4. English: "Click Rahul's name in WhatsApp", "Open my mother's chat", "Find this contact in WhatsApp"
+        val enClickName = Regex(
+            "^(?:click|tap|open)\\s+(?:on\\s+)?(.+?)(?:'s|’s)?\\s+(?:name|contact)(?:\\s+in\\s+whatsapp)?$",
+            RegexOption.IGNORE_CASE
+        ).find(clean)
+        if (enClickName != null) {
+            val rawPerson = enClickName.groupValues[1].trim()
+            if (rawPerson.equals("this", ignoreCase = true)) {
+                return VoiceCommand.ClickWhatsAppContact(contactName = "", index = 1)
+            }
+            val person = com.zoni.jarvis.assistant.service.MultilingualNameMatcher.cleanPersonQuery(rawPerson)
+            if (person.isNotBlank()) return VoiceCommand.ClickWhatsAppContact(contactName = person)
+        }
+        val enOpenChat = Regex(
+            "^(?:open|show)\\s+(?:my\\s+)?(.+?)(?:'s|’s)?\\s+chat(?:\\s+in\\s+whatsapp)?$",
+            RegexOption.IGNORE_CASE
+        ).find(clean)
+        if (enOpenChat != null) {
+            val person = com.zoni.jarvis.assistant.service.MultilingualNameMatcher.cleanPersonQuery(enOpenChat.groupValues[1])
+            if (person.isNotBlank()) return VoiceCommand.OpenWhatsAppChat(contactName = person)
+        }
+        val enFindContact = Regex(
+            "^(?:find|search)\\s+(?:for\\s+)?(.+?)\\s+in\\s+whatsapp$",
+            RegexOption.IGNORE_CASE
+        ).find(clean)
+        if (enFindContact != null) {
+            val rawPerson = enFindContact.groupValues[1].trim()
+            if (Regex("^(?:this\\s+)?contact$", RegexOption.IGNORE_CASE).matches(rawPerson)) {
+                return VoiceCommand.ClickWhatsAppContact(contactName = "", index = 1)
+            }
+            val person = com.zoni.jarvis.assistant.service.MultilingualNameMatcher.cleanPersonQuery(rawPerson)
+            if (person.isNotBlank()) return VoiceCommand.ClickWhatsAppContact(contactName = person)
+        }
+
+        // 5. Hindi: "WhatsApp में राहुल के नाम पर क्लिक करो" / "मेरी माँ की चैट खोलो"
+        val hiClickName = Regex(
+            "^(?:(?:whatsapp|व्हाट्सएप)\\s*में\\s+)?(.+?)\\s*(?:के\\s*नाम\\s*पर|नाम\\s*पर)\\s*(?:क्लिक\\s*करो|टैप\\s*करो)$",
+            RegexOption.IGNORE_CASE
+        ).find(clean)
+        if (hiClickName != null) {
+            val person = com.zoni.jarvis.assistant.service.MultilingualNameMatcher.cleanPersonQuery(hiClickName.groupValues[1])
+            if (person.isNotBlank()) return VoiceCommand.ClickWhatsAppContact(contactName = person)
+        }
+        val hiOpenChat = Regex(
+            "^(?:(?:whatsapp|व्हाट्सएप)\\s*में\\s+)?(.+?)\\s*(?:की|का|के)?\\s*(?:चैट|chat)\\s*खोलो$",
+            RegexOption.IGNORE_CASE
+        ).find(clean)
+        if (hiOpenChat != null) {
+            val person = com.zoni.jarvis.assistant.service.MultilingualNameMatcher.cleanPersonQuery(hiOpenChat.groupValues[1])
+            if (person.isNotBlank()) return VoiceCommand.OpenWhatsAppChat(contactName = person)
+        }
+
+        return null
+    }
+
+    private fun parseSmsCommand(raw: String): VoiceCommand.SendSms? {
+        // Bengali: "বাবাকে SMS পাঠাও: আমি বাড়ি ফিরছি" / "মাকে এসএমএস পাঠিয়ে দাও আমি আসছি"
+        val bnSms = Regex(
+            "^(?:আমার\\s+)?(.+?)(?:কে|-কে)\\s*(?:একটা\\s+|একটি\\s+)?(?:sms|এসএমএস|এস\\.এম\\.এস)(?:-?এ|\\s*এ)?\\s*(?:মেসেজ\\s*)?(?:পাঠিয়ে\\s*দাও|পাঠিয়ে\\s*দাও|পাঠাও|করো|দাও|লিখে\\s*দাও)\\s*[:,-]?\\s*(.*)$",
+            RegexOption.IGNORE_CASE
+        ).find(raw)
+        if (bnSms != null) {
+            val recipient = bnSms.groupValues[1].trim()
+            val msg = bnSms.groupValues[2].trim().trimEnd('।', '.')
+            if (recipient.isNotBlank()) {
+                return VoiceCommand.SendSms(recipient, msg)
+            }
+        }
+
+        // English: "Send SMS to Baba: I am coming home" / "Send an SMS to Dad saying I am coming"
+        val enSms = Regex(
+            "^(?:please\\s+)?(?:send\\s+(?:an?\\s+)?)?(?:sms|text\\s+message)\\s+(?:message\\s+)?to\\s+(.+?)(?:\\s+(?:saying|that|message|:)\\s*(.+)|\\s*[:,-]\\s*(.+))?[.,?!]*$",
+            RegexOption.IGNORE_CASE
+        ).find(raw)
+        if (enSms != null) {
+            val recipient = enSms.groupValues[1].trim()
+            val msg = (enSms.groupValues[2].ifBlank { enSms.groupValues[3] }).trim()
+            if (recipient.isNotBlank()) {
+                return VoiceCommand.SendSms(recipient, msg)
+            }
+        }
+
+        // Hindi: "पापा को SMS भेजो: मैं घर आ रहा हूँ"
+        val hiSms = Regex(
+            "^(.+?)\\s*को\\s*(?:sms|एसएमएस)\\s*(?:मैसेज\\s*)?(?:भेज\\s*दो|भेजो|करो|लिखो)\\s*[:,-]?\\s*(.*)$",
+            RegexOption.IGNORE_CASE
+        ).find(raw)
+        if (hiSms != null) {
+            val recipient = hiSms.groupValues[1].trim()
+            val msg = hiSms.groupValues[2].trim().trimEnd('।', '.')
+            if (recipient.isNotBlank()) {
+                return VoiceCommand.SendSms(recipient, msg)
+            }
         }
         return null
     }

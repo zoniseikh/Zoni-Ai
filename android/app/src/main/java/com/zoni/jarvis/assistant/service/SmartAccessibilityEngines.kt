@@ -1,0 +1,1048 @@
+package com.zoni.jarvis.assistant.service
+
+/**
+ * Pure, JVM-testable Smart Accessibility Engines for Zoni AI:
+ * 1. [YouTubeClickEngine] — Advanced YouTube video card, thumbnail, search result & Play button resolver + watch-screen verifier.
+ * 2. [WhatsAppSmartContactEngine] — Multilingual (Bengali/English/Hindi) visible WhatsApp contact/chat name matcher with strict ambiguity safety.
+ * 3. [WhatsAppSendButtonResolver] — Dedicated multi-signal WhatsApp Send button resolver & post-send state verifier (pending/sent/delivered).
+ *
+ * All core selection, parent-container discovery, bounds validation, disambiguation, and
+ * outcome verification algorithms operate on immutable [AccessibleNodeSnapshot] trees so they
+ * are 100% deterministic and unit-testable on the JVM without Robolectric or arbitrary screen coordinates.
+ */
+
+data class AccessibleRect(
+    val left: Int,
+    val top: Int,
+    val right: Int,
+    val bottom: Int
+) {
+    val width: Int get() = (right - left).coerceAtLeast(0)
+    val height: Int get() = (bottom - top).coerceAtLeast(0)
+    val centerX: Float get() = (left + right) / 2f
+    val centerY: Float get() = (top + bottom) / 2f
+    val isValidVisible: Boolean get() = width > 0 && height > 0 && right > 0 && bottom > 0
+}
+
+data class AccessibleNodeSnapshot(
+    val nodeId: Int,
+    val parentId: Int? = null,
+    val viewIdResourceName: String? = null,
+    val className: String? = null,
+    val text: String? = null,
+    val contentDescription: String? = null,
+    val hintText: String? = null,
+    val isClickable: Boolean = false,
+    val isEnabled: Boolean = true,
+    val isVisibleToUser: Boolean = true,
+    val isEditable: Boolean = false,
+    val isPassword: Boolean = false,
+    val bounds: AccessibleRect = AccessibleRect(0, 0, 0, 0)
+) {
+    val combinedLabel: String
+        get() = listOfNotNull(text?.trim()?.takeIf { it.isNotEmpty() }, contentDescription?.trim()?.takeIf { it.isNotEmpty() })
+            .distinct()
+            .joinToString(" ")
+}
+
+object AccessibilityTreeResolver {
+
+    /**
+     * Walks up the parent hierarchy from [startNode] to find the nearest enabled, clickable ancestor.
+     * Avoids climbing into full-screen root containers when a tighter clickable container exists.
+     */
+    fun findNearestClickableNode(
+        startNode: AccessibleNodeSnapshot,
+        nodesById: Map<Int, AccessibleNodeSnapshot>,
+        maxDepth: Int = 8
+    ): AccessibleNodeSnapshot? {
+        var current: AccessibleNodeSnapshot? = startNode
+        var depth = 0
+        while (current != null && depth <= maxDepth) {
+            if (current.isPassword) return null
+            if (current.isClickable && current.isEnabled) {
+                return current
+            }
+            val pid = current.parentId ?: break
+            current = nodesById[pid]
+            depth++
+        }
+        return null
+    }
+
+    /**
+     * Collects all descendant text & contentDescription labels under [containerId] (excluding passwords).
+     */
+    fun collectDescendantLabels(
+        containerId: Int,
+        nodes: List<AccessibleNodeSnapshot>
+    ): List<String> {
+        val childrenByParent = nodes.groupBy { it.parentId }
+        val result = mutableListOf<String>()
+        val queue = ArrayDeque<Int>()
+        queue.add(containerId)
+        val visited = HashSet<Int>()
+        val byId = nodes.associateBy { it.nodeId }
+
+        while (queue.isNotEmpty() && result.size < 30) {
+            val id = queue.removeFirst()
+            if (!visited.add(id)) continue
+            val node = byId[id] ?: continue
+            if (node.isPassword) continue
+            val txt = node.text?.trim().orEmpty()
+            val desc = node.contentDescription?.trim().orEmpty()
+            if (txt.isNotEmpty() && !AccessibilityGuard.containsOtpOrSecret(txt)) result.add(txt)
+            if (desc.isNotEmpty() && desc != txt && !AccessibilityGuard.containsOtpOrSecret(desc)) result.add(desc)
+            childrenByParent[id]?.forEach { child -> queue.add(child.nodeId) }
+        }
+        return result
+    }
+}
+
+// ============================================================================
+// PART 1 — ADVANCED YOUTUBE CLICK ENGINE
+// ============================================================================
+
+data class YouTubeCandidate(
+    val matchNode: AccessibleNodeSnapshot,
+    val clickableNode: AccessibleNodeSnapshot?,
+    val title: String,
+    val bounds: AccessibleRect,
+    val isThumbnail: Boolean,
+    val isPlayButton: Boolean
+)
+
+sealed class YouTubeTargetResolution {
+    data class Matched(val candidate: YouTubeCandidate, val rankIndex: Int) : YouTubeTargetResolution()
+    data class Ambiguous(val query: String, val candidates: List<YouTubeCandidate>) : YouTubeTargetResolution()
+    data class NotFound(val reason: String, val failureCode: String) : YouTubeTargetResolution()
+}
+
+data class YouTubeVerificationResult(
+    val openedWatchScreen: Boolean,
+    val status: String,
+    val evidence: String
+)
+
+object YouTubeClickEngine {
+
+    private val YOUTUBE_PACKAGES = setOf(
+        "com.google.android.youtube",
+        "com.google.android.apps.youtube.music",
+        "com.google.android.apps.youtube.kids"
+    )
+
+    private val CHROME_OR_NAV_LABELS = setOf(
+        "home", "shorts", "subscriptions", "you", "library", "explore", "search",
+        "search youtube", "cast", "notifications", "account", "navigate up", "back",
+        "clear", "voice search", "all", "music", "gaming", "live", "news", "recently uploaded",
+        "watched", "new to you", "filters", "more options", "action menu", "subscribe",
+        "হোম", "শর্টস", "সাবস্ক্রিপশন", "সার্চ", "খুঁজুন"
+    )
+
+    private val PLAY_BUTTON_LABELS = setOf(
+        "play", "play video", "play button", "resume", "play now",
+        "প্লে", "প্লে বাটন", "চালাও", "चलाएं", "प्ले"
+    )
+
+    private val AD_MARKERS = listOf("sponsored", "ad ·", "visit advertiser", "install now", "বিজ্ঞাপন")
+
+    fun isYouTubePackage(packageName: String?): Boolean {
+        val clean = packageName?.trim()?.lowercase().orEmpty()
+        return clean in YOUTUBE_PACKAGES
+    }
+
+    /**
+     * Discovers visible YouTube video cards / thumbnails / search result entries sorted top-to-bottom.
+     */
+    fun collectVideoCandidates(nodes: List<AccessibleNodeSnapshot>): List<YouTubeCandidate> {
+        val nodesById = nodes.associateBy { it.nodeId }
+        val rawCandidates = mutableListOf<YouTubeCandidate>()
+
+        for (node in nodes) {
+            if (node.isPassword || !node.isVisibleToUser || !node.isEnabled) continue
+            if (!node.bounds.isValidVisible) continue
+
+            val vid = node.viewIdResourceName?.lowercase().orEmpty()
+            val text = node.text?.trim().orEmpty()
+            val desc = node.contentDescription?.trim().orEmpty()
+            val label = text.ifEmpty { desc }
+            val lowerLabel = label.lowercase()
+
+            if (lowerLabel in CHROME_OR_NAV_LABELS) continue
+            if (AD_MARKERS.any { lowerLabel.contains(it) }) continue
+
+            val isThumbnailId = vid.contains("thumbnail") ||
+                vid.contains("video_thumbnail") ||
+                vid.contains("poster") ||
+                vid.contains("artwork")
+            val isVideoCardId = vid.contains("video_info_view") ||
+                vid.contains("compact_video") ||
+                vid.contains("video_with_context") ||
+                vid.contains("results_item") ||
+                vid.endsWith(":id/title") ||
+                vid.contains("video_title")
+            val looksLikeVideoDesc = desc.length >= 12 && (
+                desc.contains("minute", ignoreCase = true) ||
+                    desc.contains("second", ignoreCase = true) ||
+                    desc.contains("hour", ignoreCase = true) ||
+                    desc.contains("views", ignoreCase = true) ||
+                    desc.contains("ago", ignoreCase = true) ||
+                    desc.contains("ভিডিও", ignoreCase = true) ||
+                    desc.contains("মিনিট", ignoreCase = true) ||
+                    desc.contains("सेकंड", ignoreCase = true) ||
+                    desc.contains("मिनट", ignoreCase = true) ||
+                    desc.contains("go to channel", ignoreCase = true) ||
+                    desc.contains("play video", ignoreCase = true)
+                )
+            val looksLikeThumbnailArea = node.bounds.width >= 180 && node.bounds.height >= 100 &&
+                (isThumbnailId || isVideoCardId || looksLikeVideoDesc ||
+                    (node.isClickable && label.length >= 10 && !node.isEditable))
+
+            if (!isThumbnailId && !isVideoCardId && !looksLikeVideoDesc && !looksLikeThumbnailArea) continue
+
+            val clickable = AccessibilityTreeResolver.findNearestClickableNode(node, nodesById)
+            val effectiveBounds = if (node.bounds.isValidVisible) node.bounds else clickable?.bounds ?: node.bounds
+            if (!effectiveBounds.isValidVisible) continue
+
+            // Prefer meaningful title text from node or its clickable parent container
+            val resolvedTitle = when {
+                text.length >= 4 && text.lowercase() !in CHROME_OR_NAV_LABELS -> text
+                desc.length >= 4 && desc.lowercase() !in CHROME_OR_NAV_LABELS -> desc
+                clickable != null -> {
+                    AccessibilityTreeResolver.collectDescendantLabels(clickable.nodeId, nodes)
+                        .firstOrNull { it.length >= 4 && it.lowercase() !in CHROME_OR_NAV_LABELS }
+                        .orEmpty()
+                }
+                else -> ""
+            }
+
+            if (resolvedTitle.isBlank() && !isThumbnailId) continue
+
+            rawCandidates.add(
+                YouTubeCandidate(
+                    matchNode = node,
+                    clickableNode = clickable,
+                    title = resolvedTitle.ifBlank { "YouTube Video" },
+                    bounds = effectiveBounds,
+                    isThumbnail = isThumbnailId || (node.bounds.width >= 240 && node.bounds.height >= 140),
+                    isPlayButton = false
+                )
+            )
+        }
+
+        // Deduplicate nodes belonging to the same clickable video card (preferring thumbnail/title with richer text)
+        val groupedByCard = LinkedHashMap<String, YouTubeCandidate>()
+        for (cand in rawCandidates.sortedWith(compareBy<YouTubeCandidate> { it.bounds.top }.thenBy { it.bounds.left })) {
+            val cardKey = cand.clickableNode?.nodeId?.let { "click_$it" }
+                ?: "band_${cand.bounds.top / 120}_${cand.title.take(24).lowercase()}"
+            val existing = groupedByCard[cardKey]
+            if (existing == null ||
+                (cand.title.length > existing.title.length && existing.title == "YouTube Video") ||
+                (cand.isThumbnail && !existing.isThumbnail && cand.title.isNotBlank())
+            ) {
+                groupedByCard[cardKey] = cand
+            }
+        }
+
+        return groupedByCard.values
+            .sortedWith(compareBy<YouTubeCandidate> { it.bounds.top }.thenBy { it.bounds.left })
+    }
+
+    /**
+     * Finds an explicit Play button on screen (e.g. "Play Button চাপো" / "Click the Play button").
+     */
+    fun findPlayButton(nodes: List<AccessibleNodeSnapshot>): YouTubeCandidate? {
+        val nodesById = nodes.associateBy { it.nodeId }
+        for (node in nodes) {
+            if (node.isPassword || !node.isVisibleToUser || !node.isEnabled) continue
+            val vid = node.viewIdResourceName?.lowercase().orEmpty()
+            val desc = node.contentDescription?.trim()?.lowercase().orEmpty()
+            val txt = node.text?.trim()?.lowercase().orEmpty()
+            val isPlayId = vid.contains("player_control_play") ||
+                vid.endsWith(":id/play") ||
+                vid.contains("play_pause") ||
+                vid.contains("play_button")
+            val isPlayLabel = desc in PLAY_BUTTON_LABELS ||
+                txt in PLAY_BUTTON_LABELS ||
+                desc.startsWith("play video") ||
+                desc == "play"
+            if (isPlayId || isPlayLabel) {
+                val clickable = AccessibilityTreeResolver.findNearestClickableNode(node, nodesById)
+                val rect = if (node.bounds.isValidVisible) node.bounds else clickable?.bounds ?: node.bounds
+                if (rect.isValidVisible || clickable != null) {
+                    return YouTubeCandidate(
+                        matchNode = node,
+                        clickableNode = clickable,
+                        title = node.contentDescription?.trim()?.ifEmpty { null }
+                            ?: node.text?.trim()?.ifEmpty { null }
+                            ?: "Play",
+                        bounds = rect,
+                        isThumbnail = false,
+                        isPlayButton = true
+                    )
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Resolves a user YouTube click request (ordinal index, thumbnail, Play button, or title query).
+     * Strictly stops on ambiguous title matches or missing visible targets.
+     */
+    fun resolveVideoTarget(
+        nodes: List<AccessibleNodeSnapshot>,
+        index: Int? = null,
+        targetHint: String = "",
+        titleQuery: String = ""
+    ): YouTubeTargetResolution {
+        val hintLower = targetHint.trim().lowercase()
+        val queryClean = titleQuery.trim()
+
+        // 1. Explicit Play button request
+        if (hintLower == "play_button" || hintLower == "play" ||
+            hintLower.contains("play button") || hintLower.contains("প্লে বাটন")
+        ) {
+            val playBtn = findPlayButton(nodes)
+            if (playBtn != null) {
+                return YouTubeTargetResolution.Matched(playBtn, 1)
+            }
+            // If no player Play button is visible, fall back ONLY if there's an unambiguous single video card? No — report honestly!
+            return YouTubeTargetResolution.NotFound(
+                reason = "Could not find a visible Play button on the current YouTube screen.",
+                failureCode = "play_button_not_found"
+            )
+        }
+
+        val videos = collectVideoCandidates(nodes)
+        if (videos.isEmpty()) {
+            return YouTubeTargetResolution.NotFound(
+                reason = "No visible YouTube video cards or search results were found on the current screen.",
+                failureCode = "youtube_videos_not_found"
+            )
+        }
+
+        // 2. Title keyword query (strict ambiguity check — never guess between two matching videos)
+        if (queryClean.isNotBlank()) {
+            val qLower = queryClean.lowercase()
+            val exactMatches = videos.filter { it.title.lowercase() == qLower }
+            if (exactMatches.size == 1) {
+                return YouTubeTargetResolution.Matched(exactMatches[0], videos.indexOf(exactMatches[0]) + 1)
+            }
+            val partialMatches = videos.filter {
+                it.title.lowercase().contains(qLower) ||
+                    MultilingualNameMatcher.matchesQuery(it.title, queryClean)
+            }
+            if (partialMatches.size == 1) {
+                return YouTubeTargetResolution.Matched(partialMatches[0], videos.indexOf(partialMatches[0]) + 1)
+            }
+            if (partialMatches.size > 1) {
+                // If user also gave an explicit ordinal index (e.g. "2nd Arijit video"), select it safely
+                if (index != null && index in 1..partialMatches.size) {
+                    val picked = partialMatches[index - 1]
+                    return YouTubeTargetResolution.Matched(picked, videos.indexOf(picked) + 1)
+                }
+                return YouTubeTargetResolution.Ambiguous(queryClean, partialMatches.take(5))
+            }
+            return YouTubeTargetResolution.NotFound(
+                reason = "Could not find a visible YouTube video matching \"$queryClean\".",
+                failureCode = "youtube_video_title_not_found"
+            )
+        }
+
+        // 3. Thumbnail-specific preference when user asks to click a thumbnail ("এই ভিডিওর Thumbnail-এ ক্লিক করো")
+        val targetPool = if (hintLower.contains("thumbnail") || hintLower.contains("থাম্বনেইল")) {
+            videos.filter { it.isThumbnail }.ifEmpty { videos }
+        } else {
+            videos
+        }
+
+        // 4. Explicit ordinal selection (1 = first, 2 = second, etc.)
+        val requestedIndex = index ?: if (hintLower == "current_video" || hintLower == "thumbnail" || hintLower == "first_result") 1 else null
+        if (requestedIndex != null) {
+            if (requestedIndex < 1 || requestedIndex > targetPool.size) {
+                return YouTubeTargetResolution.NotFound(
+                    reason = "Requested video #$requestedIndex is not visible on screen (only ${targetPool.size} visible video(s) found). Try scrolling down first.",
+                    failureCode = "video_index_out_of_range"
+                )
+            }
+            return YouTubeTargetResolution.Matched(targetPool[requestedIndex - 1], requestedIndex)
+        }
+
+        // 5. No index and no query -> ambiguous if multiple visible videos
+        if (targetPool.size == 1) {
+            return YouTubeTargetResolution.Matched(targetPool[0], 1)
+        }
+        return YouTubeTargetResolution.Ambiguous("video", targetPool.take(5))
+    }
+
+    /**
+     * Verifies whether a YouTube video watch/player screen actually opened after clicking.
+     */
+    fun verifyWatchScreenOpened(
+        beforeLabels: List<String>,
+        afterNodes: List<AccessibleNodeSnapshot>,
+        clickedTitle: String,
+        activePackage: String,
+        accessibilityEventObserved: Boolean
+    ): YouTubeVerificationResult {
+        if (!isYouTubePackage(activePackage)) {
+            return YouTubeVerificationResult(
+                openedWatchScreen = false,
+                status = "youtube_left_foreground",
+                evidence = "Active app changed away from YouTube ($activePackage)."
+            )
+        }
+
+        val watchControlIds = listOf(
+            "watch_player", "player_view", "player_control", "time_bar",
+            "fullscreen_button", "like_button", "dislike_button", "comments", "subscribe_button"
+        )
+        val watchControlLabels = setOf(
+            "pause video", "play video", "minimize", "enter fullscreen", "exit fullscreen",
+            "like", "dislike", "share", "comments", "subscribe", "subscribed", "save",
+            "ভিডিও পজ করুন", "সাবস্ক্রাইব", "শেয়ার", "মন্তব্য"
+        )
+
+        val hasWatchPlayerNode = afterNodes.any { node ->
+            val vid = node.viewIdResourceName?.lowercase().orEmpty()
+            val desc = node.contentDescription?.trim()?.lowercase().orEmpty()
+            val txt = node.text?.trim()?.lowercase().orEmpty()
+            watchControlIds.any { vid.contains(it) } || desc in watchControlLabels || txt in watchControlLabels
+        }
+
+        val afterLabels = afterNodes.mapNotNull { it.combinedLabel.takeIf { s -> s.isNotEmpty() } }
+        val screenChanged = afterLabels.take(15) != beforeLabels.take(15)
+        val titlePresent = clickedTitle.length >= 4 &&
+            afterLabels.any { it.lowercase().contains(clickedTitle.take(24).lowercase()) }
+
+        return when {
+            hasWatchPlayerNode -> YouTubeVerificationResult(
+                openedWatchScreen = true,
+                status = "youtube_video_opened",
+                evidence = "Verified YouTube watch player controls visible on screen."
+            )
+            accessibilityEventObserved && screenChanged && titlePresent -> YouTubeVerificationResult(
+                openedWatchScreen = true,
+                status = "youtube_video_opened",
+                evidence = "Verified screen transitioned to \"$clickedTitle\" in YouTube."
+            )
+            accessibilityEventObserved && screenChanged -> YouTubeVerificationResult(
+                openedWatchScreen = true,
+                status = "youtube_screen_transitioned",
+                evidence = "Verified YouTube screen changed after click."
+            )
+            else -> YouTubeVerificationResult(
+                openedWatchScreen = false,
+                status = "youtube_click_unverified",
+                evidence = "Click was dispatched, but YouTube watch screen opening could not be confirmed."
+            )
+        }
+    }
+}
+
+// ============================================================================
+// PART 2 — MULTILINGUAL NAME MATCHER & WHATSAPP SMART CONTACT CLICK ENGINE
+// ============================================================================
+
+object MultilingualNameMatcher {
+
+    private val KINSHIP_GROUPS: List<Set<String>> = listOf(
+        setOf("মা", "আম্মু", "আম্মা", "মাম্মি", "ma", "maa", "ammu", "amma", "mom", "mum", "mummy", "mother", "माँ", "मां", "मम्मी", "ममी"),
+        setOf("বাবা", "আব্বু", "আব্বা", "পাপা", "baba", "abbu", "abba", "papa", "dad", "daddy", "father", "पापा", "पिता", "अब्बा", "बाबा"),
+        setOf("ভাই", "ভাইয়া", "দাদা", "bhai", "bhaiya", "dada", "brother", "bro", "भाई", "भैया"),
+        setOf("বোন", "আপু", "দিদি", "bon", "apu", "didi", "sister", "sis", "बहन", "दीदी"),
+        setOf("বউ", "স্ত্রী", "wife", "बिवी", "पत्नी"),
+        setOf("স্বামী", "husband", "पति")
+    )
+
+    private val BENGALI_CHAR_MAP = mapOf(
+        'অ' to "o", 'আ' to "a", 'ই' to "i", 'ঈ' to "i", 'উ' to "u", 'ঊ' to "u",
+        'এ' to "e", 'ঐ' to "oi", 'ও' to "o", 'ঔ' to "ou",
+        'ক' to "k", 'খ' to "kh", 'গ' to "g", 'ঘ' to "gh", 'ঙ' to "ng",
+        'চ' to "ch", 'ছ' to "ch", 'জ' to "j", 'ঝ' to "jh", 'ঞ' to "n",
+        'ট' to "t", 'ঠ' to "th", 'ড' to "d", 'ঢ' to "dh", 'ণ' to "n",
+        'ত' to "t", 'থ' to "th", 'দ' to "d", 'ধ' to "dh", 'ন' to "n",
+        'প' to "p", 'ফ' to "f", 'ব' to "b", 'ভ' to "bh", 'ম' to "m",
+        'য' to "j", 'র' to "r", 'ল' to "l", 'শ' to "sh", 'ষ' to "sh", 'স' to "s", 'হ' to "h",
+        'ড়' to "r", 'ঢ়' to "rh", 'য়' to "y", 'য়' to "y", 'ড়' to "r", 'ঢ়' to "rh",
+        'ৎ' to "t", 'ং' to "ng", 'ঃ' to "h", 'ঁ' to "n",
+        'া' to "a", 'ি' to "i", 'ী' to "i", 'ু' to "u", 'ূ' to "u",
+        'ে' to "e", 'ৈ' to "oi", 'ো' to "o", 'ৌ' to "ou", '্' to ""
+    )
+
+    private val DEVANAGARI_CHAR_MAP = mapOf(
+        'अ' to "a", 'आ' to "a", 'इ' to "i", 'ई' to "i", 'उ' to "u", 'ऊ' to "u",
+        'ए' to "e", 'ऐ' to "ai", 'ओ' to "o", 'औ' to "au",
+        'क' to "k", 'ख' to "kh", 'ग' to "g", 'घ' to "gh", 'ङ' to "ng",
+        'च' to "ch", 'छ' to "ch", 'ज' to "j", 'झ' to "jh", 'ञ' to "n",
+        'ट' to "t", 'ठ' to "th", 'ड' to "d", 'ढ' to "dh", 'ण' to "n",
+        'त' to "t", 'थ' to "th", 'द' to "d", 'ध' to "dh", 'न' to "n",
+        'प' to "p", 'फ' to "f", 'ब' to "b", 'भ' to "bh", 'म' to "m",
+        'य' to "y", 'र' to "r", 'ल' to "l", 'व' to "v", 'श' to "sh", 'ष' to "sh", 'स' to "s", 'ह' to "h",
+        'ा' to "a", 'ि' to "i", 'ी' to "i", 'ु' to "u", 'ू' to "u",
+        'े' to "e", 'ै' to "ai", 'ो' to "o", 'ौ' to "au", '्' to "", 'ं' to "n", 'ँ' to "n"
+    )
+
+    /**
+     * Strips Bengali/Hindi/English possessive suffixes ("রাহুলের" -> "রাহুল", "মায়ের" -> "মা", "Rahul's" -> "Rahul").
+     */
+    fun cleanPersonQuery(raw: String): String {
+        var clean = raw.trim()
+            .replace(Regex("^(?:আমার|my|mere|meri|मेरी|मेरे|मेरा)\\s+", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("'s$|’s$", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s+(?:का|की|के)$"), "")
+            .trim()
+
+        // Strip Bengali possessive/dative suffixes carefully
+        if (clean == "মায়ের" || clean == "মায়ের" || clean == "মাকে") return "মা"
+        if (clean == "বাবার" || clean == "বাবাকে") return "বাবা"
+        if (clean.endsWith("ের") && clean.length > 3) {
+            clean = clean.removeSuffix("ের")
+        } else if (clean.endsWith("য়ের") && clean.length > 4) {
+            clean = clean.removeSuffix("য়ের")
+        } else if (clean.endsWith("য়ের") && clean.length > 4) {
+            clean = clean.removeSuffix("য়ের")
+        } else if (clean.endsWith("র") && clean.length > 3 && !clean.endsWith("ার")) {
+            // Keep names naturally ending in "ার" unless known possessive like "জাহিদার" -> "জাহিদা"
+            clean = clean.removeSuffix("র")
+        } else if (clean.endsWith("ার") && clean.length > 4) {
+            // "জাহিদার" -> "জাহিদা", "মীনার" -> "মীনা"
+            clean = clean.removeSuffix("র")
+        } else if (clean.endsWith("কে") && clean.length > 3) {
+            clean = clean.removeSuffix("কে")
+        }
+        return clean.trim()
+    }
+
+    /**
+     * Phonetic Latin skeleton so Bengali "রাহুল" / Hindi "राहुल" / English "Rahul" and
+     * "জাহিদা" / "Jahida" / "Zahida" match cleanly across scripts.
+     */
+    fun toPhoneticLatin(input: String): String {
+        val lower = input.trim().lowercase()
+        val sb = StringBuilder(lower.length * 2)
+        for (ch in lower) {
+            val mapped = BENGALI_CHAR_MAP[ch] ?: DEVANAGARI_CHAR_MAP[ch]
+            if (mapped != null) {
+                sb.append(mapped)
+            } else if (ch.isLetterOrDigit() || ch == ' ') {
+                sb.append(ch)
+            }
+        }
+        return sb.toString()
+            .replace('z', 'j')
+            .replace("ph", "f")
+            .replace("ee", "i")
+            .replace("oo", "u")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    fun consonantSkeleton(latin: String): String {
+        return latin.replace(Regex("[aeiou\\s]+"), "")
+    }
+
+    fun matchesKinshipAlias(candidateName: String, query: String): Boolean {
+        val cClean = cleanPersonQuery(candidateName).lowercase()
+        val qClean = cleanPersonQuery(query).lowercase()
+        for (group in KINSHIP_GROUPS) {
+            if (qClean in group && (cClean in group || group.any { alias -> cClean.split(" ").contains(alias) })) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * Returns a match score: 100 = exact, 90 = exact phonetic/kinship, 75 = word-boundary/prefix,
+     * 60 = substring/phonetic partial, 0 = no match.
+     */
+    fun scoreNameMatch(candidateName: String, rawQuery: String): Int {
+        val cand = candidateName.trim()
+        val query = cleanPersonQuery(rawQuery)
+        if (cand.isEmpty() || query.isEmpty()) return 0
+
+        val cLower = cand.lowercase()
+        val qLower = query.lowercase()
+
+        if (cLower == qLower) return 100
+        if (matchesKinshipAlias(cand, query)) return 92
+
+        val cPhonetic = toPhoneticLatin(cand)
+        val qPhonetic = toPhoneticLatin(query)
+        if (cPhonetic.isNotEmpty() && cPhonetic == qPhonetic) return 90
+
+        // Word-level exact match ("Rahul" matches "Rahul Sharma")
+        val cWords = cLower.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val cPhoneticWords = cPhonetic.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (qLower in cWords || (qPhonetic.isNotEmpty() && qPhonetic in cPhoneticWords)) return 82
+
+        // Direct or phonetic prefix / contains
+        if (cLower.startsWith(qLower) || (qPhonetic.length >= 2 && cPhonetic.startsWith(qPhonetic))) return 75
+        if (qLower.length >= 2 && cLower.contains(qLower)) return 68
+        if (qPhonetic.length >= 3 && cPhonetic.contains(qPhonetic)) return 65
+
+        // Consonant skeleton match for Bengali/Hindi inherent vowel differences ("রাহুল" -> "rhl" vs "rahul" -> "rhl")
+        val cSkel = consonantSkeleton(cPhonetic)
+        val qSkel = consonantSkeleton(qPhonetic)
+        if (qSkel.length >= 3 && (cSkel == qSkel || cPhoneticWords.any { consonantSkeleton(it) == qSkel })) {
+            return 80
+        }
+
+        return 0
+    }
+
+    fun matchesQuery(candidateName: String, rawQuery: String): Boolean =
+        scoreNameMatch(candidateName, rawQuery) >= 65
+}
+
+data class WhatsAppContactRowCandidate(
+    val nameNode: AccessibleNodeSnapshot,
+    val clickableNode: AccessibleNodeSnapshot?,
+    val displayName: String,
+    val bounds: AccessibleRect,
+    val matchScore: Int
+)
+
+sealed class WhatsAppContactResolution {
+    data class Matched(val candidate: WhatsAppContactRowCandidate) : WhatsAppContactResolution()
+    data class Ambiguous(val query: String, val candidates: List<WhatsAppContactRowCandidate>) : WhatsAppContactResolution()
+    data class NotFound(val reason: String, val failureCode: String) : WhatsAppContactResolution()
+}
+
+object WhatsAppSmartContactEngine {
+
+    private val NON_CONTACT_UI_LABELS = setOf(
+        "whatsapp", "whatsapp business", "search", "ask meta ai or search", "meta ai",
+        "chats", "updates", "communities", "calls", "status", "archived", "unread",
+        "favorites", "favourites", "groups", "all", "new chat", "new group", "new contact",
+        "new community", "camera", "more options", "navigate up", "back", "settings",
+        "type a message", "message", "send", "voice message", "attach", "emoji",
+        "চ্যাট", "আপডেট", "কল", "খুঁজুন", "সার্চ", "মেসেজ", "পাঠান",
+        "चैट", "अपडेट", "कॉल", "खोजें", "संदेश", "भेजें"
+    )
+
+    private val CONTACT_NAME_VIEW_IDS = listOf(
+        "conversations_row_contact_name",
+        "contactpicker_row_name",
+        "row_contact_name",
+        "contact_name",
+        "chat_title",
+        "group_chat_title",
+        "result_title"
+    )
+
+    private val TIMESTAMP_REGEX = Regex("^\\d{1,2}:\\d{2}(?:\\s*(?:am|pm))?$|^yesterday$|^today$|^\\d{1,2}/\\d{1,2}/\\d{2,4}$", RegexOption.IGNORE_CASE)
+
+    /**
+     * Collects all visible WhatsApp chat/contact row candidates sorted visually top-to-bottom.
+     */
+    fun collectVisibleChatRows(nodes: List<AccessibleNodeSnapshot>): List<WhatsAppContactRowCandidate> {
+        val nodesById = nodes.associateBy { it.nodeId }
+        val rawRows = mutableListOf<WhatsAppContactRowCandidate>()
+
+        for (node in nodes) {
+            if (node.isPassword || node.isEditable || !node.isVisibleToUser || !node.isEnabled) continue
+            val text = node.text?.trim().orEmpty()
+            val desc = node.contentDescription?.trim().orEmpty()
+            val label = text.ifEmpty { desc }
+            if (label.isEmpty() || label.length > 80) continue
+
+            val lower = label.lowercase()
+            if (lower in NON_CONTACT_UI_LABELS) continue
+            if (TIMESTAMP_REGEX.matches(lower)) continue
+            if (AccessibilityGuard.containsOtpOrSecret(label)) continue
+
+            val vid = node.viewIdResourceName?.lowercase().orEmpty()
+            val isExplicitContactId = CONTACT_NAME_VIEW_IDS.any { vid.contains(it) }
+            val clickable = AccessibilityTreeResolver.findNearestClickableNode(node, nodesById)
+            val clickableVid = clickable?.viewIdResourceName?.lowercase().orEmpty()
+            val inContactContainer = clickableVid.contains("contact_row_container") ||
+                clickableVid.contains("conversations_row") ||
+                clickableVid.contains("contactpicker_row") ||
+                clickableVid.contains("row_container") ||
+                clickableVid.contains("chat_row")
+
+            // Reject top toolbar/header title when we are inspecting a chat list unless explicitly a row
+            val isHeaderTitle = vid.contains("conversation_contact_name") || vid.contains("toolbar")
+            if (isHeaderTitle) continue
+
+            // Reject message preview / subtitle nodes when explicit IDs indicate preview text
+            val isSubtitleOrPreview = vid.contains("single_msg_tv") ||
+                vid.contains("conversations_row_date") ||
+                vid.contains("conversations_row_message_count") ||
+                vid.contains("status") ||
+                vid.contains("badge")
+            if (isSubtitleOrPreview) continue
+
+            val isLikelyContactRow = isExplicitContactId || inContactContainer ||
+                (clickable != null && node.bounds.isValidVisible && node.bounds.top >= 120 && clickable.bounds.height in 60..320)
+
+            if (!isLikelyContactRow) continue
+
+            val effectiveBounds = if (node.bounds.isValidVisible) node.bounds else clickable?.bounds ?: node.bounds
+            if (!effectiveBounds.isValidVisible) continue
+
+            rawRows.add(
+                WhatsAppContactRowCandidate(
+                    nameNode = node,
+                    clickableNode = clickable,
+                    displayName = label,
+                    bounds = effectiveBounds,
+                    matchScore = 0
+                )
+            )
+        }
+
+        // Deduplicate by clickable row container (keep primary contact name node, top-most within each row)
+        val deduped = LinkedHashMap<String, WhatsAppContactRowCandidate>()
+        for (row in rawRows.sortedWith(compareBy<WhatsAppContactRowCandidate> { it.bounds.top }.thenBy { it.bounds.left })) {
+            val key = row.clickableNode?.nodeId?.let { "row_$it" }
+                ?: "y_${row.bounds.top / 90}_${row.displayName.lowercase()}"
+            val existing = deduped[key]
+            val rowHasExplicitId = CONTACT_NAME_VIEW_IDS.any { row.nameNode.viewIdResourceName?.lowercase()?.contains(it) == true }
+            val existingHasExplicitId = existing != null && CONTACT_NAME_VIEW_IDS.any { existing.nameNode.viewIdResourceName?.lowercase()?.contains(it) == true }
+            if (existing == null || (rowHasExplicitId && !existingHasExplicitId)) {
+                deduped[key] = row
+            }
+        }
+
+        return deduped.values.sortedWith(compareBy<WhatsAppContactRowCandidate> { it.bounds.top }.thenBy { it.bounds.left })
+    }
+
+    /**
+     * Resolves a visible WhatsApp contact/chat target by multilingual name OR explicit ordinal index.
+     * STRICT SAFETY:
+     * - If multiple contacts match ambiguously, returns [WhatsAppContactResolution.Ambiguous] (NEVER guesses).
+     * - Never substitutes screen position when a specific contact name was requested.
+     */
+    fun resolveContactTarget(
+        nodes: List<AccessibleNodeSnapshot>,
+        contactQuery: String = "",
+        ordinalIndex: Int? = null
+    ): WhatsAppContactResolution {
+        val rows = collectVisibleChatRows(nodes)
+        if (rows.isEmpty()) {
+            return WhatsAppContactResolution.NotFound(
+                reason = "No visible WhatsApp contacts or chat rows were detected on the current screen.",
+                failureCode = "whatsapp_contacts_not_visible"
+            )
+        }
+
+        val cleanQuery = contactQuery.trim()
+        if (cleanQuery.isNotEmpty()) {
+            val scored = rows
+                .map { it.copy(matchScore = MultilingualNameMatcher.scoreNameMatch(it.displayName, cleanQuery)) }
+                .filter { it.matchScore >= 65 }
+                .sortedByDescending { it.matchScore }
+
+            if (scored.isEmpty()) {
+                return WhatsAppContactResolution.NotFound(
+                    reason = "Could not find \"$cleanQuery\" among the currently visible WhatsApp chats.",
+                    failureCode = "whatsapp_contact_not_visible"
+                )
+            }
+
+            // Check for multiple exact or equally-ranked matches (e.g., two contacts named "Rahul" or "Rahul Das" & "Rahul Roy")
+            val topScore = scored.first().matchScore
+            val topTier = scored.filter { it.matchScore >= topScore - 8 }
+            if (topTier.size > 1) {
+                return WhatsAppContactResolution.Ambiguous(cleanQuery, topTier.take(6))
+            }
+
+            return WhatsAppContactResolution.Matched(scored.first())
+        }
+
+        if (ordinalIndex != null) {
+            if (ordinalIndex < 1 || ordinalIndex > rows.size) {
+                return WhatsAppContactResolution.NotFound(
+                    reason = "Requested contact/chat #$ordinalIndex is not visible (only ${rows.size} visible row(s) found).",
+                    failureCode = "contact_index_out_of_range"
+                )
+            }
+            return WhatsAppContactResolution.Matched(rows[ordinalIndex - 1])
+        }
+
+        return WhatsAppContactResolution.NotFound(
+            reason = "Please specify a contact name or chat position to open in WhatsApp.",
+            failureCode = "missing_contact_target"
+        )
+    }
+
+    /**
+     * Verifies that the active WhatsApp screen is now a conversation with the expected contact.
+     */
+    fun verifyConversationOpened(
+        afterNodes: List<AccessibleNodeSnapshot>,
+        expectedName: String,
+        expectedPhone: String,
+        activePackage: String
+    ): Boolean {
+        if (!WhatsAppAutomationValidator.isWhatsAppPackage(activePackage)) return false
+
+        val hasComposer = afterNodes.any { node ->
+            !node.isPassword && node.isEditable && node.isVisibleToUser
+        }
+        val headerLabels = afterNodes
+            .filter { !it.isPassword && it.isVisibleToUser }
+            .filter { node ->
+                val vid = node.viewIdResourceName?.lowercase().orEmpty()
+                vid.contains("conversation_contact_name") || vid.contains("toolbar") || node.bounds.top < 280
+            }
+            .mapNotNull { it.text?.trim()?.takeIf { s -> s.isNotEmpty() } ?: it.contentDescription?.trim()?.takeIf { s -> s.isNotEmpty() } }
+
+        val allLabels = if (headerLabels.isNotEmpty()) headerLabels else afterNodes.take(15).mapNotNull { it.combinedLabel.takeIf { s -> s.isNotEmpty() } }
+
+        val nameMatched = expectedName.isBlank() ||
+            allLabels.any { MultilingualNameMatcher.matchesQuery(it, expectedName) } ||
+            WhatsAppAutomationValidator.matchesExpectedRecipient(allLabels, expectedName, expectedPhone)
+
+        return hasComposer && nameMatched
+    }
+}
+
+// ============================================================================
+// PART 2C & 2D — DEDICATED WHATSAPP SEND BUTTON RESOLVER & DELIVERY VERIFIER
+// ============================================================================
+
+data class WhatsAppSendButtonMatch(
+    val buttonNode: AccessibleNodeSnapshot,
+    val clickableNode: AccessibleNodeSnapshot?,
+    val bounds: AccessibleRect,
+    val score: Int,
+    val matchedBy: String
+)
+
+enum class WhatsAppDeliveryState(val statusCode: String) {
+    DELIVERED("whatsapp_delivered_confirmed"),
+    SENT("whatsapp_sent_confirmed"),
+    PENDING("whatsapp_sent_pending"),
+    SENT_BUBBLE_VISIBLE("whatsapp_sent_verified"),
+    UNVERIFIED("whatsapp_send_unverified")
+}
+
+data class WhatsAppSendVerificationReport(
+    val verified: Boolean,
+    val state: WhatsAppDeliveryState,
+    val bubbleVisible: Boolean,
+    val composerCleared: Boolean,
+    val evidence: String
+)
+
+object WhatsAppSendButtonResolver {
+
+    private val SEND_EXACT_LABELS = setOf(
+        "send", "send message", "send now",
+        "পাঠান", "মেসেজ পাঠান", "বার্তা পাঠান",
+        "भेजें", "भेजे", "संदेश भेजें", "मैसेज भेजें"
+    )
+
+    private val SEND_VIEW_IDS = listOf(
+        ":id/send",
+        ":id/send_container",
+        ":id/send_btn",
+        ":id/conversation_send",
+        ":id/btn_send",
+        ":id/send_button"
+    )
+
+    // Strictly reject mic/voice-note/attach/camera/emoji/call buttons!
+    private val FORBIDDEN_ACTION_KEYWORDS = listOf(
+        "voice", "mic", "microphone", "record", "audio", "camera", "attach",
+        "emoji", "sticker", "gif", "call", "video call", "search", "more options",
+        "ভয়েস", "মাইক", "ক্যামেরা", "অ্যাটাচ", "ইমোজি", "কল",
+        "वॉइस", "माइक", "कैमरा", "अटैच", "इमोजी", "कॉल"
+    )
+
+    private val FORBIDDEN_VIEW_ID_KEYWORDS = listOf(
+        "voice_note", "mic", "camera", "attach", "emoji", "input_attach", "call", "video"
+    )
+
+    /**
+     * Resolves the real visible & enabled WhatsApp Send button using multi-signal semantic analysis
+     * (text, contentDescription, viewIdResourceName, className, isClickable, isEnabled,
+     * isVisibleToUser, boundsInScreen, parent node hierarchy) — never depends on one hardcoded ID
+     * and never selects voice-note/mic buttons.
+     */
+    fun resolveSendButton(
+        nodes: List<AccessibleNodeSnapshot>,
+        composerBounds: AccessibleRect? = null
+    ): WhatsAppSendButtonMatch? {
+        val nodesById = nodes.associateBy { it.nodeId }
+        val candidates = mutableListOf<WhatsAppSendButtonMatch>()
+
+        for (node in nodes) {
+            if (node.isPassword || node.isEditable) continue
+            if (!node.isEnabled || !node.isVisibleToUser) continue
+
+            val vid = node.viewIdResourceName?.trim()?.lowercase().orEmpty()
+            val desc = node.contentDescription?.trim()?.lowercase().orEmpty()
+            val txt = node.text?.trim()?.lowercase().orEmpty()
+            val cls = node.className?.trim()?.lowercase().orEmpty()
+
+            // Strict safety filter: never treat voice-note/mic/camera/attach/emoji/call as Send
+            if (FORBIDDEN_VIEW_ID_KEYWORDS.any { vid.contains(it) }) continue
+            if (FORBIDDEN_ACTION_KEYWORDS.any { desc.contains(it) || txt.contains(it) }) continue
+
+            var score = 0
+            val signals = mutableListOf<String>()
+
+            if (SEND_EXACT_LABELS.any { desc == it || txt == it }) {
+                score += 60
+                signals.add("exact_send_label")
+            } else if (SEND_EXACT_LABELS.any { desc.startsWith(it) || txt.startsWith(it) }) {
+                score += 45
+                signals.add("prefix_send_label")
+            }
+
+            if (SEND_VIEW_IDS.any { vid.endsWith(it) || vid.contains(it) }) {
+                score += 50
+                signals.add("send_view_id")
+            }
+
+            if (score == 0) continue
+
+            if (cls.contains("imagebutton") || cls.contains("button") || cls.contains("imageview")) {
+                score += 10
+                signals.add("button_class")
+            }
+
+            val clickable = AccessibilityTreeResolver.findNearestClickableNode(node, nodesById, maxDepth = 4)
+            if (node.isClickable) {
+                score += 15
+                signals.add("directly_clickable")
+            } else if (clickable != null) {
+                score += 10
+                signals.add("clickable_parent")
+            }
+
+            val effectiveBounds = if (node.bounds.isValidVisible) node.bounds else clickable?.bounds ?: node.bounds
+            if (effectiveBounds.isValidVisible) {
+                score += 10
+                // Geometric consistency bonus: Send button sits to the right of / aligned vertically with composer
+                if (composerBounds != null && composerBounds.isValidVisible) {
+                    val nearComposerY = kotlin.math.abs(effectiveBounds.centerY - composerBounds.centerY) <= (composerBounds.height * 2.2f + 120f)
+                    val toRightOfComposer = effectiveBounds.left >= composerBounds.left
+                    if (nearComposerY && toRightOfComposer) {
+                        score += 15
+                        signals.add("composer_aligned")
+                    }
+                }
+            }
+
+            // Must have either a semantic clickable node OR valid visible bounds for bounded fallback
+            if (clickable == null && !effectiveBounds.isValidVisible) continue
+
+            candidates.add(
+                WhatsAppSendButtonMatch(
+                    buttonNode = node,
+                    clickableNode = clickable,
+                    bounds = effectiveBounds,
+                    score = score,
+                    matchedBy = signals.joinToString("+")
+                )
+            )
+        }
+
+        return candidates.maxByOrNull { it.score }
+    }
+
+    /**
+     * Inspects updated WhatsApp conversation nodes after Send to verify the outgoing message
+     * and honestly distinguish pending vs sent vs delivered states when visible.
+     * NEVER claims delivery or read status without explicit visible evidence.
+     */
+    fun verifyPostSendState(
+        afterNodes: List<AccessibleNodeSnapshot>,
+        composerText: String,
+        expectedMessage: String
+    ): WhatsAppSendVerificationReport {
+        val cleanExpected = expectedMessage.trim()
+        if (cleanExpected.isEmpty()) {
+            return WhatsAppSendVerificationReport(
+                verified = false,
+                state = WhatsAppDeliveryState.UNVERIFIED,
+                bubbleVisible = false,
+                composerCleared = composerText.trim().isEmpty(),
+                evidence = "Expected message was empty."
+            )
+        }
+
+        val normalizedExpected = cleanExpected.replace(Regex("\\s+"), " ").lowercase()
+        val snippet = normalizedExpected.take(48)
+
+        val nonEditableNodes = afterNodes.filter { !it.isPassword && !it.isEditable && it.isVisibleToUser }
+        val matchingBubbleNode = nonEditableNodes.lastOrNull { node ->
+            val combined = node.combinedLabel.replace(Regex("\\s+"), " ").lowercase()
+            combined.contains(snippet)
+        }
+
+        val composerNormalized = composerText.trim().replace(Regex("\\s+"), " ").lowercase()
+        val composerCleared = composerNormalized.isEmpty() || composerNormalized != normalizedExpected
+
+        if (matchingBubbleNode == null || !composerCleared) {
+            val reason = when {
+                !composerCleared -> "Message text is still present in the WhatsApp composer — Send was not confirmed."
+                else -> "Outgoing message bubble could not be visually verified in the WhatsApp conversation."
+            }
+            return WhatsAppSendVerificationReport(
+                verified = false,
+                state = WhatsAppDeliveryState.UNVERIFIED,
+                bubbleVisible = matchingBubbleNode != null,
+                composerCleared = composerCleared,
+                evidence = reason
+            )
+        }
+
+        // Inspect nearby status indicators (sibling/parent/recent status nodes) for explicit tick descriptions
+        val nodesById = afterNodes.associateBy { it.nodeId }
+        val bubbleParentId = matchingBubbleNode.parentId
+        val statusContextNodes = afterNodes.filter { node ->
+            !node.isPassword && node.isVisibleToUser && (
+                node.parentId == bubbleParentId ||
+                    (bubbleParentId != null && node.parentId == nodesById[bubbleParentId]?.parentId) ||
+                    node.viewIdResourceName?.lowercase()?.contains("status") == true
+                )
+        }
+        val statusLabels = statusContextNodes.mapNotNull {
+            it.contentDescription?.trim()?.lowercase()?.takeIf { s -> s.isNotEmpty() }
+        }
+
+        return when {
+            statusLabels.any { it == "delivered" || it.contains("delivered") || it.contains("ডেলিভার") || it.contains("डिलीवर") } ->
+                WhatsAppSendVerificationReport(
+                    verified = true,
+                    state = WhatsAppDeliveryState.DELIVERED,
+                    bubbleVisible = true,
+                    composerCleared = true,
+                    evidence = "Verified outgoing message bubble, cleared composer, and visible Delivered status indicator."
+                )
+            statusLabels.any { it == "sent" || it.contains("sent") || it.contains("পাঠানো হয়েছে") || it.contains("भेजा गया") } ->
+                WhatsAppSendVerificationReport(
+                    verified = true,
+                    state = WhatsAppDeliveryState.SENT,
+                    bubbleVisible = true,
+                    composerCleared = true,
+                    evidence = "Verified outgoing message bubble, cleared composer, and visible Sent status indicator (delivery not yet confirmed)."
+                )
+            statusLabels.any { it.contains("pending") || it.contains("sending") || it.contains("waiting") || it.contains("clock") } ->
+                WhatsAppSendVerificationReport(
+                    verified = true,
+                    state = WhatsAppDeliveryState.PENDING,
+                    bubbleVisible = true,
+                    composerCleared = true,
+                    evidence = "Verified outgoing message bubble in chat with Pending/Sending status (waiting for network)."
+                )
+            else ->
+                WhatsAppSendVerificationReport(
+                    verified = true,
+                    state = WhatsAppDeliveryState.SENT_BUBBLE_VISIBLE,
+                    bubbleVisible = true,
+                    composerCleared = true,
+                    evidence = "Verified outgoing message appeared in conversation and composer cleared (delivery/read status not exposed by WhatsApp UI)."
+                )
+        }
+    }
+}

@@ -78,6 +78,8 @@ jobs:
 
       # 7. Run Android Unit Tests
       - name: Run Android Unit Tests
+        env:
+          ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: ./android/gradlew -p android --no-daemon :app:testDebugUnitTest --stacktrace
 
       # 8. Build Debug APK (never requires signing secrets)

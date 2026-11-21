@@ -1,9 +1,29 @@
+import org.gradle.api.tasks.testing.logging.TestExceptionFormat
+import org.gradle.api.tasks.testing.logging.TestLogEvent
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
 }
+
+val defaultBackendUrl = "https://zoni-ai-675435111499.asia-southeast1.run.app"
+val configuredBackendUrl = (
+    providers.environmentVariable("ZONI_BACKEND_URL").orNull?.trim()?.takeIf { it.isNotEmpty() }
+        ?: providers.gradleProperty("ZONI_BACKEND_URL").orNull?.trim()?.takeIf { it.isNotEmpty() }
+        ?: defaultBackendUrl
+    )
+    .trimEnd('/')
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"")
+
+val releaseKeystoreFile = providers.environmentVariable("ANDROID_KEYSTORE_PATH")
+    .orNull
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() }
+    ?.let { file(it) }
+    ?.takeIf { it.isFile }
 
 android {
     namespace = "com.zoni.jarvis.assistant"
@@ -22,25 +42,16 @@ android {
             useSupportLibrary = true
         }
 
-        val configuredBackendUrl = (
-            System.getenv("ZONI_BACKEND_URL")?.takeIf { it.isNotBlank() }
-                ?: "https://zoni-ai-675435111499.asia-southeast1.run.app"
-            )
-            .trim()
-            .trimEnd('/')
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
         buildConfigField("String", "ZONI_BACKEND_URL", "\"$configuredBackendUrl\"")
     }
 
     signingConfigs {
         create("release") {
-            val ksPath = System.getenv("ANDROID_KEYSTORE_PATH")
-            if (!ksPath.isNullOrBlank()) {
-                storeFile = file(ksPath)
-                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD") ?: ""
-                keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: ""
-                keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: ""
+            if (releaseKeystoreFile != null) {
+                storeFile = releaseKeystoreFile
+                storePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").orElse("").get()
+                keyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").orElse("").get()
+                keyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD").orElse("").get()
             }
         }
     }
@@ -48,8 +59,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
-            val ksPath = System.getenv("ANDROID_KEYSTORE_PATH")
-            if (!ksPath.isNullOrBlank()) {
+            if (releaseKeystoreFile != null) {
                 signingConfig = signingConfigs.getByName("release")
             }
             proguardFiles(
@@ -73,6 +83,26 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = false
+            isReturnDefaultValues = true
+            all {
+                it.testLogging {
+                    events(
+                        TestLogEvent.PASSED,
+                        TestLogEvent.SKIPPED,
+                        TestLogEvent.FAILED,
+                        TestLogEvent.STANDARD_ERROR
+                    )
+                    showExceptions = true
+                    showCauses = true
+                    showStackTraces = true
+                    exceptionFormat = TestExceptionFormat.FULL
+                }
+            }
+        }
     }
     packaging {
         resources {
@@ -104,6 +134,7 @@ dependencies {
     implementation(libs.okhttp)
 
     testImplementation(libs.junit)
+    testImplementation(libs.org.json)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.androidx.room.testing)
     androidTestImplementation(libs.androidx.junit)

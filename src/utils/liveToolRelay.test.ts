@@ -10,15 +10,23 @@ import {
   type GeminiFunctionResponseItem,
 } from './liveToolRelay.ts';
 
-test('Category D: Gemini Live & HTTP expose all 25 validated assistant tools including open_app, WhatsApp, and generic app chat', () => {
+test('Category D: Gemini Live & HTTP expose all 33 validated assistant tools including YouTube click and WhatsApp smart contact/send tools', () => {
   const names = getExposedAssistantToolNames();
-  assert.equal(names.length, 25);
+  assert.equal(names.length, 33);
   assert.ok(names.includes('open_app'));
   assert.ok(names.includes('prepare_whatsapp_message'));
   assert.ok(names.includes('prepare_app_chat_message'));
   assert.ok(names.includes('flashlight_control'));
   assert.ok(names.includes('call_contact'));
   assert.ok(names.includes('list_installed_apps'));
+  assert.ok(names.includes('click_youtube_video'));
+  assert.ok(names.includes('click_youtube_search_result'));
+  assert.ok(names.includes('click_visible_element'));
+  assert.ok(names.includes('click_whatsapp_contact'));
+  assert.ok(names.includes('open_whatsapp_chat'));
+  assert.ok(names.includes('type_whatsapp_message'));
+  assert.ok(names.includes('send_whatsapp_message'));
+  assert.ok(names.includes('verify_whatsapp_send'));
 });
 
 test('Category D: LiveToolRelayManager relays native_tool_call -> native_tool_result -> sendToolResponse without fabricating success', () => {

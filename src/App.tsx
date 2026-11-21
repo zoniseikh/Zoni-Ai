@@ -51,7 +51,6 @@ import {
   getNativePermissionsSnapshot,
   getNativeRuntimeDiagnostics,
   executeTypedActionViaNativeBridge,
-  confirmPendingActionViaNativeBridge,
   cancelPendingActionViaNativeBridge,
   listInstalledAppsViaNativeBridge,
   executeVerifiedWorkflowViaNativeBridge,
@@ -126,7 +125,7 @@ function mapTaskStepToAssistantTool(
       return {
         name: 'prepare_sms',
         args: {
-          recipient: String(step.args.phoneNumber || ''),
+          recipient: String(step.args.contactQuery || step.args.phoneNumber || ''),
           message: String(step.args.message || ''),
         },
       };
@@ -135,14 +134,20 @@ function mapTaskStepToAssistantTool(
         name: 'open_app',
         args: { app_name: String(step.args.appQuery || '') },
       };
-    case 'app_search_workflow':
+    case 'app_search_workflow': {
+      const targetApp = String(step.args.appQuery || 'YouTube').trim();
+      const query = String(step.args.searchQuery || '').trim();
+      if (targetApp.toLowerCase() === 'youtube' && query) {
+        return { name: 'search_youtube', args: { query } };
+      }
       return {
         name: 'open_app',
         args: {
-          app_name: String(step.args.appQuery || 'YouTube'),
-          search_query: String(step.args.searchQuery || ''),
+          app_name: targetApp,
+          search_query: query,
         },
       };
+    }
     case 'list_installed_apps':
       return { name: 'list_installed_apps', args: {} };
     case 'open_settings':
@@ -190,6 +195,74 @@ function mapTaskStepToAssistantTool(
       return { name: 'search_web', args: { query: String(step.args.query || '') } };
     case 'cancel_current_task':
       return { name: 'cancel_current_task', args: {} };
+    case 'click_youtube_video':
+      return {
+        name: 'click_youtube_video',
+        args: {
+          ...(step.args.index !== undefined ? { index: Number(step.args.index) } : {}),
+          ...(step.args.target ? { target: String(step.args.target) } : {}),
+          ...(step.args.query ? { query: String(step.args.query) } : {}),
+        },
+      };
+    case 'click_youtube_search_result':
+      return {
+        name: 'click_youtube_search_result',
+        args: {
+          index: Number(step.args.index || 1),
+          ...(step.args.query ? { query: String(step.args.query) } : {}),
+        },
+      };
+    case 'click_visible_element':
+      return {
+        name: 'click_visible_element',
+        args: {
+          target: String(step.args.target || ''),
+          ...(step.args.index !== undefined ? { index: Number(step.args.index) } : {}),
+        },
+      };
+    case 'click_whatsapp_contact':
+      return {
+        name: 'click_whatsapp_contact',
+        args: {
+          ...(step.args.contactName ? { contact_name: String(step.args.contactName) } : {}),
+          ...(step.args.index !== undefined ? { index: Number(step.args.index) } : {}),
+          ...(step.args.searchIfMissing !== undefined
+            ? { search_if_missing: Boolean(step.args.searchIfMissing) }
+            : {}),
+        },
+      };
+    case 'open_whatsapp_chat':
+      return {
+        name: 'open_whatsapp_chat',
+        args: {
+          ...(step.args.contactName ? { contact_name: String(step.args.contactName) } : {}),
+          ...(step.args.index !== undefined ? { index: Number(step.args.index) } : {}),
+        },
+      };
+    case 'type_whatsapp_message':
+      return {
+        name: 'type_whatsapp_message',
+        args: {
+          ...(step.args.recipient ? { recipient: String(step.args.recipient) } : {}),
+          message: String(step.args.message || ''),
+        },
+      };
+    case 'send_whatsapp_message':
+      return {
+        name: 'send_whatsapp_message',
+        args: {
+          ...(step.args.recipient ? { recipient: String(step.args.recipient) } : {}),
+          message: String(step.args.message || ''),
+        },
+      };
+    case 'verify_whatsapp_send':
+      return {
+        name: 'verify_whatsapp_send',
+        args: {
+          ...(step.args.recipient ? { recipient: String(step.args.recipient) } : {}),
+          message: String(step.args.message || ''),
+        },
+      };
     default:
       return null;
   }
@@ -723,9 +796,10 @@ export default function App() {
       const bridge = getNativeAndroidBridge();
       const lang = activeLanguageRef.current;
 
-      // 1. Communication Tools requiring explicit user review & approval (WhatsApp, SMS, Call, Supported App Chats)
+      // 1. Direct Communication Tools (WhatsApp, SMS, Call, Supported App Chats — NO routine confirmation; disambiguate ONLY on multiple matches)
       if (
         req.actionType === 'prepare_whatsapp_message' ||
+        req.actionType === 'send_whatsapp_message' ||
         req.actionType === 'prepare_sms' ||
         req.actionType === 'call_contact' ||
         req.actionType === 'prepare_app_chat_message'
@@ -759,109 +833,141 @@ export default function App() {
             req.actionId
           );
           if (nativeReport) {
-            if (nativeReport.awaitingConfirmation && nativeReport.pendingActionId) {
+            const rawCandidates = Array.isArray(nativeReport.data?.candidates)
+              ? nativeReport.data.candidates
+              : [];
+            const needsDisambiguation =
+              (nativeReport.status === 'multiple_contacts' ||
+                nativeReport.status === 'multiple_numbers') &&
+              rawCandidates.length > 1;
+
+            if (needsDisambiguation) {
               setPendingActionDraft({
-                pendingActionId: nativeReport.pendingActionId,
-                actionType: req.actionType,
+                pendingActionId: nativeReport.pendingActionId || `disambig_${Date.now()}`,
+                actionType:
+                  req.actionType === 'send_whatsapp_message'
+                    ? 'prepare_whatsapp_message'
+                    : req.actionType,
                 appName:
                   req.actionType === 'prepare_app_chat_message'
                     ? String(nativeReport.data?.appName || rawAppName || 'Telegram')
                     : undefined,
-                recipientName: String(nativeReport.data?.contactName || recipient),
-                phoneNumber: String(nativeReport.data?.phoneNumber || ''),
-                messageText: String(nativeReport.data?.message || messageText),
-                candidates: Array.isArray(nativeReport.data?.candidates)
-                  ? nativeReport.data.candidates
-                  : undefined,
-                canReplyViaNotification: Boolean(nativeReport.data?.canReplyViaNotification),
-                notificationKey: nativeReport.data?.notificationKey
-                  ? String(nativeReport.data.notificationKey)
-                  : undefined,
+                recipientName: String(nativeReport.data?.recipient || nativeReport.data?.contactName || recipient),
+                phoneNumber: '',
+                messageText: String(nativeReport.data?.messageText || nativeReport.data?.message || messageText),
+                candidates: rawCandidates,
                 isNativePending: true,
                 statusNote: nativeReport.message,
               });
+            } else {
+              setPendingActionDraft(null);
             }
             return nativeReport;
           }
         }
 
-        // Web preview / PWA confirmation staging (NEVER auto-send or auto-dial)
-        const pendingId = `web_pending_${Date.now()}`;
+        // Web preview / PWA direct execution (NO routine confirmation cards, NEVER guess unknown phone numbers)
+        setPendingActionDraft(null);
         const digitsOnly = recipient.replace(/[^\d+]/g, '');
         const isNumeric = digitsOnly.length >= 7;
+        const displayRecipientName = String(req.arguments.recipient_name || recipient).trim() || recipient;
         const displayAppName =
           req.actionType === 'prepare_app_chat_message'
             ? rawAppName.charAt(0).toUpperCase() + rawAppName.slice(1).toLowerCase()
             : undefined;
-        setPendingActionDraft({
-          pendingActionId: pendingId,
-          actionType: req.actionType,
-          appName: displayAppName,
-          recipientName: recipient,
-          phoneNumber: isNumeric ? digitsOnly : '',
-          messageText,
-          isNativePending: false,
-          statusNote:
-            req.actionType === 'prepare_whatsapp_message'
-              ? messageText
-                ? lang === 'bn-BD'
-                  ? 'মেসেজটি রিভিউ বা এডিট করে অনুমোদন দিন — অনুমোদনের আগে WhatsApp-এ পাঠানো হবে না।'
-                  : 'Review or edit the draft before approving — nothing is sent until you explicitly approve.'
-                : lang === 'bn-BD'
-                ? 'কী মেসেজ লিখতে চান তা নিচের বক্সে লিখে অনুমোদন দিন — অনুমোদনের আগে পাঠানো হবে না।'
-                : 'Type the message you want to send below, then approve — nothing is sent before approval.'
-              : req.actionType === 'prepare_app_chat_message'
-              ? lang === 'bn-BD'
-                ? `${displayAppName}-এ পাঠানোর আগে প্রাপক ও মেসেজ যাচাই করে অনুমোদন দিন।`
-                : `Review recipient and message before approving ${displayAppName} automation.`
-              : req.actionType === 'call_contact'
-              ? lang === 'bn-BD'
-                ? 'কল করার আগে নম্বর ও নাম যাচাই করে অনুমতি দিন।'
-                : 'Verify recipient details and approve before placing the call.'
-              : lang === 'bn-BD'
-              ? 'SMS কম্পোজার খোলার আগে মেসেজটি যাচাই করুন।'
-              : 'Review this SMS draft before opening your SMS composer.',
+
+        if (req.actionType === 'prepare_app_chat_message') {
+          return {
+            actionId: req.actionId,
+            actionType: 'prepare_app_chat_message',
+            success: false,
+            verified: true,
+            status: 'native_android_required',
+            message:
+              lang === 'bn-BD'
+                ? `${displayAppName}-এ সরাসরি মেসেজ পাঠাতে Android APK ও Zoni Accessibility Service প্রয়োজন।`
+                : `Direct ${displayAppName} messaging requires the installed Android APK with Zoni Accessibility Service enabled.`,
+            data: { appName: displayAppName, contactName: displayRecipientName },
+          };
+        }
+
+        if (!isNumeric) {
+          return {
+            actionId: req.actionId,
+            actionType: req.actionType,
+            success: false,
+            verified: true,
+            status: 'native_android_required',
+            requiredPermissions: ['READ_CONTACTS'],
+            message:
+              lang === 'bn-BD'
+                ? `"${recipient}" কন্টাক্টের ফোন নম্বর খুঁজে সরাসরি কাজ করতে Android APK (READ_CONTACTS পারমিশনসহ) প্রয়োজন, অথবা সরাসরি ফোন নম্বর বলুন।`
+                : `Resolving saved contact "${recipient}" without guessing requires the installed Android APK with Contacts permission, or please provide the exact phone number.`,
+            data: { recipient, failureReason: 'contacts_unavailable_in_web_preview' },
+          };
+        }
+
+        if (req.actionType === 'call_contact') {
+          executeAssistantActionDirectly({
+            type: 'call',
+            target: digitsOnly,
+            label: `Call ${displayRecipientName}`,
+          });
+          return {
+            actionId: req.actionId,
+            actionType: 'call_contact',
+            success: true,
+            verified: true,
+            status: 'dialer_opened',
+            message:
+              lang === 'bn-BD'
+                ? `${displayRecipientName} (${digitsOnly})-এ কল করার জন্য ডায়ালার খোলা হয়েছে।`
+                : `Opened dialer for ${displayRecipientName} (${digitsOnly}).`,
+            data: { contactName: displayRecipientName, phoneNumber: digitsOnly },
+          };
+        }
+
+        if (req.actionType === 'prepare_whatsapp_message' || req.actionType === 'send_whatsapp_message') {
+          executeAssistantActionDirectly({
+            type: 'whatsapp',
+            target: digitsOnly,
+            payload: messageText,
+            label: `WhatsApp ${displayRecipientName}`,
+          });
+          return {
+            actionId: req.actionId,
+            actionType: req.actionType,
+            target: displayRecipientName,
+            success: true,
+            verified: true,
+            status: 'opened_whatsapp_draft_ready_to_send',
+            executionStatus: 'opened_whatsapp_draft_ready_to_send',
+            message:
+              lang === 'bn-BD'
+                ? `${displayRecipientName}-এর জন্য WhatsApp চ্যাট খুলে দেওয়া হয়েছে।`
+                : `Opened WhatsApp chat for ${displayRecipientName}.`,
+            data: { contactName: displayRecipientName, phoneNumber: digitsOnly, message: messageText },
+          };
+        }
+
+        // prepare_sms in web preview
+        executeAssistantActionDirectly({
+          type: 'sms',
+          target: digitsOnly,
+          payload: messageText,
+          label: `SMS ${displayRecipientName}`,
         });
-
-        const stagedMessage =
-          req.actionType === 'prepare_whatsapp_message'
-            ? messageText
-              ? lang === 'bn-BD'
-                ? `${recipient}-এর জন্য WhatsApp মেসেজ ড্রাফট প্রস্তুত করা হয়েছে: "${messageText}"। অনুগ্রহ করে নিচের কার্ডে রিভিউ করে অনুমোদন দিন বা বলুন "এখন পাঠানোর অনুমতি দিলাম"।`
-                : `Prepared WhatsApp draft for ${recipient}: "${messageText}". Please review, edit, cancel, or approve below before sending.`
-              : lang === 'bn-BD'
-              ? `${recipient}-এর জন্য WhatsApp ড্রাফট খোলা হয়েছে। কী মেসেজ লিখতে চান তা নিচের কার্ডে লিখে অনুমোদন দিন।`
-              : `Prepared WhatsApp draft for ${recipient}. What message would you like to send? Enter it in the confirmation card below and approve.`
-            : req.actionType === 'prepare_app_chat_message'
-            ? messageText
-              ? lang === 'bn-BD'
-                ? `${displayAppName}-এ ${recipient}-এর জন্য মেসেজ ড্রাফট প্রস্তুত করা হয়েছে: "${messageText}"। পাঠানোর আগে নিচের কার্ডে রিভিউ করে অনুমোদন দিন।`
-                : `Prepared ${displayAppName} chat draft for ${recipient}: "${messageText}". Please review and approve below before sending.`
-              : lang === 'bn-BD'
-              ? `${displayAppName}-এ ${recipient}-এর জন্য ড্রাফট প্রস্তুত। কী মেসেজ লিখতে চান তা নিচের কার্ডে লিখে অনুমোদন দিন।`
-              : `Prepared ${displayAppName} draft for ${recipient}. Enter the message text below and approve to send.`
-            : req.actionType === 'call_contact'
-            ? lang === 'bn-BD'
-              ? `${recipient}-কে কল করার আগে অনুগ্রহ করে নিচের কার্ডে নিশ্চিত করুন।`
-              : `Please confirm below before calling ${recipient}.`
-            : lang === 'bn-BD'
-            ? `${recipient}-এর জন্য SMS ড্রাফট প্রস্তুত করা হয়েছে। নিচের কার্ডে রিভিউ করে অনুমোদন দিন।`
-            : `Prepared SMS draft for ${recipient}. Please review and approve below.`;
-
         return {
           actionId: req.actionId,
-          actionType: req.actionType,
+          actionType: 'prepare_sms',
           success: true,
           verified: true,
-          awaitingConfirmation: true,
-          pendingActionId: pendingId,
-          status: 'awaiting_confirmation',
-          message: stagedMessage,
-          data: {
-            recipient,
-            ...(displayAppName ? { appName: displayAppName } : {}),
-            hasMessageText: Boolean(messageText),
-          },
+          status: 'opened_sms_composer_ready_to_send',
+          message:
+            lang === 'bn-BD'
+              ? `${displayRecipientName} (${digitsOnly})-এর জন্য SMS অ্যাপ খোলা হয়েছে।`
+              : `Opened SMS composer for ${displayRecipientName} (${digitsOnly}).`,
+          data: { contactName: displayRecipientName, phoneNumber: digitsOnly, message: messageText },
         };
       }
 
@@ -1036,6 +1142,26 @@ export default function App() {
           req.actionId
         );
         if (nativeRes) {
+          // If WhatsApp contact click found multiple matching visible contacts, surface the disambiguation picker
+          const rawCandidates = Array.isArray(nativeRes.data?.candidates)
+            ? nativeRes.data.candidates
+            : [];
+          if (
+            (req.actionType === 'click_whatsapp_contact' || req.actionType === 'open_whatsapp_chat') &&
+            (nativeRes.status === 'multiple_contacts' || nativeRes.status === 'multiple_numbers') &&
+            rawCandidates.length > 1
+          ) {
+            setPendingActionDraft({
+              pendingActionId: nativeRes.pendingActionId || `wa_disambig_${Date.now()}`,
+              actionType: 'prepare_whatsapp_message',
+              recipientName: String(nativeRes.data?.recipient || nativeRes.target || ''),
+              phoneNumber: '',
+              messageText: '',
+              candidates: rawCandidates,
+              isNativePending: true,
+              statusNote: nativeRes.message,
+            });
+          }
           return nativeRes;
         }
       }
@@ -1081,6 +1207,36 @@ export default function App() {
                     .slice(0, 4)
                     .map((n) => `${n.appName} (${n.title}): ${n.text}`)
                     .join(' | '),
+          };
+        }
+        case 'click_youtube_video':
+        case 'click_youtube_search_result':
+        case 'click_visible_element':
+        case 'click_whatsapp_contact':
+        case 'open_whatsapp_chat':
+        case 'type_whatsapp_message':
+        case 'verify_whatsapp_send': {
+          const targetLabel = String(
+            req.arguments.contact_name ||
+              req.arguments.target ||
+              req.arguments.query ||
+              req.arguments.recipient ||
+              ''
+          );
+          return {
+            actionId: req.actionId,
+            actionType: req.actionType,
+            target: targetLabel,
+            success: false,
+            verified: true,
+            status: 'permission_missing',
+            executionStatus: 'permission_missing',
+            failureReason: 'accessibility_service_disabled',
+            requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+            message:
+              lang === 'bn-BD'
+                ? 'YouTube ভিডিও ক্লিক ও WhatsApp কন্টাক্ট/মেসেজ অটোমেশনের জন্য Android APK-তে Zoni Accessibility Service চালু করতে হবে।'
+                : 'YouTube video clicking and WhatsApp smart contact/message automation require the installed Android APK with Zoni Accessibility Service enabled.',
           };
         }
         case 'scroll_screen':
@@ -1308,9 +1464,9 @@ export default function App() {
     []
   );
 
-  // Explicit User Approval Handler for Pending WhatsApp / SMS / Call Drafts
+  // Direct Execution Handler when user selects an exact contact from a multiple-match disambiguation list
   const handleApprovePendingAction = useCallback(
-    (options: {
+    async (options: {
       pendingActionId: string;
       recipientName: string;
       phoneNumber: string;
@@ -1323,111 +1479,26 @@ export default function App() {
       const name = selectedAffectionNameRef.current;
 
       setPendingActionDraft(null);
-      let report: ToolExecutionReport;
 
-      if (currentDraft.isNativePending) {
-        const nativeReport = confirmPendingActionViaNativeBridge(
-          options.pendingActionId,
-          options.messageText,
-          options.useNotificationReply
-        );
-        report = nativeReport || {
-          actionId: options.pendingActionId,
-          actionType: currentDraft.actionType,
-          success: false,
-          verified: false,
-          status: 'failed',
-          message: 'Could not confirm pending native action.',
-        };
-      } else {
-        // Web preview approval: open honest draft link (never claim auto-sent!)
-        const cleanPhone = options.phoneNumber.replace(/[^\d+]/g, '');
-        if (currentDraft.actionType === 'prepare_whatsapp_message') {
-          if (cleanPhone) {
-            executeAssistantActionDirectly({
-              type: 'whatsapp',
-              target: cleanPhone,
-              payload: options.messageText,
-              label: `WhatsApp ${options.recipientName}`,
-            });
-          }
-          report = {
-            actionId: options.pendingActionId,
-            actionType: 'prepare_whatsapp_message',
-            success: true,
-            verified: true,
-            status: 'opened_whatsapp_draft_ready_to_send',
-            message: 'WhatsApp draft opened after user approval.',
-            data: {
-              contactName: options.recipientName,
-              phoneNumber: cleanPhone,
-              message: options.messageText,
-            },
-          };
-        } else if (currentDraft.actionType === 'prepare_sms') {
-          if (cleanPhone) {
-            executeAssistantActionDirectly({
-              type: 'sms',
-              target: cleanPhone,
-              payload: options.messageText,
-              label: `SMS ${options.recipientName}`,
-            });
-          }
-          report = {
-            actionId: options.pendingActionId,
-            actionType: 'prepare_sms',
-            success: true,
-            verified: true,
-            status: 'opened_sms_composer',
-            message:
-              lang === 'bn-BD'
-                ? `${name}, ${options.recipientName}-এর জন্য SMS কম্পোজার খোলা হয়েছে। পাঠাতে অনুগ্রহ করে SMS অ্যাপে Send চাপুন।`
-                : `Opened SMS composer for ${options.recipientName}. Please review and tap Send.`,
-          };
-        } else if (currentDraft.actionType === 'prepare_app_chat_message') {
-          const targetApp = currentDraft.appName || 'App';
-          report = {
-            actionId: options.pendingActionId,
-            actionType: 'prepare_app_chat_message',
-            success: true,
-            verified: true,
-            status: 'opened_app_chat_draft_ready_to_send',
-            message:
-              lang === 'bn-BD'
-                ? `${name}, ${targetApp}-এ ${options.recipientName}-এর মেসেজ অনুমোদিত হয়েছে। সম্পূর্ণ ইন-অ্যাপ অটোমেশন Android APK-তে Accessibility চালু থাকলে চলে।`
-                : `${targetApp} message approved for ${options.recipientName}. Full verified in-app automation runs inside the Android APK with Accessibility enabled.`,
-            data: {
-              appName: targetApp,
-              contactName: options.recipientName,
-            },
-          };
-        } else {
-          if (cleanPhone) {
-            executeAssistantActionDirectly({
-              type: 'call',
-              target: cleanPhone,
-              label: `Call ${options.recipientName}`,
-            });
-          }
-          report = {
-            actionId: options.pendingActionId,
-            actionType: 'call_contact',
-            success: Boolean(cleanPhone),
-            verified: true,
-            status: cleanPhone ? 'dialer_opened' : 'missing_phone',
-            message: cleanPhone
-              ? lang === 'bn-BD'
-                ? `${name}, আপনার অনুমোদনের পর ${options.recipientName} (${cleanPhone})-এ কল শুরু করা হয়েছে।`
-                : `Call initiated for ${options.recipientName} (${cleanPhone}) after your approval.`
-              : lang === 'bn-BD'
-              ? `${name}, কল করার জন্য সঠিক ফোন নম্বর দিন বা Android APK-তে Contacts পারমিশন চালু করুন।`
-              : `Please enter a phone number or grant Android Contacts permission in the APK to call ${options.recipientName}.`,
-          };
-        }
+      const directArgs: Record<string, unknown> = {
+        recipient: options.phoneNumber || options.recipientName,
+        recipient_name: options.recipientName,
+      };
+      if (currentDraft.actionType !== 'call_contact') {
+        directArgs.message = options.messageText;
+      }
+      if (currentDraft.actionType === 'prepare_app_chat_message' && currentDraft.appName) {
+        directArgs.app_name = currentDraft.appName;
       }
 
+      const report = await executeValidatedAssistantTool(
+        currentDraft.actionType,
+        directArgs,
+        `disambig_exec_${Date.now()}`
+      );
+
       recordActionDiagnostic(
-        currentDraft.isNativePending ? 'deterministic_native' : 'deterministic_native',
+        'deterministic_native',
         currentDraft.actionType,
         currentDraft.appName ? { app_name: currentDraft.appName } : {},
         report
@@ -1437,7 +1508,7 @@ export default function App() {
       setMessages((prev) => [
         ...prev,
         {
-          id: `confirm-res-${Date.now()}`,
+          id: `disambig-res-${Date.now()}`,
           role: 'assistant',
           text: honestReply,
           timestamp: new Date(),
@@ -1447,7 +1518,7 @@ export default function App() {
       setLatestTranscript(honestReply);
       setAssistantState('idle');
     },
-    [recordActionDiagnostic]
+    [executeValidatedAssistantTool, recordActionDiagnostic]
   );
 
   // Explicit User Cancellation Handler for Pending Drafts
@@ -1578,8 +1649,10 @@ export default function App() {
             toolResults.push(result);
           }
 
-          const hasPendingConfirmation = toolResults.some((r) => r.awaitingConfirmation);
-          if (hasPendingConfirmation) {
+          const needsContactDisambiguation = toolResults.some(
+            (r) => r.status === 'multiple_contacts' || r.status === 'multiple_numbers'
+          );
+          if (needsContactDisambiguation) {
             finalReply = toolResults
               .map((r) =>
                 formatLocalizedActionOutcome(
@@ -1991,25 +2064,12 @@ export default function App() {
                   }
                   if (plan.steps.length === 0) return;
 
-                  // Voice approval of pending draft
-                  if (plan.steps.length === 1 && plan.steps[0].tool === 'approve_pending_action') {
-                    const draft = pendingActionDraftRef.current;
-                    if (
-                      draft &&
-                      recentActionDeduplicatorRef.current.shouldExecute('approve_pending_action', {
-                        id: draft.pendingActionId,
-                      })
-                    ) {
-                      handleApprovePendingAction({
-                        pendingActionId: draft.pendingActionId,
-                        recipientName: draft.recipientName,
-                        phoneNumber: draft.phoneNumber,
-                        messageText: draft.messageText,
-                        useNotificationReply: Boolean(
-                          draft.canReplyViaNotification && draft.notificationKey
-                        ),
-                      });
-                    }
+                  // Routine actions execute directly — no second verbal approval required.
+                  if (
+                    plan.steps.length === 1 &&
+                    (plan.steps[0].tool === 'approve_pending_action' ||
+                      plan.steps[0].tool === 'review_pending_draft')
+                  ) {
                     return;
                   }
 
@@ -2924,48 +2984,13 @@ export default function App() {
           setAssistantState('idle');
         };
 
-        // Handle explicit pending-draft review or approval commands first
+        // Routine actions execute directly without a pending approval step.
         const singleTool = taskPlan.steps.length === 1 ? taskPlan.steps[0].tool : null;
-        if (singleTool === 'approve_pending_action') {
-          const currentDraft = pendingActionDraftRef.current;
-          if (!currentDraft) {
-            appendDirectTurn(
-              activeLanguage === 'bn-BD'
-                ? `${selectedAffectionName}, এখন কোনো অপেক্ষমাণ মেসেজ বা কল ড্রাফট নেই।`
-                : `There is no pending message or call draft to approve right now, ${selectedAffectionName}.`
-            );
-            return;
-          }
-          setMessages((prev) => [
-            ...prev,
-            { id: clientMsgId, role: 'user', text: cleanText, timestamp: new Date(), lang: activeLanguage },
-          ]);
-          handleApprovePendingAction({
-            pendingActionId: currentDraft.pendingActionId,
-            recipientName: currentDraft.recipientName,
-            phoneNumber: currentDraft.phoneNumber,
-            messageText: currentDraft.messageText,
-            useNotificationReply: Boolean(
-              currentDraft.canReplyViaNotification && currentDraft.notificationKey
-            ),
-          });
-          return;
-        }
-
-        if (singleTool === 'review_pending_draft') {
-          const currentDraft = pendingActionDraftRef.current;
-          if (!currentDraft) {
-            appendDirectTurn(
-              activeLanguage === 'bn-BD'
-                ? `${selectedAffectionName}, এখন কোনো মেসেজ ড্রাফট তৈরি করা নেই। বলুন কাকে কী মেসেজ লিখতে চান।`
-                : `No draft is queued yet, ${selectedAffectionName}. Tell me who you want to message and what to write.`
-            );
-            return;
-          }
+        if (singleTool === 'approve_pending_action' || singleTool === 'review_pending_draft') {
           appendDirectTurn(
             activeLanguage === 'bn-BD'
-              ? `${selectedAffectionName}, আপনার ড্রাফট — প্রাপক: ${currentDraft.recipientName}${currentDraft.phoneNumber ? ` (${currentDraft.phoneNumber})` : ''}, মেসেজ: "${currentDraft.messageText || '(খালি)'}"। নিচের কার্ড থেকে এডিট, বাতিল বা অনুমোদন করতে পারবেন।`
-              : `Pending draft for ${currentDraft.recipientName}${currentDraft.phoneNumber ? ` (${currentDraft.phoneNumber})` : ''}: "${currentDraft.messageText || '(empty)'}". Review, edit, cancel, or approve in the card below.`
+              ? `${selectedAffectionName}, এখন কোনো আলাদা অনুমতির দরকার নেই — সরাসরি বলুন কাকে কল বা মেসেজ করতে হবে।`
+              : `No separate approval step is required, ${selectedAffectionName} — just tell me directly who to call or message.`
           );
           return;
         }

@@ -41,7 +41,15 @@ export type AllowedTaskTool =
   | 'notification'
   | 'reminder'
   | 'web_search'
-  | 'cancel_current_task';
+  | 'cancel_current_task'
+  | 'click_youtube_video'
+  | 'click_youtube_search_result'
+  | 'click_visible_element'
+  | 'click_whatsapp_contact'
+  | 'open_whatsapp_chat'
+  | 'type_whatsapp_message'
+  | 'send_whatsapp_message'
+  | 'verify_whatsapp_send';
 
 export const ALLOWED_TASK_TOOLS: ReadonlySet<AllowedTaskTool> = new Set([
   'open_app',
@@ -67,6 +75,14 @@ export const ALLOWED_TASK_TOOLS: ReadonlySet<AllowedTaskTool> = new Set([
   'reminder',
   'web_search',
   'cancel_current_task',
+  'click_youtube_video',
+  'click_youtube_search_result',
+  'click_visible_element',
+  'click_whatsapp_contact',
+  'open_whatsapp_chat',
+  'type_whatsapp_message',
+  'send_whatsapp_message',
+  'verify_whatsapp_send',
 ]);
 
 export interface TaskStep {
@@ -128,7 +144,7 @@ export function buildStructuredTaskPlan(rawInput: string): TaskPlan {
 
   // Do not split WhatsApp/SMS messages that contain "এবং" / "then" inside the message body
   const looksLikeMessaging =
-    /(?:whats\s*app|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|व्हाट्सएप|মেসেজ\s*(?:পাঠাও|করো|লিখে\s*দাও)|मैसेज\s*(?:भेजो|लिखो)|message\s+(?:to|saying))/i.test(
+    /(?:whats\s*app|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|व्हाट्सएप|\bsms\b|এসএমএস|এস\.এম\.এস|एसएमएस|মেসেজ\s*(?:পাঠাও|পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|করো|লিখে\s*দাও)|मैसेज\s*(?:भेजो|भेज\s*दो|लिखो)|message\s+(?:to|saying))/i.test(
       cleaned
     );
 
@@ -169,12 +185,36 @@ function stripTrailingPunctuation(text: string): string {
 }
 
 function normalizeRelationName(raw: string): string {
-  return raw
+  let clean = raw
     .trim()
     .replace(/^(?:আমার|একটু|দয়া\s*করে|দয়া\s*করে|প্লিজ|my|please|मेरे|मेरी|मेरा)\s+/i, '')
     .replace(/^(?:কে|কো)\s+/i, '')
-    .replace(/(?:-?কে|কে)$/i, '')
+    .replace(/(?:'s|’s)$/i, '')
+    .replace(/\s+(?:का|की|के)$/i, '')
     .trim();
+
+  if (clean === 'মায়ের' || clean === 'মায়ের' || clean === 'মাকে') return 'মা';
+  if (clean === 'বাবার' || clean === 'বাবাকে') return 'বাবা';
+  if (clean.endsWith('ের') && clean.length > 3) {
+    clean = clean.slice(0, -2);
+  } else if ((clean.endsWith('য়ের') || clean.endsWith('য়ের')) && clean.length > 4) {
+    clean = clean.slice(0, -3);
+  } else if (clean.endsWith('ার') && clean.length > 4) {
+    clean = clean.slice(0, -1);
+  } else if (clean.endsWith('কে') && clean.length > 3) {
+    clean = clean.replace(/(?:-?কে|কে)$/i, '');
+  }
+  return clean.trim();
+}
+
+function parseMultilingualOrdinal(text: string): number | null {
+  const lower = text.toLowerCase();
+  if (/(?:প্রথম|পহেলা|1st|\bfirst\b|पहला|पहले|प्रथम)/i.test(lower)) return 1;
+  if (/(?:দ্বিতীয়|দ্বিতীয়|2nd|\bsecond\b|दूसरा|दूसरे|दूसरी)/i.test(lower)) return 2;
+  if (/(?:তৃতীয়|তৃতীয়|3rd|\bthird\b|तीसरा|तीसरे)/i.test(lower)) return 3;
+  if (/(?:চতুর্থ|4th|\bfourth\b|चौथा|चौथे)/i.test(lower)) return 4;
+  if (/(?:পঞ্চম|5th|\bfifth\b|पांचवा|पाँचवाँ)/i.test(lower)) return 5;
+  return null;
 }
 
 function normalizeAppQueryTarget(raw: string): string {
@@ -342,6 +382,284 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
       requiresUserConfirmation: false,
       honestOutcomeNote: 'Reads recent local non-sensitive Android notifications captured via NotificationListenerService.',
     };
+  }
+
+  // 2b. Advanced YouTube Click Engine (Bengali / English / Hindi)
+  // Play button: "Play Button চাপো", "Click the Play button", "প্লে বাটন চাপো"
+  if (
+    /(?:play\s*button|প্লে\s*বাটন|प्ले\s*बटन)/i.test(segment) &&
+    /(?:click|tap|press|চাপো|ক্লিক|ট্যাপ|दबाओ|क्लिक)/i.test(segment)
+  ) {
+    return {
+      stepId,
+      tool: 'click_youtube_video',
+      args: { target: 'play_button' },
+      requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Clicks the visible YouTube Play button via Accessibility and verifies playback.',
+    };
+  }
+
+  // Thumbnail click: "এই ভিডিওর Thumbnail-এ ক্লিক করো", "Click this video's thumbnail"
+  if (
+    /(?:thumbnail|থাম্বনেইল|थंबनेल)/i.test(segment) &&
+    /(?:click|tap|open|ক্লিক|ট্যাপ|খোলো|ওপেন|क्लिक)/i.test(segment)
+  ) {
+    return {
+      stepId,
+      tool: 'click_youtube_video',
+      args: { index: parseMultilingualOrdinal(segment) ?? 1, target: 'thumbnail' },
+      requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Clicks the visible YouTube video thumbnail via semantic bounds and verifies watch screen opens.',
+    };
+  }
+
+  // Search Result click: "প্রথম সার্চ রেজাল্টে ক্লিক করো", "Open the first search result"
+  if (
+    /(?:search\s*result|সার্চ\s*রেজাল্ট|सर्च\s*रिजल्ट|सर्च\s*परिणाम)/i.test(segment) &&
+    /(?:click|tap|open|play|ক্লিক|ওপেন|খোলো|চালাও|क्लिक|खोलो)/i.test(segment)
+  ) {
+    return {
+      stepId,
+      tool: 'click_youtube_search_result',
+      args: { index: parseMultilingualOrdinal(segment) ?? 1 },
+      requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Clicks the requested visible YouTube search result and verifies the video opens.',
+    };
+  }
+
+  // Ordinal / current YouTube video click: "প্রথম ভিডিওটি চালাও", "দ্বিতীয় ভিডিওতে ক্লিক করো", "এই ভিডিওটা ওপেন করো",
+  // "Play the first video", "Click the second video", "Open this video",
+  // "पहला वीडियो चलाओ", "दूसरे वीडियो पर क्लिक करो", "इस वीडियो को खोलो"
+  if (
+    /(?:video|ভিডিও|वीडियो)/i.test(segment) &&
+    /(?:play|click|tap|open|select|চালাও|ক্লিক|ট্যাপ|ওপেন|খোলো|चलाओ|क्लिक|खोलो)/i.test(segment)
+  ) {
+    const ord = parseMultilingualOrdinal(segment);
+    if (ord !== null) {
+      return {
+        stepId,
+        tool: 'click_youtube_video',
+        args: { index: ord, target: `video_${ord}` },
+        requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Clicks visible YouTube video #${ord} via semantic node discovery and verifies watch screen opens.`,
+      };
+    }
+    if (/(?:এই\s*ভিডিও|this\s+video|current\s+video|इस\s*वीडियो)/i.test(segment)) {
+      return {
+        stepId,
+        tool: 'click_youtube_video',
+        args: { index: 1, target: 'current_video' },
+        requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: 'Clicks the visible YouTube video on screen and verifies the watch player opens.',
+      };
+    }
+  }
+
+  // 2c. WhatsApp Smart Contact & Chat Name Click Engine (Bengali / English / Hindi)
+  const hasWaContactContext =
+    /(?:whatsapp|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|व्हाट्सएप|chat|চ্যাট|चैट|contact|কন্টাক্ট|कॉन्टैक्ट|নামের\s*উপর|নামটিতে)/i.test(
+      segment
+    );
+  const isFullMessageSend =
+    /(?:মেসেজ\s*(?:পাঠাও|পাঠিয়ে|পাঠিয়ে|করো|লিখে)|message\s+(?:to|saying)|मैसेज\s*(?:भेजो|भेज\s*दो|लिखो))/i.test(
+      segment
+    );
+
+  if (hasWaContactContext && !isFullMessageSend) {
+    // Type-only WhatsApp message ("WhatsApp-এ শুধু টাইপ করো: ...", "Type in WhatsApp: ...", "WhatsApp में टाइप करो: ...") -> NEVER auto-sends!
+    const typeOnlyMatch = segment.match(
+      /^(?:(?:whatsapp|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|व्हाट्सएप)(?:-?এ|\s*এ|\s*में)?\s+)?(?:শুধু\s*)?(?:type(?:\s+in\s+whatsapp)?|টাইপ\s*করো|লিখে\s*রাখো|टाइप\s*करो)\s*[:,-]?\s*(.+)$/i
+    );
+    if (typeOnlyMatch && typeOnlyMatch[1]) {
+      return {
+        stepId,
+        tool: 'type_whatsapp_message',
+        args: { message: typeOnlyMatch[1].trim() },
+        requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: 'Types the exact message into WhatsApp composer without clicking Send.',
+      };
+    }
+
+    // Ordinal contact/chat click ("নিচের দ্বিতীয় নামটিতে ক্লিক করো", "প্রথম Chat ওপেন করো", "Click the second contact", "Open the first chat", "दूसरा चैट खोलो")
+    const ord = parseMultilingualOrdinal(segment);
+    if (ord !== null && /(?:chat|চ্যাট|चैट|contact|কন্টাক্ট|নাম|name)/i.test(segment)) {
+      const isChat = /(?:chat|চ্যাট|चैट)/i.test(segment);
+      return {
+        stepId,
+        tool: isChat ? 'open_whatsapp_chat' : 'click_whatsapp_contact',
+        args: { index: ord },
+        requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Clicks visible WhatsApp ${isChat ? 'chat' : 'contact'} #${ord} and verifies the conversation opens.`,
+      };
+    }
+
+    // Bengali: "WhatsApp-এ রাহুলের নামের উপর ক্লিক করো" / "এই Contact-এর নামের উপর ক্লিক করো"
+    const bnClickName = segment.match(
+      /^(?:(?:whatsapp|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ)(?:-?এ|\s*এ)\s+)?(.+?)\s*(?:নামের\s*উপর|নামটিতে|নামে)\s*(?:ক্লিক\s*করো|ট্যাপ\s*করো|চাপো)$/i
+    );
+    if (bnClickName && bnClickName[1]) {
+      const rawPerson = bnClickName[1].trim();
+      if (/^(?:এই\s*)?(?:contact|কন্টাক্ট)(?:-?এর)?$/i.test(rawPerson)) {
+        return {
+          stepId,
+          tool: 'click_whatsapp_contact',
+          args: { index: 1 },
+          requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+          requiresUserConfirmation: false,
+          honestOutcomeNote: 'Clicks the visible WhatsApp contact name and verifies the conversation opens.',
+        };
+      }
+      const contactName = normalizeRelationName(rawPerson);
+      if (contactName) {
+        return {
+          stepId,
+          tool: 'click_whatsapp_contact',
+          args: { contactName },
+          requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+          requiresUserConfirmation: false,
+          honestOutcomeNote: `Clicks "${contactName}" in WhatsApp and verifies the conversation opens.`,
+        };
+      }
+    }
+
+    // Bengali: "মায়ের Chat ওপেন করো" / "জাহিদার Chat খুলে দাও"
+    const bnOpenChat = segment.match(
+      /^(?:(?:whatsapp|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ)(?:-?এ|\s*এ)\s+)?(.+?)\s*(?:chat|চ্যাট)\s*(?:ওপেন\s*করো|খুলে\s*দাও|খোলো)$/i
+    );
+    if (bnOpenChat && bnOpenChat[1]) {
+      const contactName = normalizeRelationName(bnOpenChat[1]);
+      if (contactName) {
+        return {
+          stepId,
+          tool: 'open_whatsapp_chat',
+          args: { contactName },
+          requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+          requiresUserConfirmation: false,
+          honestOutcomeNote: `Opens "${contactName}"'s WhatsApp chat and verifies the conversation header.`,
+        };
+      }
+    }
+
+    // Bengali: "WhatsApp-এ বাবাকে খুঁজে বের করো"
+    const bnFindWa = segment.match(
+      /^(?:whatsapp|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ)(?:-?এ|\s*এ)\s+(.+?)\s*(?:খুঁজে\s*বের\s*করো|খুঁজে\s*দাও|খুঁজো)$/i
+    );
+    if (bnFindWa && bnFindWa[1]) {
+      const contactName = normalizeRelationName(bnFindWa[1]);
+      if (contactName) {
+        return {
+          stepId,
+          tool: 'click_whatsapp_contact',
+          args: { contactName, searchIfMissing: true },
+          requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+          requiresUserConfirmation: false,
+          honestOutcomeNote: `Finds and clicks "${contactName}" inside WhatsApp.`,
+        };
+      }
+    }
+
+    // English: "Click Rahul's name in WhatsApp", "Open my mother's chat", "Find this contact in WhatsApp"
+    const enClickName = segment.match(
+      /^(?:click|tap|open)\s+(?:on\s+)?(.+?)(?:'s|’s)?\s+(?:name|contact)(?:\s+in\s+whatsapp)?$/i
+    );
+    if (enClickName && enClickName[1]) {
+      const rawPerson = enClickName[1].trim();
+      if (/^this$/i.test(rawPerson)) {
+        return {
+          stepId,
+          tool: 'click_whatsapp_contact',
+          args: { index: 1 },
+          requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+          requiresUserConfirmation: false,
+          honestOutcomeNote: 'Clicks the visible contact in WhatsApp.',
+        };
+      }
+      const contactName = normalizeRelationName(rawPerson);
+      if (contactName) {
+        return {
+          stepId,
+          tool: 'click_whatsapp_contact',
+          args: { contactName },
+          requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+          requiresUserConfirmation: false,
+          honestOutcomeNote: `Clicks "${contactName}" in WhatsApp and verifies the conversation opens.`,
+        };
+      }
+    }
+
+    const enOpenChat = segment.match(
+      /^(?:open|show)\s+(?:my\s+)?(.+?)(?:'s|’s)?\s+chat(?:\s+in\s+whatsapp)?$/i
+    );
+    if (enOpenChat && enOpenChat[1]) {
+      const contactName = normalizeRelationName(enOpenChat[1]);
+      if (contactName) {
+        return {
+          stepId,
+          tool: 'open_whatsapp_chat',
+          args: { contactName },
+          requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+          requiresUserConfirmation: false,
+          honestOutcomeNote: `Opens "${contactName}"'s WhatsApp chat.`,
+        };
+      }
+    }
+
+    const enFindContact = segment.match(/^(?:find|search)\s+(?:for\s+)?(.+?)\s+in\s+whatsapp$/i);
+    if (enFindContact && enFindContact[1]) {
+      const rawPerson = enFindContact[1].trim();
+      const isGenericThis = /^(?:this\s+)?contact$/i.test(rawPerson);
+      const contactName = isGenericThis ? '' : normalizeRelationName(rawPerson);
+      return {
+        stepId,
+        tool: 'click_whatsapp_contact',
+        args: isGenericThis ? { index: 1 } : { contactName, searchIfMissing: true },
+        requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Finds and clicks ${contactName || 'the visible contact'} in WhatsApp.`,
+      };
+    }
+
+    // Hindi: "WhatsApp में राहुल के नाम पर क्लिक करो" / "मेरी माँ की चैट खोलो"
+    const hiClickName = segment.match(
+      /^(?:(?:whatsapp|व्हाट्सएप)\s*में\s+)?(.+?)\s*(?:के\s*नाम\s*पर|नाम\s*पर)\s*(?:क्लिक\s*करो|टैप\s*करो)$/i
+    );
+    if (hiClickName && hiClickName[1]) {
+      const contactName = normalizeRelationName(hiClickName[1]);
+      if (contactName) {
+        return {
+          stepId,
+          tool: 'click_whatsapp_contact',
+          args: { contactName },
+          requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+          requiresUserConfirmation: false,
+          honestOutcomeNote: `Clicks "${contactName}" in WhatsApp.`,
+        };
+      }
+    }
+
+    const hiOpenChat = segment.match(
+      /^(?:(?:whatsapp|व्हाट्सएप)\s*में\s+)?(.+?)\s*(?:की|का|के)?\s*(?:चैट|chat)\s*खोलो$/i
+    );
+    if (hiOpenChat && hiOpenChat[1]) {
+      const contactName = normalizeRelationName(hiOpenChat[1]);
+      if (contactName) {
+        return {
+          stepId,
+          tool: 'open_whatsapp_chat',
+          args: { contactName },
+          requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+          requiresUserConfirmation: false,
+          honestOutcomeNote: `Opens "${contactName}"'s WhatsApp chat.`,
+        };
+      }
+    }
   }
 
   // 3. Accessibility Navigation & Touch ("scroll down", "scroll up", "go back", "go home", "tap <button>")
@@ -517,7 +835,7 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     };
   }
 
-  // 7a. Controlled Generic App Chat Workflow (Telegram, Instagram, Messenger — ALWAYS requires explicit confirmation!)
+  // 7a. Controlled Generic App Chat Workflow (Telegram, Instagram, Messenger — executes directly)
   const genericAppChatBn = segment.match(
     /^(?:টেলিগ্রামে|টেলিগ্রাম-এ|টেলিগ্রাম|telegram(?:-?এ|\s*এ)?|ইনস্টাগ্রামে|ইনস্টাগ্রাম-এ|ইনস্টাগ্রাম|instagram(?:-?এ|\s*এ)?|মেসেঞ্জারে|মেসেঞ্জার-এ|মেসেঞ্জার|messenger(?:-?এ|\s*এ)?)\s+(.+?)(?:কে|-\s*কে)\s*(?:একটা\s+|একটি\s+)?(?:মেসেজ\s*)?(?:পাঠাও|পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|করো|দাও|বলো|লিখে\s*দাও|লেখো)(?:\s*[:,-]?\s*(.+))?$/i
   );
@@ -535,8 +853,8 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
           message: stripTrailingPunctuation(genericAppChatBn[2] || ''),
         },
         requiredPermissions: ['ACCESSIBILITY_SERVICE'],
-        requiresUserConfirmation: true,
-        honestOutcomeNote: `Prepares a ${appName} chat draft for user review and approval. Never sends silently.`,
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Executes ${appName} messaging directly using the verified Accessibility adapter.`,
       };
     }
   }
@@ -557,8 +875,8 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
           message: stripTrailingPunctuation(genericAppChatEn[3] || genericAppChatEn[4] || ''),
         },
         requiredPermissions: ['ACCESSIBILITY_SERVICE'],
-        requiresUserConfirmation: true,
-        honestOutcomeNote: `Prepares a ${appName} chat draft for user review and approval. Never sends silently.`,
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Executes ${appName} messaging directly using the verified Accessibility adapter.`,
       };
     }
   }
@@ -580,13 +898,116 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
           message: stripTrailingPunctuation(genericAppChatOnEn[3] || genericAppChatOnEn[4] || ''),
         },
         requiredPermissions: ['ACCESSIBILITY_SERVICE'],
-        requiresUserConfirmation: true,
-        honestOutcomeNote: `Prepares a ${appName} chat draft for user review and approval. Never sends silently.`,
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Executes ${appName} messaging directly using the verified Accessibility adapter.`,
       };
     }
   }
 
-  // 7. Contact-based WhatsApp & Message Drafting (ALWAYS requires user confirmation before sending!)
+  // 7b. Direct Contact-Based SMS Messaging (Bengali, English, Hindi — executes directly with NO confirmation screen!)
+  // Bengali: "বাবাকে SMS পাঠাও: আমি বাড়ি ফিরছি" / "মাকে এসএমএস পাঠিয়ে দাও: আমি আসছি"
+  const smsNamedBn = segment.match(
+    /^(.+?)(?:কে|-\s*কে)\s*(?:একটা\s+|একটি\s+)?(?:sms|এসএমএস|এস\.এম\.এস)(?:-?এ|\s*এ)?\s*(?:মেসেজ\s*)?(?:পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|পাঠাও|করে\s*দাও|করো|দাও|লিখে\s*দাও|লেখো)(?:\s*[:,-]?\s*(.+))?$/i
+  );
+  if (smsNamedBn && smsNamedBn[1]) {
+    const recipient = normalizeRelationName(smsNamedBn[1]);
+    return {
+      stepId,
+      tool: 'sms_compose',
+      args: {
+        contactQuery: recipient,
+        phoneNumber: recipient,
+        message: stripTrailingPunctuation(smsNamedBn[2] || ''),
+      },
+      requiredPermissions: ['READ_CONTACTS', 'SEND_SMS'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Sends the exact SMS directly using authorized Android SMS functionality.',
+    };
+  }
+
+  // Bengali SMS-first: "SMS-এ বাবাকে পাঠাও: আমি বাড়ি ফিরছি"
+  const smsAppFirstBn = segment.match(
+    /^(?:sms|এসএমএস|এস\.এম\.এস)(?:-?এ|\s*এ)\s+(.+?)(?:কে|-\s*কে)\s*(?:একটা\s+|একটি\s+)?(?:মেসেজ\s*)?(?:পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|পাঠাও|করে\s*দাও|করো|দাও|বলো|লিখে\s*দাও)(?:\s*[:,-]?\s*(.+))?$/i
+  );
+  if (smsAppFirstBn && smsAppFirstBn[1]) {
+    const recipient = normalizeRelationName(smsAppFirstBn[1]);
+    return {
+      stepId,
+      tool: 'sms_compose',
+      args: {
+        contactQuery: recipient,
+        phoneNumber: recipient,
+        message: stripTrailingPunctuation(smsAppFirstBn[2] || ''),
+      },
+      requiredPermissions: ['READ_CONTACTS', 'SEND_SMS'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Sends the exact SMS directly using authorized Android SMS functionality.',
+    };
+  }
+
+  // English SMS: "Send an SMS to Baba saying I am coming home" / "Send SMS to Dad: I am on my way" / "SMS Rahul saying hello"
+  const smsEnTo = segment.match(
+    /^(?:please\s+)?(?:send\s+(?:an?\s+)?)?(?:sms|text\s+message)\s+(?:message\s+)?to\s+([^:]+?)(?:\s+(?:saying|that|message)\s+(.+)|\s*[:,-]\s*(.+))?$/i
+  );
+  if (smsEnTo && smsEnTo[1]) {
+    const recipient = normalizeRelationName(smsEnTo[1]);
+    return {
+      stepId,
+      tool: 'sms_compose',
+      args: {
+        contactQuery: recipient,
+        phoneNumber: recipient,
+        message: stripTrailingPunctuation(smsEnTo[2] || smsEnTo[3] || ''),
+      },
+      requiredPermissions: ['READ_CONTACTS', 'SEND_SMS'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Sends the exact SMS directly using authorized Android SMS functionality.',
+    };
+  }
+
+  const smsEnRecipientFirst = segment.match(
+    /^(?:please\s+)?(?:send\s+([a-zA-Z0-9\s.'-]{2,40}?)\s+(?:an?\s+)?sms(?:\s+message)?|sms\s+([a-zA-Z0-9\s.'-]{2,40}?))(?:\s+(?:saying|that|with\s+message)\s+(.+)|\s*[:,-]\s*(.+))?$/i
+  );
+  if (smsEnRecipientFirst && (smsEnRecipientFirst[1] || smsEnRecipientFirst[2])) {
+    const recipient = normalizeRelationName(smsEnRecipientFirst[1] || smsEnRecipientFirst[2]);
+    if (recipient && !/^(?:to|a|an)$/i.test(recipient)) {
+      return {
+        stepId,
+        tool: 'sms_compose',
+        args: {
+          contactQuery: recipient,
+          phoneNumber: recipient,
+          message: stripTrailingPunctuation(smsEnRecipientFirst[3] || smsEnRecipientFirst[4] || ''),
+        },
+        requiredPermissions: ['READ_CONTACTS', 'SEND_SMS'],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: 'Sends the exact SMS directly using authorized Android SMS functionality.',
+      };
+    }
+  }
+
+  // Hindi SMS: "पापा को SMS भेजो: मैं घर आ रहा हूँ" / "राहुल को एसएमएस भेजो मैं आ रहा हूँ"
+  const smsNamedHi = segment.match(
+    /^(.+?)\s*को\s*(?:sms|एसएमएस)\s*(?:मैसेज\s*)?(?:भेज\s*दो|भेजो|लिख\s*दो|लिखो|करो)(?:\s*(?:कि\s+|[:,-]\s*)?(.+))?$/i
+  );
+  if (smsNamedHi && smsNamedHi[1]) {
+    const recipient = normalizeRelationName(smsNamedHi[1]);
+    const rawHiBody = (smsNamedHi[2] || '').replace(/^कि\s+/i, '');
+    return {
+      stepId,
+      tool: 'sms_compose',
+      args: {
+        contactQuery: recipient,
+        phoneNumber: recipient,
+        message: stripTrailingPunctuation(rawHiBody),
+      },
+      requiredPermissions: ['READ_CONTACTS', 'SEND_SMS'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Sends the exact SMS directly using authorized Android SMS functionality.',
+    };
+  }
+
+  // 7c. Direct Contact-based WhatsApp Messaging (executes directly with NO routine confirmation screen!)
   // English: "Message Rahul on WhatsApp saying I am coming" / "Send a message to Rahul on WhatsApp: hello"
   const waMessageOnEn = segment.match(
     /^(?:please\s+)?(?:message|text|send\s+(?:a\s+)?message\s+to)\s+(.+?)\s+(?:on|in|via)\s+whats\s*app(?:\s+(?:saying|that|message)\s+(.+)|\s*[:,-]\s*(.+))?$/i
@@ -602,9 +1023,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
         message: stripTrailingPunctuation(waMessageOnEn[2] || waMessageOnEn[3] || ''),
       },
       requiredPermissions: ['READ_CONTACTS'],
-      requiresUserConfirmation: true,
+      requiresUserConfirmation: false,
       honestOutcomeNote:
-        'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+        'Sends the exact WhatsApp message directly using Android WhatsApp and Accessibility integration.',
     };
   }
 
@@ -623,9 +1044,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
         message: stripTrailingPunctuation(waSendRecipientFirst[2] || ''),
       },
       requiredPermissions: ['READ_CONTACTS'],
-      requiresUserConfirmation: true,
+      requiresUserConfirmation: false,
       honestOutcomeNote:
-        'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+        'Sends the exact WhatsApp message directly using Android WhatsApp and Accessibility integration.',
     };
   }
 
@@ -644,9 +1065,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
         message: stripTrailingPunctuation(waNamedEnglish[2] || waNamedEnglish[3] || ''),
       },
       requiredPermissions: ['READ_CONTACTS'],
-      requiresUserConfirmation: true,
+      requiresUserConfirmation: false,
       honestOutcomeNote:
-        'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+        'Sends the exact WhatsApp message directly using Android WhatsApp and Accessibility integration.',
     };
   }
 
@@ -666,9 +1087,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
         message: stripTrailingPunctuation(waAppFirstBn[2] || ''),
       },
       requiredPermissions: ['READ_CONTACTS'],
-      requiresUserConfirmation: true,
+      requiresUserConfirmation: false,
       honestOutcomeNote:
-        'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+        'Sends the exact WhatsApp message directly using Android WhatsApp and Accessibility integration.',
     };
   }
 
@@ -688,13 +1109,13 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
         message: stripTrailingPunctuation(waNamedBn[2] || ''),
       },
       requiredPermissions: ['READ_CONTACTS'],
-      requiresUserConfirmation: true,
+      requiresUserConfirmation: false,
       honestOutcomeNote:
-        'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+        'Sends the exact WhatsApp message directly using Android WhatsApp and Accessibility integration.',
     };
   }
 
-  // Bengali general message draft: "রাহুলকে একটা মেসেজ লিখে দাও" / "মাকে একটা মেসেজ লিখে দাও।" / "পাপাকে মেসেজ করো আমি পরে ফোন করব"
+  // Bengali general message: "রাহুলকে একটা মেসেজ লিখে দাও" / "মাকে একটা মেসেজ লিখে দাও।" / "পাপাকে মেসেজ করো আমি পরে ফোন করব"
   const msgDraftBn = segment.match(
     /^(.+?)(?:কে|-\s*কে)\s*(?:একটা\s+|একটি\s+)?মেসেজ\s*(?:লিখে\s*দাও|লেখো|পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|পাঠাও|করে\s*দাও|করো|দাও)(?:\s*[:,-]?\s*(.+))?$/i
   );
@@ -709,9 +1130,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
         message: stripTrailingPunctuation(msgDraftBn[2] || ''),
       },
       requiredPermissions: ['READ_CONTACTS'],
-      requiresUserConfirmation: true,
+      requiresUserConfirmation: false,
       honestOutcomeNote:
-        'Prepares a message draft for user review and approval before opening WhatsApp.',
+        'Sends the exact WhatsApp message directly using Android WhatsApp and Accessibility integration.',
     };
   }
 
@@ -730,9 +1151,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
         message: stripTrailingPunctuation(waAppFirstHi[2] || ''),
       },
       requiredPermissions: ['READ_CONTACTS'],
-      requiresUserConfirmation: true,
+      requiresUserConfirmation: false,
       honestOutcomeNote:
-        'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+        'Sends the exact WhatsApp message directly using Android WhatsApp and Accessibility integration.',
     };
   }
 
@@ -751,9 +1172,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
         message: stripTrailingPunctuation(rawHiBody),
       },
       requiredPermissions: ['READ_CONTACTS'],
-      requiresUserConfirmation: true,
+      requiresUserConfirmation: false,
       honestOutcomeNote:
-        'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+        'Sends the exact WhatsApp message directly using Android WhatsApp and Accessibility integration.',
     };
   }
 
@@ -887,8 +1308,8 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
           tool: 'sim_call',
           args: { phoneNumber: detected.target || '', target: detected.target || '' },
           requiredPermissions: ['CALL_PHONE', 'READ_CONTACTS'],
-          requiresUserConfirmation: true,
-          honestOutcomeNote: 'Stages a SIM phone call for explicit user confirmation before dialing.',
+          requiresUserConfirmation: false,
+          honestOutcomeNote: 'Initiates a direct SIM phone call via Android native calling APIs.',
         };
       case 'whatsapp':
         return {
@@ -900,18 +1321,18 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
             message: detected.payload || '',
           },
           requiredPermissions: ['READ_CONTACTS'],
-          requiresUserConfirmation: true,
+          requiresUserConfirmation: false,
           honestOutcomeNote:
-            'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+            'Sends the exact WhatsApp message directly using Android WhatsApp and Accessibility integration.',
         };
       case 'sms':
         return {
           stepId,
           tool: 'sms_compose',
           args: { phoneNumber: detected.target || '', message: detected.payload || '' },
-          requiredPermissions: ['READ_CONTACTS'],
-          requiresUserConfirmation: true,
-          honestOutcomeNote: 'Stages an SMS draft for explicit user review before opening the SMS composer.',
+          requiredPermissions: ['READ_CONTACTS', 'SEND_SMS'],
+          requiresUserConfirmation: false,
+          honestOutcomeNote: 'Sends the exact SMS directly using authorized Android SMS functionality.',
         };
       case 'flashlight': {
         const enable = detected.payload === 'on' || detected.target === 'on';
@@ -965,7 +1386,7 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     }
   }
 
-  // 12. Contact-Name SIM Call (with confirmation) — "call my father", "আমার মাকে ফোন করো", "বাবাকে কল করো", "पापा को कॉल करो"
+  // 12. Direct Contact-Name SIM Call — "call my father", "আমার মাকে ফোন করো", "বাবাকে কল করো", "पापा को कॉल करो"
   const namedCallEn = segment.match(/^(?:please\s+)?(?:call|dial|phone)\s+(?:my\s+)?([a-zA-Z0-9\s.'-]{2,40})$/i);
   if (namedCallEn && namedCallEn[1]) {
     const targetName = normalizeRelationName(namedCallEn[1]);
@@ -975,9 +1396,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
         tool: 'sim_call',
         args: { contactQuery: targetName, target: targetName },
         requiredPermissions: ['READ_CONTACTS', 'CALL_PHONE'],
-        requiresUserConfirmation: true,
+        requiresUserConfirmation: false,
         honestOutcomeNote:
-          'Resolves the contact from Android Contacts and asks for explicit confirmation before placing a SIM call.',
+          'Resolves the contact from Android Contacts and initiates the SIM call directly (asking only if multiple contacts match).',
       };
     }
   }
@@ -990,9 +1411,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
       tool: 'sim_call',
       args: { contactQuery: targetName, target: targetName },
       requiredPermissions: ['READ_CONTACTS', 'CALL_PHONE'],
-      requiresUserConfirmation: true,
+      requiresUserConfirmation: false,
       honestOutcomeNote:
-        'Resolves the contact from Android Contacts and asks for explicit confirmation before placing a SIM call.',
+        'Resolves the contact from Android Contacts and initiates the SIM call directly (asking only if multiple contacts match).',
     };
   }
 
@@ -1004,9 +1425,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
       tool: 'sim_call',
       args: { contactQuery: targetName, target: targetName },
       requiredPermissions: ['READ_CONTACTS', 'CALL_PHONE'],
-      requiresUserConfirmation: true,
+      requiresUserConfirmation: false,
       honestOutcomeNote:
-        'Resolves the contact from Android Contacts and asks for explicit confirmation before placing a SIM call.',
+        'Resolves the contact from Android Contacts and initiates the SIM call directly (asking only if multiple contacts match).',
     };
   }
 
@@ -1014,7 +1435,7 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
 }
 
 /**
- * Formats an honest post-action voice response (enforcing WhatsApp and SIM call honesty).
+ * Formats an honest post-action voice response (enforcing WhatsApp, SMS, and SIM call honesty).
  */
 export function formatHonestTaskOutcome(tool: AllowedTaskTool, succeeded: boolean, detail?: string): string {
   if (!succeeded) {
@@ -1024,9 +1445,9 @@ export function formatHonestTaskOutcome(tool: AllowedTaskTool, succeeded: boolea
     case 'whatsapp_prepare':
       return detail || 'WhatsApp-এ আপনার মেসেজ ড্রাফট প্রস্তুত করে খুলে দেওয়া হয়েছে। পাঠাতে অনুগ্রহ করে WhatsApp-এ Send চাপুন।';
     case 'sim_call':
-      return detail || 'আপনার অনুমোদনের পর ফোনের সিম (SIM) ডায়ালারের মাধ্যমে কল শুরু করা হয়েছে।';
+      return detail || 'ফোনের সিম (SIM) কলিং-এর মাধ্যমে সরাসরি কল শুরু করা হয়েছে।';
     case 'sms_compose':
-      return detail || 'SMS মেসেজ কম্পোজার প্রস্তুত করা হয়েছে — পাঠাতে অনুগ্রহ করে SMS অ্যাপে Send চাপুন।';
+      return detail || 'SMS মেসেজ কম্পোজার প্রস্তুত করা হয়েছে — সরাসরি পাঠাতে SEND_SMS পারমিশন দিন বা SMS অ্যাপে Send চাপুন।';
     case 'flashlight':
       return detail || 'ফ্ল্যাশলাইট আপডেট করা হয়েছে।';
     case 'camera_open':

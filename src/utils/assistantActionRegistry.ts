@@ -37,7 +37,15 @@ export type AssistantToolName =
   | 'search_web'
   | 'search_youtube'
   | 'search_installed_app'
-  | 'cancel_current_task';
+  | 'cancel_current_task'
+  | 'click_youtube_video'
+  | 'click_youtube_search_result'
+  | 'click_visible_element'
+  | 'click_whatsapp_contact'
+  | 'open_whatsapp_chat'
+  | 'type_whatsapp_message'
+  | 'send_whatsapp_message'
+  | 'verify_whatsapp_send';
 
 export interface AssistantToolParamSpec {
   type: 'STRING' | 'BOOLEAN' | 'INTEGER';
@@ -75,11 +83,13 @@ export interface ToolValidationResult {
 export interface ToolExecutionReport {
   actionId: string;
   actionType: AssistantToolName | string;
+  target?: string;
   success: boolean;
   verified: boolean;
   awaitingConfirmation?: boolean;
   pendingActionId?: string;
   status: string;
+  executionStatus?: string;
   message: string;
   failureReason?: string;
   requiredPermissions?: string[];
@@ -259,19 +269,23 @@ export const ASSISTANT_TOOL_SPECS: readonly AssistantToolSpec[] = [
   },
   {
     name: 'prepare_whatsapp_message',
-    description: 'Prepare a WhatsApp message draft for a contact or phone number so the user can review, edit, cancel, or explicitly approve before opening WhatsApp. NEVER claim the message is already sent.',
+    description: 'Send a WhatsApp message directly to an explicitly requested contact or phone number using native Android WhatsApp and Accessibility integration. Do NOT ask for routine confirmation when the user explicitly instructed to send a message. Ask ONLY if multiple contacts match or the message body is missing. Never guess an unknown phone number, never alter the user message, and never fabricate delivery.',
     requiredPermissions: ['READ_CONTACTS'],
-    requiresConfirmation: true,
+    requiresConfirmation: false,
     timeoutMs: 6000,
     parameters: {
       properties: {
         recipient: {
           type: 'STRING',
-          description: 'Contact name (e.g., Rahul, Ma, Baba) or phone number.',
+          description: 'Contact name (e.g., Rahul, Ma, Baba) or exact phone number.',
+        },
+        recipient_name: {
+          type: 'STRING',
+          description: 'Optional display contact name when recipient is a resolved phone number.',
         },
         message: {
           type: 'STRING',
-          description: 'The exact message body to prepare in Bengali, English, or Hindi.',
+          description: 'The exact unmodified message body requested by the user in Bengali, English, or Hindi.',
         },
       },
       required: ['recipient'],
@@ -279,19 +293,23 @@ export const ASSISTANT_TOOL_SPECS: readonly AssistantToolSpec[] = [
   },
   {
     name: 'prepare_sms',
-    description: 'Prepare an SMS text message draft for a contact or phone number for explicit user review and approval before opening the SMS composer.',
-    requiredPermissions: ['READ_CONTACTS'],
-    requiresConfirmation: true,
+    description: 'Send an SMS directly to an explicitly requested contact or phone number using authorized Android SMS functionality (SmsManager when SEND_SMS is granted, or Android SMS composer fallback when permission is missing). Do NOT ask for routine confirmation. Ask ONLY when multiple contacts match or message text is missing. Never guess unknown numbers or alter the message.',
+    requiredPermissions: ['READ_CONTACTS', 'SEND_SMS'],
+    requiresConfirmation: false,
     timeoutMs: 6000,
     parameters: {
       properties: {
         recipient: {
           type: 'STRING',
-          description: 'Contact name or phone number.',
+          description: 'Contact name or exact phone number.',
+        },
+        recipient_name: {
+          type: 'STRING',
+          description: 'Optional display contact name when recipient is a resolved phone number.',
         },
         message: {
           type: 'STRING',
-          description: 'The SMS text body to prepare.',
+          description: 'The exact unmodified SMS text body requested by the user.',
         },
       },
       required: ['recipient'],
@@ -299,9 +317,9 @@ export const ASSISTANT_TOOL_SPECS: readonly AssistantToolSpec[] = [
   },
   {
     name: 'prepare_app_chat_message',
-    description: 'Prepare a chat message draft for a supported accessible messaging app (Telegram, Instagram, Messenger) so the user can review, edit, and explicitly approve before sending. NEVER sends silently.',
+    description: 'Send a chat message directly in a supported messaging app (Telegram, Instagram, Messenger) using verified Accessibility adapters when explicitly requested by the user. Do NOT ask for routine confirmation. Never alter the message or fabricate delivery.',
     requiredPermissions: ['ACCESSIBILITY_SERVICE'],
-    requiresConfirmation: true,
+    requiresConfirmation: false,
     timeoutMs: 6000,
     parameters: {
       properties: {
@@ -315,7 +333,7 @@ export const ASSISTANT_TOOL_SPECS: readonly AssistantToolSpec[] = [
         },
         message: {
           type: 'STRING',
-          description: 'Exact message text to review and approve before sending.',
+          description: 'Exact unmodified message text requested by the user.',
         },
       },
       required: ['app_name', 'recipient'],
@@ -410,15 +428,19 @@ export const ASSISTANT_TOOL_SPECS: readonly AssistantToolSpec[] = [
   },
   {
     name: 'call_contact',
-    description: 'Resolve a contact or phone number and request user confirmation before placing a SIM phone call.',
+    description: 'Resolve a contact or phone number and initiate a direct SIM phone call immediately via Android native calling APIs. Do NOT ask for routine confirmation. Ask ONLY when multiple contacts or multiple phone numbers match. Never guess an unknown phone number.',
     requiredPermissions: ['READ_CONTACTS', 'CALL_PHONE'],
-    requiresConfirmation: true,
+    requiresConfirmation: false,
     timeoutMs: 6000,
     parameters: {
       properties: {
         recipient: {
           type: 'STRING',
-          description: 'Contact name or phone number to call.',
+          description: 'Contact name or exact phone number to call.',
+        },
+        recipient_name: {
+          type: 'STRING',
+          description: 'Optional display contact name when recipient is a resolved phone number.',
         },
       },
       required: ['recipient'],
@@ -501,6 +523,186 @@ export const ASSISTANT_TOOL_SPECS: readonly AssistantToolSpec[] = [
     parameters: {
       properties: {},
       required: [],
+    },
+  },
+  {
+    name: 'click_youtube_video',
+    description:
+      'Click or play a visible YouTube video card, thumbnail, or Play button on screen (e.g., 1st video, 2nd video, this video, thumbnail, Play button) via Accessibility semantic click & bounded gesture fallback, and verify the watch screen opens.',
+    requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+    requiresConfirmation: false,
+    timeoutMs: 5000,
+    parameters: {
+      properties: {
+        index: {
+          type: 'INTEGER',
+          description: '1-based visible video position (e.g., 1 for first video, 2 for second video).',
+        },
+        target: {
+          type: 'STRING',
+          description: 'Target hint such as "play_button", "thumbnail", "current_video", or button label.',
+        },
+        query: {
+          type: 'STRING',
+          description: 'Optional visible video title keywords to match unambiguously.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'click_youtube_search_result',
+    description:
+      'Click a visible YouTube search result entry (e.g., first search result, second search result) and verify the video screen opens.',
+    requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+    requiresConfirmation: false,
+    timeoutMs: 5000,
+    parameters: {
+      properties: {
+        index: {
+          type: 'INTEGER',
+          description: '1-based visible search result position (defaults to 1).',
+        },
+        query: {
+          type: 'STRING',
+          description: 'Optional video title keywords inside the search results.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'click_visible_element',
+    description:
+      'Find and click any clearly identified visible UI element, thumbnail, or button on screen using semantic Accessibility nodes and bounded visible bounds.',
+    requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+    requiresConfirmation: false,
+    timeoutMs: 4500,
+    parameters: {
+      properties: {
+        target: {
+          type: 'STRING',
+          description: 'Visible label, button name, or thumbnail hint to click.',
+        },
+        index: {
+          type: 'INTEGER',
+          description: 'Optional 1-based ordinal index when selecting from visible items.',
+        },
+      },
+      required: ['target'],
+    },
+  },
+  {
+    name: 'click_whatsapp_contact',
+    description:
+      'Find and click a clearly identified visible contact name, chat name, or ordinal contact row inside WhatsApp (supports Bengali, English, and Hindi names; asks if multiple contacts match).',
+    requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+    requiresConfirmation: false,
+    timeoutMs: 6000,
+    parameters: {
+      properties: {
+        contact_name: {
+          type: 'STRING',
+          description: 'Contact, person, or group chat name in Bengali, English, or Hindi (e.g., রাহুল, Rahul, মা, জাহিদা).',
+        },
+        index: {
+          type: 'INTEGER',
+          description: 'Optional 1-based visible contact row index (e.g., 2 for second contact).',
+        },
+        search_if_missing: {
+          type: 'BOOLEAN',
+          description: 'Whether to search in WhatsApp if the contact is not currently visible in the chat list.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'open_whatsapp_chat',
+    description:
+      'Open a specific WhatsApp conversation by contact name (Bengali, English, or Hindi) or ordinal chat position and verify the conversation opened.',
+    requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+    requiresConfirmation: false,
+    timeoutMs: 6000,
+    parameters: {
+      properties: {
+        contact_name: {
+          type: 'STRING',
+          description: 'Contact or chat name to open in WhatsApp.',
+        },
+        index: {
+          type: 'INTEGER',
+          description: 'Optional 1-based chat index (e.g., 1 for first chat, 2 for second chat).',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'type_whatsapp_message',
+    description:
+      'Type an exact user-provided message into the visible WhatsApp composer WITHOUT tapping Send (typing alone does not authorize sending).',
+    requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+    requiresConfirmation: false,
+    timeoutMs: 6000,
+    parameters: {
+      properties: {
+        recipient: {
+          type: 'STRING',
+          description: 'Optional expected recipient name to verify before typing.',
+        },
+        message: {
+          type: 'STRING',
+          description: 'Exact unmodified message text to enter into the WhatsApp composer.',
+        },
+      },
+      required: ['message'],
+    },
+  },
+  {
+    name: 'send_whatsapp_message',
+    description:
+      'Directly send an explicitly user-authorized WhatsApp message: resolves recipient safely (asks only on multiple matches), verifies conversation and exact message text, clicks the real visible Send button via semantic Accessibility, and verifies the outgoing message state.',
+    requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+    requiresConfirmation: false,
+    timeoutMs: 8000,
+    parameters: {
+      properties: {
+        recipient: {
+          type: 'STRING',
+          description: 'Recipient name or phone number (optional if already inside the target WhatsApp chat).',
+        },
+        recipient_name: {
+          type: 'STRING',
+          description: 'Optional verified recipient display name.',
+        },
+        message: {
+          type: 'STRING',
+          description: 'Exact unmodified message text to send.',
+        },
+      },
+      required: ['message'],
+    },
+  },
+  {
+    name: 'verify_whatsapp_send',
+    description:
+      'Inspect the active WhatsApp conversation screen to verify whether an outgoing message appeared and distinguish pending, sent, or delivered status honestly.',
+    requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+    requiresConfirmation: false,
+    timeoutMs: 4000,
+    parameters: {
+      properties: {
+        recipient: {
+          type: 'STRING',
+          description: 'Optional recipient name for reporting.',
+        },
+        message: {
+          type: 'STRING',
+          description: 'Exact outgoing message text to verify in the visible conversation.',
+        },
+      },
+      required: ['message'],
     },
   },
 ] as const;
@@ -639,38 +841,197 @@ export function formatLocalizedActionOutcome(
     return `Blocked for your security, ${name}: ${report.message}`;
   }
 
-  if (report.status === 'whatsapp_sent_verified') {
-    const recipient = report.data?.contactName || report.data?.phoneNumber || '';
+  if (report.status === 'multiple_contacts' || report.status === 'multiple_numbers') {
+    const query = String(report.data?.recipient || report.data?.query || '');
     if (lang === 'bn-BD') {
-      return `${name}, আপনার অনুমোদনের পর ${recipient ? `${recipient}-এর ` : ''}WhatsApp চ্যাটে Send বাটন চাপানো সম্পন্ন ও চ্যাটে যাচাই করা হয়েছে (ডেলিভারি/রিড স্ট্যাটাস WhatsApp নেটওয়ার্কের উপর নির্ভরশীল)।`;
+      return `${name}, ${query ? `"${query}" নামে ` : ''}একাধিক কন্টাক্ট বা নম্বর পাওয়া গেছে। সঠিক কন্টাক্টটি নিচে থেকে বেছে নিন — সাথে সাথেই কাজটি সম্পন্ন হবে।`;
     }
     if (lang === 'hi-IN') {
-      return `${name}, आपकी अनुमति के बाद ${recipient ? `${recipient} की ` : ''}WhatsApp चैट में Send बटन दबाया और सत्यापित किया गया है (डिलीवरी/रीड स्थिति WhatsApp नेटवर्क पर निर्भर करती है)।`;
+      return `${name}, ${query ? `"${query}" नाम से ` : ''}एक से अधिक कॉन्टैक्ट या नंबर मिले हैं। कृपया नीचे से सही कॉन्टैक्ट चुनें — कार्रवाई तुरंत हो जाएगी।`;
     }
-    return `${name}, after your approval, WhatsApp Send was clicked and verified in chat${recipient ? ` for ${recipient}` : ''} (delivery/read status depends on WhatsApp network).`;
+    return `${name}, multiple matching contacts or numbers were found${query ? ` for "${query}"` : ''}. Please pick the right contact below to proceed immediately.`;
+  }
+
+  if (report.status === 'contact_not_found') {
+    if (lang === 'bn-BD') {
+      return `${name}, আপনার ফোনের কন্টাক্টে এই নামটি খুঁজে পাওয়া যায়নি। সঠিক ফোন নম্বর বললে আমি সরাসরি কাজটি করে দিতে পারব।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, आपके कॉन्टैक्ट्स में यह नाम नहीं मिला। कृपया सही फ़ोन नंबर बताएं।`;
+    }
+    return `${name}, I could not find that contact in your phonebook. Please share the exact phone number instead.`;
+  }
+
+  if (report.status === 'duplicate_blocked') {
+    if (lang === 'bn-BD') {
+      return `${name}, একই মেসেজ বা কল ডুপ্লিকেট হওয়া আটকাতে এটি আবার পাঠানো হয়নি।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, डुप्लीकेट भेजने से रोकने के लिए वही कार्रवाई दोबारा नहीं की गई।`;
+    }
+    return `${name}, duplicate send prevented — that exact action was just executed.`;
+  }
+
+  if (report.status === 'call_initiated') {
+    const recipient = String(report.data?.contactName || report.data?.phoneNumber || '');
+    if (lang === 'bn-BD') {
+      return `${name}, ${recipient ? `${recipient}-কে ` : ''}সরাসরি ফোন কল শুরু করা হয়েছে।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, ${recipient ? `${recipient} को ` : ''}सीधा फ़ोन कॉल शुरू कर दिया गया है।`;
+    }
+    return `${name}, direct phone call initiated${recipient ? ` to ${recipient}` : ''}.`;
+  }
+
+  if (report.status === 'dialer_opened') {
+    const recipient = String(report.data?.contactName || report.data?.phoneNumber || '');
+    if (lang === 'bn-BD') {
+      return `${name}, ${recipient ? `${recipient}-এর নম্বরসহ ` : ''}ফোনের ডায়ালার খোলা হয়েছে (সরাসরি কল করার জন্য Android-এ CALL_PHONE পারমিশন চালু রাখুন)।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, ${recipient ? `${recipient} के नंबर के साथ ` : ''}डायलर खोला गया है (सीधी कॉल के लिए CALL_PHONE अनुमति दें)।`;
+    }
+    return `${name}, opened the phone dialer${recipient ? ` for ${recipient}` : ''} (grant CALL_PHONE permission for direct 1-step dialing).`;
+  }
+
+  if (report.status === 'sms_sent_direct') {
+    const recipient = String(report.data?.contactName || report.data?.phoneNumber || '');
+    if (lang === 'bn-BD') {
+      return `${name}, ${recipient ? `${recipient}-কে ` : ''}আপনার SMS সরাসরি Android SMS সার্ভিসের মাধ্যমে পাঠানো হয়েছে (নেটওয়ার্ক ডেলিভারি আপনার সিম ও অপারেটরের উপর নির্ভরশীল)।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, ${recipient ? `${recipient} को ` : ''}आपका SMS सीधे Android SMS सेवा के माध्यम से भेज दिया गया है।`;
+    }
+    return `${name}, your SMS${recipient ? ` to ${recipient}` : ''} was submitted directly via Android SMS (delivery depends on carrier network).`;
+  }
+
+  if (report.status === 'opened_sms_composer_ready_to_send' || report.status === 'opened_sms_composer') {
+    const recipient = String(report.data?.contactName || report.data?.phoneNumber || '');
+    if (lang === 'bn-BD') {
+      return `${name}, ${recipient ? `${recipient}-এর জন্য ` : ''}SMS অ্যাপে আপনার মেসেজ প্রস্তুত করে খোলা হয়েছে। সরাসরি SMS পাঠাতে Android-এ SEND_SMS পারমিশন দিন, অথবা এখন SMS অ্যাপে Send চাপুন।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, ${recipient ? `${recipient} के लिए ` : ''}SMS ऐप में आपका मैसेज तैयार करके खोला गया है। सीधे भेजने के लिए SEND_SMS अनुमति दें या Send दबाएं।`;
+    }
+    return `${name}, opened your SMS app${recipient ? ` for ${recipient}` : ''} with the exact message ready (grant SEND_SMS permission for direct sending, or tap Send now).`;
+  }
+
+  if (report.status === 'youtube_video_opened' || report.status === 'youtube_screen_transitioned') {
+    const title = String(report.data?.title || report.target || '');
+    if (lang === 'bn-BD') {
+      return `${name}, YouTube-এ ${title ? `"${title}" ` : ''}ভিডিওটি ক্লিক করে ওপেন করা হয়েছে এবং প্লেয়ার স্ক্রিন যাচাই করা হয়েছে।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, YouTube पर ${title ? `"${title}" ` : ''}वीडियो क्लिक करके खोल दिया गया है और प्लेयर स्क्रीन सत्यापित हो गई है।`;
+    }
+    return `${name}, clicked and verified opening ${title ? `"${title}"` : 'the requested video'} on YouTube.`;
+  }
+
+  if (report.status === 'youtube_click_unverified') {
+    if (lang === 'bn-BD') {
+      return `${name}, YouTube ভিডিওতে ক্লিক করা হয়েছে, কিন্তু প্লেয়ার স্ক্রিন খুলেছে কি না তা নিশ্চিতভাবে যাচাই করা যায়নি।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, YouTube वीडियो पर क्लिक किया गया, लेकिन वीडियो प्लेयर खुलने की पुष्टि नहीं हो सकी।`;
+    }
+    return `${name}, I dispatched the click on YouTube, but could not verify that the video player opened.`;
+  }
+
+  if (report.status === 'ambiguous_target') {
+    if (lang === 'bn-BD') {
+      return `${name}, স্ক্রিনে একাধিক মিল পাওয়া গেছে — ভুল আইটেমে ক্লিক না করতে অনুগ্রহ করে নির্দিষ্ট করে বলুন (যেমন প্রথম বা দ্বিতীয়)।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, स्क्रीन पर एक से अधिक मिलते-जुलते विकल्प हैं — कृपया स्पष्ट बताएं (जैसे पहला या दूसरा)।`;
+    }
+    return `${name}, multiple matching items are visible on screen — please clarify which one (e.g., first or second) so I do not click the wrong item.`;
+  }
+
+  if (report.status === 'whatsapp_contact_opened') {
+    const contact = String(report.data?.contactName || report.target || '');
+    if (lang === 'bn-BD') {
+      return `${name}, WhatsApp-এ ${contact ? `${contact}-এর ` : ''}চ্যাট ক্লিক করে ওপেন করা হয়েছে এবং কনভার্সেশন হেডার যাচাই করা হয়েছে।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, WhatsApp में ${contact ? `${contact} की ` : ''}चैट क्लिक करके खोल दी गई है और सत्यापित हो गई है।`;
+    }
+    return `${name}, clicked and opened ${contact ? `${contact}'s` : 'the requested'} WhatsApp chat and verified the conversation header.`;
+  }
+
+  if (report.status === 'whatsapp_message_typed_not_sent') {
+    if (lang === 'bn-BD') {
+      return `${name}, আপনার সম্পূর্ণ মেসেজটি WhatsApp কম্পোজারে লিখে যাচাই করা হয়েছে — শুধু লেখার নির্দেশ থাকায় Send চাপা হয়নি।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, आपका पूरा मैसेज WhatsApp कंपोज़र में लिखकर सत्यापित किया गया है — भेजने का आदेश न होने के कारण Send नहीं दबाया गया।`;
+    }
+    return `${name}, typed and verified your exact message in the WhatsApp composer without tapping Send (typing alone does not authorize sending).`;
+  }
+
+  if (report.status === 'whatsapp_delivered_confirmed') {
+    const recipient = report.data?.contactName || report.target || '';
+    if (lang === 'bn-BD') {
+      return `${name}, ${recipient ? `${recipient}-এর ` : ''}WhatsApp চ্যাটে আপনার মেসেজটি পাঠানো সম্পন্ন হয়েছে এবং চ্যাটে Delivered স্ট্যাটাস দেখা গেছে।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, ${recipient ? `${recipient} की ` : ''}WhatsApp चैट में आपका मैसेज भेजा गया है और Delivered स्थिति दिखाई दे रही है।`;
+    }
+    return `${name}, your WhatsApp message${recipient ? ` to ${recipient}` : ''} was sent and the Delivered indicator is visible in chat.`;
+  }
+
+  if (report.status === 'whatsapp_sent_confirmed' || report.status === 'whatsapp_sent_verified') {
+    const recipient = report.data?.contactName || report.data?.phoneNumber || report.target || '';
+    if (lang === 'bn-BD') {
+      return `${name}, ${recipient ? `${recipient}-এর ` : ''}WhatsApp চ্যাটে Send বাটন চাপানো সম্পন্ন ও আউটগোয়িং মেসেজ যাচাই করা হয়েছে (ডেলিভারি/রিড স্ট্যাটাস WhatsApp নেটওয়ার্কের উপর নির্ভরশীল)।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, ${recipient ? `${recipient} की ` : ''}WhatsApp चैट में Send बटन दबाया और आउटगोइंग मैसेज सत्यापित किया गया है (डिलीवरी/रीड स्थिति WhatsApp नेटवर्क पर निर्भर करती है)।`;
+    }
+    return `${name}, WhatsApp Send was clicked and the outgoing message is verified in chat${recipient ? ` for ${recipient}` : ''} (delivery/read status depends on WhatsApp network).`;
+  }
+
+  if (report.status === 'whatsapp_sent_pending') {
+    const recipient = report.data?.contactName || report.target || '';
+    if (lang === 'bn-BD') {
+      return `${name}, ${recipient ? `${recipient}-এর ` : ''}WhatsApp চ্যাটে মেসেজটি পাঠানো হয়েছে এবং বর্তমানে Pending/Sending অবস্থায় আছে।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, ${recipient ? `${recipient} की ` : ''}WhatsApp चैट में मैसेज सबमिट हो गया है और अभी Pending/Sending स्थिति में है।`;
+    }
+    return `${name}, your WhatsApp message${recipient ? ` to ${recipient}` : ''} appears in chat with Pending/Sending status while waiting for network.`;
+  }
+
+  if (report.status === 'send_button_not_found' || report.status === 'whatsapp_send_unverified') {
+    if (lang === 'bn-BD') {
+      return `${name}, মেসেজটি WhatsApp-এ প্রস্তুত রয়েছে, তবে Send বাটন শনাক্ত বা পাঠানো নিশ্চিতভাবে যাচাই করা যায়নি। ডুপ্লিকেট এড়াতে অনুগ্রহ করে WhatsApp-এ দেখে নিন।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, मैसेज WhatsApp में तैयार है, लेकिन Send बटन या भेजने की पुष्टि नहीं हो सकी। कृपया WhatsApp में जांच लें।`;
+    }
+    return `${name}, the message was prepared in WhatsApp, but the Send button or outgoing message could not be verified — please check WhatsApp so no duplicate is sent.`;
   }
 
   if (report.status === 'opened_whatsapp_draft_ready_to_send') {
     const recipient = report.data?.contactName || report.data?.phoneNumber || '';
     if (lang === 'bn-BD') {
-      return `${name}, ${recipient ? `${recipient}-এর জন্য ` : ''}WhatsApp চ্যাটে আপনার মেসেজ ড্রাফট খুলে দেওয়া হয়েছে। মেসেজটি এখনো স্বয়ংক্রিয়ভাবে পাঠানো হয়নি — অনুগ্রহ করে WhatsApp-এ Send বাটন চাপুন।`;
+      return `${name}, ${recipient ? `${recipient}-এর জন্য ` : ''}WhatsApp চ্যাটে আপনার মেসেজ ড্রাফট খুলে দেওয়া হয়েছে। মেসেজটি এখনো স্বয়ংক্রিয়ভাবে পাঠানো হয়নি — সরাসরি পাঠাতে Accessibility চালু রাখুন বা WhatsApp-এ Send চাপুন।`;
     }
     if (lang === 'hi-IN') {
       return `${name}, ${recipient ? `${recipient} के लिए ` : ''}WhatsApp में आपका मैसेज ड्राफ्ट खोल दिया गया है। यह अपने आप नहीं भेजा गया है — कृपया WhatsApp में Send दबाएं।`;
     }
-    return `${name}, I opened your WhatsApp draft${recipient ? ` for ${recipient}` : ''}. It has NOT been auto-sent — please review and tap Send in WhatsApp.`;
+    return `${name}, I opened your WhatsApp draft${recipient ? ` for ${recipient}` : ''}. It was NOT auto-sent — enable Accessibility for direct send or tap Send in WhatsApp.`;
   }
 
   if (report.status === 'app_chat_sent_verified') {
     const appLabel = report.data?.appName || 'app';
     const recipient = report.data?.contactName || report.data?.recipient || '';
     if (lang === 'bn-BD') {
-      return `${name}, আপনার অনুমোদনের পর ${appLabel}-এ ${recipient ? `${recipient}-কে ` : ''}মেসেজ পাঠানোর Send বাটন চাপানো ও যাচাই করা হয়েছে।`;
+      return `${name}, ${appLabel}-এ ${recipient ? `${recipient}-কে ` : ''}মেসেজ পাঠানোর Send বাটন চাপানো ও যাচাই করা হয়েছে।`;
     }
     if (lang === 'hi-IN') {
-      return `${name}, आपकी अनुमति के बाद ${appLabel} में ${recipient ? `${recipient} को ` : ''}मैसेज का Send बटन दबाया और सत्यापित किया गया है।`;
+      return `${name}, ${appLabel} में ${recipient ? `${recipient} को ` : ''}मैसेज का Send बटन दबाया और सत्यापित किया गया है।`;
     }
-    return `${name}, after your approval, Send was clicked and verified in ${appLabel}${recipient ? ` for ${recipient}` : ''}.`;
+    return `${name}, Send was clicked and verified in ${appLabel}${recipient ? ` for ${recipient}` : ''}.`;
   }
 
   if (report.status === 'opened_app_chat_draft_ready_to_send') {
@@ -686,12 +1047,12 @@ export function formatLocalizedActionOutcome(
 
   if (report.status === 'replied_via_notification_remote_input') {
     if (lang === 'bn-BD') {
-      return `${name}, আপনার অনুমোদিত উত্তরটি অ্যান্ড্রয়েড নোটিফিকেশন রিপ্লাই-এর মাধ্যমে পাঠানো হয়েছে।`;
+      return `${name}, আপনার উত্তরটি অ্যান্ড্রয়েড নোটিফিকেশন রিপ্লাই-এর মাধ্যমে পাঠানো হয়েছে।`;
     }
     if (lang === 'hi-IN') {
-      return `${name}, आपका अनुमोदित उत्तर Android नोटिफिकेशन रिप्लाई के ज़रिए भेज दिया गया है।`;
+      return `${name}, आपका उत्तर Android नोटिफिकेशन रिप्लाई के ज़रिए भेज दिया गया है।`;
     }
-    return `${name}, your approved reply was sent through Android Notification Reply.`;
+    return `${name}, your reply was sent through Android Notification Reply.`;
   }
 
   if (report.status === 'cancelled') {

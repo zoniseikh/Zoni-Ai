@@ -15,6 +15,7 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.provider.MediaStore
 import android.provider.Settings
+import android.telephony.SmsManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -29,12 +30,12 @@ import com.zoni.jarvis.assistant.device.FlashlightResult
 import com.zoni.jarvis.assistant.domain.NumberNormalizer
 import com.zoni.jarvis.assistant.domain.NumberNormalizerResult
 import com.zoni.jarvis.assistant.service.AppChatAdapterRegistry
+import com.zoni.jarvis.assistant.service.WhatsAppSendDeduplicator
 import com.zoni.jarvis.assistant.service.ZoniAccessibilityService
 import com.zoni.jarvis.assistant.service.ZoniNotificationListenerService
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 data class DeviceActionResult(
@@ -49,9 +50,11 @@ data class DeviceActionResult(
  * Implements:
  * - Strict 20-tool allowlisted execution via `executeTypedActionJson`
  * - Permission verification before executing privileged operations
- * - Mandatory review/confirmation workflow for WhatsApp messages, SMS drafts, and phone calls
- *   (`confirmPendingActionJson` / `cancelPendingActionJson`)
- * - Honest verification & outcome reporting (NEVER claims a WhatsApp/SMS was sent when only a draft opened)
+ * - Permanent no-confirmation direct execution for explicitly requested calls, WhatsApp messages,
+ *   SMS messages, app launches, Android settings, and Google/YouTube searches
+ * - Strict contact safety: disambiguates ONLY when multiple contacts/numbers match, never guesses
+ *   unknown numbers, preserves exact message text, and prevents duplicate sends
+ * - Honest verification & outcome reporting (NEVER claims a call/WhatsApp/SMS succeeded unless verified)
  * - Legacy `[ACTION:...]` parser preserved for backward compatibility
  */
 class DeviceActionExecutor(private val context: Context) {
@@ -104,8 +107,8 @@ class DeviceActionExecutor(private val context: Context) {
 
     /**
      * Executes a structured JSON action request validated against the strict 20-tool allowlist.
-     * Sensitive communication actions (WhatsApp, SMS, Call) return `awaitingConfirmation = true`
-     * with a `pendingActionId` so the user can review, edit, cancel, or explicitly approve first.
+     * Explicit user commands execute directly without routine confirmation gates; contact
+     * disambiguation is returned only when multiple contacts or phone numbers match.
      */
     @Volatile
     private var lastActionRequested: String = "none"
@@ -285,30 +288,33 @@ class DeviceActionExecutor(private val context: Context) {
                 )
             }
 
-            AllowedActionType.PREPARE_WHATSAPP_MESSAGE -> prepareCommunicationDraft(
+            AllowedActionType.PREPARE_WHATSAPP_MESSAGE -> executeCommunicationDirectly(
                 request = request,
                 recipientQuery = args["recipient"] ?: args["contact_name"] ?: args["phone_number"] ?: "",
+                explicitRecipientName = args["recipient_name"] ?: "",
                 messageText = args["message"] ?: "",
                 actionType = AllowedActionType.PREPARE_WHATSAPP_MESSAGE
             )
 
-            AllowedActionType.PREPARE_SMS -> prepareCommunicationDraft(
+            AllowedActionType.PREPARE_SMS -> executeCommunicationDirectly(
                 request = request,
                 recipientQuery = args["recipient"] ?: args["contact_name"] ?: args["phone_number"] ?: "",
+                explicitRecipientName = args["recipient_name"] ?: "",
                 messageText = args["message"] ?: "",
                 actionType = AllowedActionType.PREPARE_SMS
             )
 
-            AllowedActionType.PREPARE_APP_CHAT_MESSAGE -> prepareGenericAppChatDraft(
+            AllowedActionType.PREPARE_APP_CHAT_MESSAGE -> executeGenericAppChatDirectly(
                 request = request,
                 appNameQuery = args["app_name"] ?: "",
                 recipientQuery = args["recipient"] ?: "",
                 messageText = args["message"] ?: ""
             )
 
-            AllowedActionType.CALL_CONTACT -> prepareCommunicationDraft(
+            AllowedActionType.CALL_CONTACT -> executeCommunicationDirectly(
                 request = request,
                 recipientQuery = args["recipient"] ?: args["contact_name"] ?: args["phone_number"] ?: "",
+                explicitRecipientName = args["recipient_name"] ?: "",
                 messageText = "",
                 actionType = AllowedActionType.CALL_CONTACT
             )
@@ -571,10 +577,248 @@ class DeviceActionExecutor(private val context: Context) {
                     }
                 )
             }
+
+            AllowedActionType.CLICK_YOUTUBE_VIDEO -> {
+                val index = args["index"]?.toIntOrNull()
+                val targetHint = args["target"] ?: ""
+                val titleQuery = args["query"] ?: ""
+                val outcome = ZoniAccessibilityService.clickYouTubeVideo(
+                    index = index,
+                    targetHint = targetHint,
+                    titleQuery = titleQuery,
+                    actionTypeName = request.actionType.toolName
+                )
+                wrapAccessibilityResult(request, outcome.toJson())
+            }
+
+            AllowedActionType.CLICK_YOUTUBE_SEARCH_RESULT -> {
+                val index = args["index"]?.toIntOrNull() ?: 1
+                val titleQuery = args["query"] ?: ""
+                val outcome = ZoniAccessibilityService.clickYouTubeVideo(
+                    index = index,
+                    targetHint = "first_result",
+                    titleQuery = titleQuery,
+                    actionTypeName = request.actionType.toolName
+                )
+                wrapAccessibilityResult(request, outcome.toJson())
+            }
+
+            AllowedActionType.CLICK_VISIBLE_ELEMENT -> {
+                val target = args["target"] ?: args["element_text"] ?: ""
+                val index = args["index"]?.toIntOrNull()
+                val outcome = ZoniAccessibilityService.clickVisibleElementAdvanced(target, index)
+                wrapAccessibilityResult(request, outcome.toJson())
+            }
+
+            AllowedActionType.CLICK_WHATSAPP_CONTACT -> executeWhatsAppContactClick(
+                request = request,
+                contactQuery = args["contact_name"] ?: args["recipient"] ?: args["target"] ?: "",
+                ordinalIndex = args["index"]?.toIntOrNull(),
+                searchIfMissing = !args["search_if_missing"].equals("false", ignoreCase = true)
+            )
+
+            AllowedActionType.OPEN_WHATSAPP_CHAT -> executeOpenWhatsAppChat(
+                request = request,
+                contactQuery = args["contact_name"] ?: args["recipient"] ?: args["target"] ?: "",
+                ordinalIndex = args["index"]?.toIntOrNull()
+            )
+
+            AllowedActionType.TYPE_WHATSAPP_MESSAGE -> {
+                val recipient = args["recipient"] ?: args["contact_name"] ?: ""
+                val msg = args["message"] ?: ""
+                val outcome = ZoniAccessibilityService.typeWhatsAppMessageOnly(recipient, msg)
+                wrapAccessibilityResult(request, outcome.toJson())
+            }
+
+            AllowedActionType.SEND_WHATSAPP_MESSAGE -> executeSendWhatsAppMessage(
+                request = request,
+                recipientQuery = args["recipient"] ?: args["contact_name"] ?: args["phone_number"] ?: "",
+                explicitRecipientName = args["recipient_name"] ?: "",
+                messageText = args["message"] ?: ""
+            )
+
+            AllowedActionType.VERIFY_WHATSAPP_SEND -> {
+                val recipient = args["recipient"] ?: args["contact_name"] ?: ""
+                val msg = args["message"] ?: ""
+                val outcome = ZoniAccessibilityService.verifyWhatsAppSendState(recipient, msg)
+                wrapAccessibilityResult(request, outcome.toJson())
+            }
         }
     }
 
-    private fun prepareGenericAppChatDraft(
+    private fun ensureWhatsAppInForeground(): Boolean {
+        val activePkg = ZoniAccessibilityService.instance?.getActivePackageName().orEmpty()
+        if (com.zoni.jarvis.assistant.service.WhatsAppAutomationValidator.isWhatsAppPackage(activePkg)) {
+            return true
+        }
+        return appLauncher.launchAppByVoiceQuery("WhatsApp") is AppLaunchResult.Success
+    }
+
+    private fun executeWhatsAppContactClick(
+        request: TypedActionRequest,
+        contactQuery: String,
+        ordinalIndex: Int?,
+        searchIfMissing: Boolean
+    ): TypedActionResult {
+        if (!ZoniAccessibilityService.isConnected()) {
+            return TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = false,
+                verified = true,
+                status = "permission_missing",
+                message = "Zoni Accessibility Service is required to find and click contacts inside WhatsApp.",
+                failureReason = "accessibility_service_disabled",
+                requiredPermissions = listOf("ACCESSIBILITY_SERVICE"),
+                target = contactQuery
+            )
+        }
+        ensureWhatsAppInForeground()
+        val outcome = ZoniAccessibilityService.clickWhatsAppContact(
+            contactQuery = contactQuery,
+            ordinalIndex = ordinalIndex,
+            searchIfMissing = searchIfMissing,
+            actionTypeName = request.actionType.toolName
+        )
+        return wrapAccessibilityResult(request, outcome.toJson())
+    }
+
+    private fun executeOpenWhatsAppChat(
+        request: TypedActionRequest,
+        contactQuery: String,
+        ordinalIndex: Int?
+    ): TypedActionResult {
+        val cleanQuery = contactQuery.trim()
+        // If ordinal chat requested ("first chat", "second chat"), click directly via WhatsApp Accessibility
+        if (cleanQuery.isEmpty() && ordinalIndex != null) {
+            return executeWhatsAppContactClick(request, "", ordinalIndex, searchIfMissing = false)
+        }
+        // If WhatsApp is already open and Accessibility is connected, try visible smart contact click first
+        val activePkg = ZoniAccessibilityService.instance?.getActivePackageName().orEmpty()
+        if (ZoniAccessibilityService.isConnected() &&
+            com.zoni.jarvis.assistant.service.WhatsAppAutomationValidator.isWhatsAppPackage(activePkg)
+        ) {
+            val clickOutcome = ZoniAccessibilityService.clickWhatsAppContact(
+                contactQuery = cleanQuery,
+                ordinalIndex = ordinalIndex,
+                searchIfMissing = true,
+                actionTypeName = request.actionType.toolName
+            )
+            if (clickOutcome.success || clickOutcome.executionStatus == "multiple_contacts") {
+                return wrapAccessibilityResult(request, clickOutcome.toJson())
+            }
+        }
+        // Otherwise resolve via Android Contacts (safe disambiguation; never guesses) and open WhatsApp chat
+        if (cleanQuery.isNotEmpty()) {
+            val viaContacts = executeCommunicationDirectly(
+                request = request,
+                recipientQuery = cleanQuery,
+                explicitRecipientName = "",
+                messageText = "",
+                actionType = AllowedActionType.PREPARE_WHATSAPP_MESSAGE
+            )
+            if (viaContacts.success || viaContacts.status == "multiple_contacts" || viaContacts.status == "multiple_numbers") {
+                return viaContacts.copy(actionType = request.actionType.toolName, target = cleanQuery)
+            }
+            // Fallback: launch WhatsApp and try visible in-app contact search & click
+            if (ZoniAccessibilityService.isConnected()) {
+                return executeWhatsAppContactClick(request, cleanQuery, ordinalIndex, searchIfMissing = true)
+            }
+            return viaContacts.copy(actionType = request.actionType.toolName, target = cleanQuery)
+        }
+        return executeWhatsAppContactClick(request, "", ordinalIndex ?: 1, searchIfMissing = false)
+    }
+
+    private fun executeSendWhatsAppMessage(
+        request: TypedActionRequest,
+        recipientQuery: String,
+        explicitRecipientName: String,
+        messageText: String
+    ): TypedActionResult {
+        val cleanRecipient = recipientQuery.trim()
+        val cleanMsg = messageText.trim()
+        if (cleanMsg.isEmpty()) {
+            return TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = false,
+                verified = true,
+                status = "missing_message",
+                message = "Please provide the message text you want to send on WhatsApp.",
+                failureReason = "empty_message",
+                target = cleanRecipient
+            )
+        }
+        // If user is already inside a WhatsApp chat and didn't repeat the contact name, send in current verified chat
+        if (cleanRecipient.isEmpty()) {
+            if (!ZoniAccessibilityService.isConnected()) {
+                return TypedActionResult(
+                    actionId = request.actionId,
+                    actionType = request.actionType.toolName,
+                    success = false,
+                    verified = true,
+                    status = "permission_missing",
+                    message = "Enable Zoni Accessibility Service to send messages in the active WhatsApp chat.",
+                    failureReason = "accessibility_service_disabled",
+                    requiredPermissions = listOf("ACCESSIBILITY_SERVICE")
+                )
+            }
+            val outcome = ZoniAccessibilityService.sendApprovedWhatsAppMessage(
+                expectedRecipient = explicitRecipientName,
+                expectedPhone = "",
+                expectedMessage = cleanMsg,
+                pendingActionId = request.actionId
+            )
+            return wrapAccessibilityResult(request, outcome.toJson())
+        }
+
+        // Standard direct path: resolve via Android Contacts first (strict disambiguation), then fallback to WhatsApp visible contact click!
+        val primary = executeCommunicationDirectly(
+            request = request,
+            recipientQuery = cleanRecipient,
+            explicitRecipientName = explicitRecipientName,
+            messageText = cleanMsg,
+            actionType = AllowedActionType.PREPARE_WHATSAPP_MESSAGE
+        )
+        if (primary.success ||
+            primary.status == "multiple_contacts" ||
+            primary.status == "multiple_numbers" ||
+            primary.status == "duplicate_blocked"
+        ) {
+            return primary.copy(actionType = request.actionType.toolName, target = cleanRecipient)
+        }
+
+        // Fallback when contact wasn't found in Android Contacts (e.g., group chat or WhatsApp-only name): click visible WhatsApp contact & send!
+        if (ZoniAccessibilityService.isConnected() &&
+            (primary.status == "contact_not_found" || primary.status == "permission_missing")
+        ) {
+            val contactClick = executeWhatsAppContactClick(request, cleanRecipient, null, searchIfMissing = true)
+            if (contactClick.status == "multiple_contacts") {
+                return contactClick.copy(actionType = request.actionType.toolName)
+            }
+            if (contactClick.success) {
+                val resolvedName = contactClick.data?.optString("contactName", cleanRecipient).orEmpty().ifBlank { cleanRecipient }
+                val sendOutcome = ZoniAccessibilityService.sendApprovedWhatsAppMessage(
+                    expectedRecipient = resolvedName,
+                    expectedPhone = "",
+                    expectedMessage = cleanMsg,
+                    pendingActionId = request.actionId
+                )
+                return wrapAccessibilityResult(request, sendOutcome.toJson()).copy(
+                    actionType = request.actionType.toolName,
+                    target = resolvedName
+                )
+            }
+        }
+        return primary.copy(actionType = request.actionType.toolName, target = cleanRecipient)
+    }
+
+    /**
+     * Directly executes supported generic app chat messaging (Telegram, Instagram, Messenger)
+     * without routine confirmation screens, while strictly verifying adapter support, Accessibility,
+     * duplicate-send prevention, and honest outcome reporting.
+     */
+    private fun executeGenericAppChatDirectly(
         request: TypedActionRequest,
         appNameQuery: String,
         recipientQuery: String,
@@ -591,19 +835,6 @@ class DeviceActionExecutor(private val context: Context) {
                 failureReason = "unsupported_chat_app"
             )
 
-        if (!ZoniAccessibilityService.isConnected()) {
-            return TypedActionResult(
-                actionId = request.actionId,
-                actionType = request.actionType.toolName,
-                success = false,
-                verified = false,
-                status = "permission_missing",
-                message = "Enable Zoni Accessibility Service in Android Settings to use controlled ${adapter.appName} chat workflows.",
-                failureReason = "accessibility_service_disabled",
-                requiredPermissions = listOf("ACCESSIBILITY_SERVICE")
-            )
-        }
-
         val cleanRecipient = recipientQuery.trim()
         val cleanMsg = messageText.trim()
         if (cleanRecipient.isEmpty()) {
@@ -617,43 +848,112 @@ class DeviceActionExecutor(private val context: Context) {
             )
         }
 
-        val pendingId = "pend_${UUID.randomUUID().toString().take(10)}"
-        val primaryPkg = adapter.packageNames.first()
-        val draft = PendingConfirmationDraft(
-            pendingActionId = pendingId,
-            actionType = AllowedActionType.PREPARE_APP_CHAT_MESSAGE,
-            recipientName = cleanRecipient,
-            phoneNumber = "",
-            messageText = cleanMsg,
-            targetAppName = adapter.appName,
-            targetPackageName = primaryPkg
-        )
-        pendingDrafts[pendingId] = draft
+        if (!ZoniAccessibilityService.isConnected()) {
+            return TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = false,
+                verified = false,
+                status = "permission_missing",
+                message = "Enable Zoni Accessibility Service in Android Settings to send messages directly in ${adapter.appName}.",
+                failureReason = "accessibility_service_disabled",
+                requiredPermissions = listOf("ACCESSIBILITY_SERVICE")
+            )
+        }
 
-        val data = JSONObject()
-            .put("pendingActionId", pendingId)
-            .put("actionType", AllowedActionType.PREPARE_APP_CHAT_MESSAGE.toolName)
-            .put("appName", adapter.appName)
-            .put("packageName", primaryPkg)
-            .put("contactName", cleanRecipient)
-            .put("messageText", cleanMsg)
+        val appLabel = adapter.appName
+        if (cleanMsg.isNotBlank() &&
+            !WhatsAppSendDeduplicator.tryAcquireDirectSend(appLabel.lowercase(), cleanRecipient, cleanMsg)
+        ) {
+            return TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = false,
+                verified = true,
+                status = "duplicate_blocked",
+                message = "Duplicate send prevented for $cleanRecipient on $appLabel.",
+                failureReason = "duplicate_send_prevented"
+            )
+        }
+
+        val launchRes = appLauncher.launchAppByVoiceQuery(appLabel)
+        if (launchRes !is AppLaunchResult.Success) {
+            if (cleanMsg.isNotBlank()) {
+                WhatsAppSendDeduplicator.releaseDirectSend(appLabel.lowercase(), cleanRecipient, cleanMsg)
+            }
+            return TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = false,
+                verified = false,
+                status = "failed",
+                message = "Could not open $appLabel on this device.",
+                failureReason = "app_not_installed_or_launch_failed"
+            )
+        }
+
+        if (cleanMsg.isNotBlank()) {
+            val outcome = ZoniAccessibilityService.sendApprovedAppChatMessage(
+                appName = appLabel,
+                expectedRecipient = cleanRecipient,
+                expectedMessage = cleanMsg,
+                pendingActionId = request.actionId
+            )
+            if (outcome.success && outcome.verified) {
+                return TypedActionResult(
+                    actionId = request.actionId,
+                    actionType = request.actionType.toolName,
+                    success = true,
+                    verified = true,
+                    status = "app_chat_sent_verified",
+                    message = outcome.message,
+                    data = (outcome.data ?: JSONObject())
+                        .put("appName", appLabel)
+                        .put("contactName", cleanRecipient)
+                )
+            }
+            WhatsAppSendDeduplicator.releaseDirectSend(appLabel.lowercase(), cleanRecipient, cleanMsg)
+            return TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = true,
+                verified = true,
+                status = "opened_app_chat_draft_ready_to_send",
+                message = outcome.message,
+                failureReason = outcome.failureReason,
+                data = JSONObject()
+                    .put("appName", appLabel)
+                    .put("contactName", cleanRecipient)
+            )
+        }
 
         return TypedActionResult(
             actionId = request.actionId,
             actionType = request.actionType.toolName,
             success = true,
-            verified = false,
-            awaitingConfirmation = true,
-            pendingActionId = pendingId,
-            status = "awaiting_confirmation",
-            message = "${adapter.appName} message draft prepared for $cleanRecipient. Review and explicitly approve before opening ${adapter.appName}.",
-            data = data
+            verified = true,
+            status = "opened_app_chat_draft_ready_to_send",
+            message = "Opened $appLabel for $cleanRecipient. No message text was provided.",
+            data = JSONObject()
+                .put("appName", appLabel)
+                .put("contactName", cleanRecipient)
         )
     }
 
-    private fun prepareCommunicationDraft(
+    /**
+     * Resolves a recipient safely and executes CALL_CONTACT, PREPARE_WHATSAPP_MESSAGE, or PREPARE_SMS
+     * directly with ZERO routine confirmation screens.
+     *
+     * Contact Safety:
+     * - Asks ONLY when multiple contacts or multiple numbers match.
+     * - Never guesses an unknown phone number.
+     * - Never alters the user's message text.
+     * - Prevents duplicate sends within the deduplication window.
+     */
+    private fun executeCommunicationDirectly(
         request: TypedActionRequest,
         recipientQuery: String,
+        explicitRecipientName: String,
         messageText: String,
         actionType: AllowedActionType
     ): TypedActionResult {
@@ -674,18 +974,19 @@ class DeviceActionExecutor(private val context: Context) {
         // Direct phone number candidate?
         val norm = NumberNormalizer.normalizePhoneNumber(rawRecipient)
         if (norm is NumberNormalizerResult.ValidCandidate) {
-            return createPendingDraftResult(
+            val resolvedDisplayName = explicitRecipientName.trim().ifEmpty { norm.normalizedNumber }
+            return dispatchResolvedCommunication(
                 request = request,
                 actionType = actionType,
-                recipientName = norm.normalizedNumber,
+                recipientName = resolvedDisplayName,
                 phoneNumber = norm.normalizedNumber,
                 messageText = cleanMsg
             )
         }
 
-        // Resolve via Android Contacts
+        // Resolve via Android Contacts (ask ONLY if multiple contacts/numbers match; never guess)
         return when (val resolved = contactCallManager.resolveContact(rawRecipient)) {
-            is ContactCallResolution.ReadyToCall -> createPendingDraftResult(
+            is ContactCallResolution.ReadyToCall -> dispatchResolvedCommunication(
                 request = request,
                 actionType = actionType,
                 recipientName = resolved.name,
@@ -701,7 +1002,8 @@ class DeviceActionExecutor(private val context: Context) {
                     actionId = request.actionId,
                     actionType = actionType.toolName,
                     success = false,
-                    awaitingConfirmation = true,
+                    verified = true,
+                    awaitingConfirmation = false,
                     status = "multiple_numbers",
                     message = "${resolved.name} has multiple phone numbers. Please choose which number to use.",
                     data = JSONObject()
@@ -721,11 +1023,13 @@ class DeviceActionExecutor(private val context: Context) {
                     actionId = request.actionId,
                     actionType = actionType.toolName,
                     success = false,
-                    awaitingConfirmation = true,
+                    verified = true,
+                    awaitingConfirmation = false,
                     status = "multiple_contacts",
-                    message = "Multiple contacts match \"${resolved.query}\". Please select the right contact before continuing.",
+                    message = "Multiple contacts match \"${resolved.query}\". Please select the right contact.",
                     data = JSONObject()
                         .put("query", resolved.query)
+                        .put("recipient", resolved.query)
                         .put("messageText", cleanMsg)
                         .put("candidates", arr)
                 )
@@ -734,6 +1038,7 @@ class DeviceActionExecutor(private val context: Context) {
                 actionId = request.actionId,
                 actionType = actionType.toolName,
                 success = false,
+                verified = true,
                 status = "contact_not_found",
                 message = "Could not find \"${resolved.query}\" in your Android contacts. Please share their phone number.",
                 failureReason = "contact_not_found"
@@ -742,6 +1047,7 @@ class DeviceActionExecutor(private val context: Context) {
                 actionId = request.actionId,
                 actionType = actionType.toolName,
                 success = false,
+                verified = true,
                 status = "permission_missing",
                 message = "Contacts permission (READ_CONTACTS) is required to look up \"$rawRecipient\".",
                 failureReason = "read_contacts_denied",
@@ -758,60 +1064,258 @@ class DeviceActionExecutor(private val context: Context) {
         }
     }
 
-    private fun createPendingDraftResult(
+    private fun dispatchResolvedCommunication(
         request: TypedActionRequest,
         actionType: AllowedActionType,
         recipientName: String,
         phoneNumber: String,
         messageText: String
     ): TypedActionResult {
-        val pendingId = "pend_${UUID.randomUUID().toString().take(10)}"
-        val notifKey = if (actionType == AllowedActionType.PREPARE_WHATSAPP_MESSAGE) {
-            ZoniNotificationListenerService.findReplyableWhatsAppNotificationKey(recipientName)
-        } else {
-            null
+        return when (actionType) {
+            AllowedActionType.CALL_CONTACT -> {
+                if (!WhatsAppSendDeduplicator.tryAcquireDirectSend("call", phoneNumber, "", windowMs = 5000L)) {
+                    return TypedActionResult(
+                        actionId = request.actionId,
+                        actionType = actionType.toolName,
+                        success = false,
+                        verified = true,
+                        status = "duplicate_blocked",
+                        message = "Duplicate call prevented for $recipientName ($phoneNumber).",
+                        failureReason = "duplicate_call_prevented"
+                    )
+                }
+                val started = contactCallManager.initiateCall(phoneNumber)
+                if (!started) {
+                    WhatsAppSendDeduplicator.releaseDirectSend("call", phoneNumber, "")
+                    return TypedActionResult(
+                        actionId = request.actionId,
+                        actionType = actionType.toolName,
+                        success = false,
+                        verified = false,
+                        status = "failed",
+                        message = "Could not start phone call to $recipientName ($phoneNumber).",
+                        failureReason = "call_intent_failed"
+                    )
+                }
+                val direct = contactCallManager.hasCallPhonePermission()
+                TypedActionResult(
+                    actionId = request.actionId,
+                    actionType = actionType.toolName,
+                    success = true,
+                    verified = true,
+                    status = if (direct) "call_initiated" else "dialer_opened",
+                    message = if (direct) {
+                        "Initiated direct SIM call to $recipientName ($phoneNumber)."
+                    } else {
+                        "Opened Android dialer with $recipientName ($phoneNumber). Grant CALL_PHONE permission for direct 1-step calling."
+                    },
+                    requiredPermissions = if (direct) emptyList() else listOf("CALL_PHONE"),
+                    data = JSONObject()
+                        .put("contactName", recipientName)
+                        .put("phoneNumber", phoneNumber)
+                        .put("directCall", direct)
+                )
+            }
+
+            AllowedActionType.PREPARE_WHATSAPP_MESSAGE -> {
+                if (messageText.isNotBlank() &&
+                    !WhatsAppSendDeduplicator.tryAcquireDirectSend("whatsapp", phoneNumber, messageText)
+                ) {
+                    return TypedActionResult(
+                        actionId = request.actionId,
+                        actionType = actionType.toolName,
+                        success = false,
+                        verified = true,
+                        status = "duplicate_blocked",
+                        message = "Duplicate WhatsApp send prevented for $recipientName.",
+                        failureReason = "duplicate_send_prevented"
+                    )
+                }
+
+                val opened = openWhatsApp(phoneNumber, messageText)
+                if (!opened) {
+                    if (messageText.isNotBlank()) {
+                        WhatsAppSendDeduplicator.releaseDirectSend("whatsapp", phoneNumber, messageText)
+                    }
+                    return TypedActionResult(
+                        actionId = request.actionId,
+                        actionType = actionType.toolName,
+                        success = false,
+                        verified = false,
+                        status = "failed",
+                        message = "Could not open WhatsApp on this device. Please make sure WhatsApp is installed.",
+                        failureReason = "whatsapp_not_installed_or_launch_failed"
+                    )
+                }
+
+                if (ZoniAccessibilityService.isConnected() && messageText.isNotBlank()) {
+                    val sendOutcome = ZoniAccessibilityService.sendApprovedWhatsAppMessage(
+                        expectedRecipient = recipientName,
+                        expectedPhone = phoneNumber,
+                        expectedMessage = messageText,
+                        pendingActionId = request.actionId
+                    )
+                    if (sendOutcome.success && sendOutcome.verified) {
+                        return TypedActionResult(
+                            actionId = request.actionId,
+                            actionType = actionType.toolName,
+                            success = true,
+                            verified = true,
+                            status = sendOutcome.executionStatus.ifBlank { "whatsapp_sent_verified" },
+                            executionStatus = sendOutcome.executionStatus.ifBlank { "whatsapp_sent_verified" },
+                            target = recipientName,
+                            message = sendOutcome.message,
+                            data = (sendOutcome.data ?: JSONObject())
+                                .put("contactName", recipientName)
+                                .put("phoneNumber", phoneNumber)
+                                .put("messageText", messageText)
+                        )
+                    }
+                    if (sendOutcome.failureReason != "send_verification_failed") {
+                        WhatsAppSendDeduplicator.releaseDirectSend("whatsapp", phoneNumber, messageText)
+                    }
+                    return TypedActionResult(
+                        actionId = request.actionId,
+                        actionType = actionType.toolName,
+                        success = sendOutcome.failureReason != "send_button_not_found" && sendOutcome.failureReason != "send_click_rejected",
+                        verified = false,
+                        status = if (sendOutcome.failureReason == "send_button_not_found") "send_button_not_found" else "opened_whatsapp_draft_ready_to_send",
+                        executionStatus = sendOutcome.executionStatus.ifBlank { "opened_whatsapp_draft_ready_to_send" },
+                        target = recipientName,
+                        message = sendOutcome.message,
+                        failureReason = sendOutcome.failureReason,
+                        data = JSONObject()
+                            .put("contactName", recipientName)
+                            .put("phoneNumber", phoneNumber)
+                            .put("messageText", messageText)
+                            .put("autoSendAttempted", true)
+                    )
+                }
+
+                if (messageText.isNotBlank()) {
+                    WhatsAppSendDeduplicator.releaseDirectSend("whatsapp", phoneNumber, messageText)
+                }
+                TypedActionResult(
+                    actionId = request.actionId,
+                    actionType = actionType.toolName,
+                    success = true,
+                    verified = true,
+                    status = "opened_whatsapp_draft_ready_to_send",
+                    message = if (messageText.isBlank()) {
+                        "Opened WhatsApp chat for $recipientName. No message text was provided."
+                    } else {
+                        "Opened WhatsApp chat for $recipientName with your exact message ready. Enable Zoni Accessibility Service for direct Send, or tap Send in WhatsApp now."
+                    },
+                    requiredPermissions = if (messageText.isNotBlank() && !ZoniAccessibilityService.isConnected()) {
+                        listOf("ACCESSIBILITY_SERVICE")
+                    } else {
+                        emptyList()
+                    },
+                    data = JSONObject()
+                        .put("contactName", recipientName)
+                        .put("phoneNumber", phoneNumber)
+                        .put("messageText", messageText)
+                )
+            }
+
+            AllowedActionType.PREPARE_SMS -> {
+                if (messageText.isNotBlank()) {
+                    if (!WhatsAppSendDeduplicator.tryAcquireDirectSend("sms", phoneNumber, messageText)) {
+                        return TypedActionResult(
+                            actionId = request.actionId,
+                            actionType = actionType.toolName,
+                            success = false,
+                            verified = true,
+                            status = "duplicate_blocked",
+                            message = "Duplicate SMS send prevented for $recipientName.",
+                            failureReason = "duplicate_send_prevented"
+                        )
+                    }
+
+                    val hasSendSmsPermission = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.SEND_SMS
+                    ) == PackageManager.PERMISSION_GRANTED
+
+                    if (hasSendSmsPermission) {
+                        val sentDirect = sendSmsDirect(phoneNumber, messageText)
+                        if (sentDirect) {
+                            return TypedActionResult(
+                                actionId = request.actionId,
+                                actionType = actionType.toolName,
+                                success = true,
+                                verified = true,
+                                status = "sms_sent_direct",
+                                message = "Sent SMS directly to $recipientName ($phoneNumber) via Android SmsManager.",
+                                data = JSONObject()
+                                    .put("contactName", recipientName)
+                                    .put("phoneNumber", phoneNumber)
+                                    .put("messageText", messageText)
+                                    .put("directSms", true)
+                            )
+                        }
+                    }
+
+                    // Honest fallback: release dedup guard & open SMS composer if SEND_SMS is denied or SmsManager failed
+                    WhatsAppSendDeduplicator.releaseDirectSend("sms", phoneNumber, messageText)
+                    val opened = openSms(phoneNumber, messageText)
+                    return TypedActionResult(
+                        actionId = request.actionId,
+                        actionType = actionType.toolName,
+                        success = opened,
+                        verified = opened,
+                        status = if (opened) "opened_sms_composer_ready_to_send" else "failed",
+                        message = if (opened) {
+                            if (!hasSendSmsPermission) {
+                                "SEND_SMS permission is not granted. Opened Android SMS composer for $recipientName ($phoneNumber) with your exact message ready."
+                            } else {
+                                "Direct carrier SMS submission failed. Opened Android SMS composer for $recipientName ($phoneNumber) with your exact message ready."
+                            }
+                        } else {
+                            "Could not send SMS or open the Android SMS app."
+                        },
+                        failureReason = when {
+                            !opened -> "sms_intent_failed"
+                            !hasSendSmsPermission -> "send_sms_permission_missing"
+                            else -> "sms_manager_failed_composer_opened"
+                        },
+                        requiredPermissions = if (!hasSendSmsPermission) listOf("SEND_SMS") else emptyList(),
+                        data = JSONObject()
+                            .put("contactName", recipientName)
+                            .put("phoneNumber", phoneNumber)
+                            .put("messageText", messageText)
+                    )
+                }
+
+                // Blank message -> open SMS composer honestly
+                val opened = openSms(phoneNumber, "")
+                TypedActionResult(
+                    actionId = request.actionId,
+                    actionType = actionType.toolName,
+                    success = opened,
+                    verified = opened,
+                    status = if (opened) "opened_sms_composer_ready_to_send" else "failed",
+                    message = if (opened) {
+                        "Opened Android SMS composer for $recipientName ($phoneNumber). No message text was provided."
+                    } else {
+                        "Could not open the Android SMS app."
+                    },
+                    failureReason = if (opened) null else "sms_intent_failed",
+                    data = JSONObject()
+                        .put("contactName", recipientName)
+                        .put("phoneNumber", phoneNumber)
+                )
+            }
+
+            else -> TypedActionResult(
+                actionId = request.actionId,
+                actionType = actionType.toolName,
+                success = false,
+                status = "unsupported",
+                message = "Unsupported communication action.",
+                failureReason = "unsupported_action"
+            )
         }
-        val draft = PendingConfirmationDraft(
-            pendingActionId = pendingId,
-            actionType = actionType,
-            recipientName = recipientName,
-            phoneNumber = phoneNumber,
-            messageText = messageText,
-            notificationKey = notifKey,
-            canReplyViaNotification = notifKey != null
-        )
-        pendingDrafts[pendingId] = draft
-
-        val data = JSONObject()
-            .put("pendingActionId", pendingId)
-            .put("actionType", actionType.toolName)
-            .put("contactName", recipientName)
-            .put("phoneNumber", phoneNumber)
-            .put("messageText", messageText)
-            .put("canReplyViaNotification", draft.canReplyViaNotification)
-            .put("notificationKey", notifKey.orEmpty())
-
-        val summary = when (actionType) {
-            AllowedActionType.PREPARE_WHATSAPP_MESSAGE ->
-                "WhatsApp draft prepared for $recipientName ($phoneNumber). Please review and approve before opening WhatsApp."
-            AllowedActionType.PREPARE_SMS ->
-                "SMS draft prepared for $recipientName ($phoneNumber). Please review and approve before opening SMS."
-            AllowedActionType.CALL_CONTACT ->
-                "Ready to call $recipientName ($phoneNumber). Please confirm to place the phone call."
-            else -> "Pending user confirmation."
-        }
-
-        return TypedActionResult(
-            actionId = request.actionId,
-            actionType = actionType.toolName,
-            success = true,
-            verified = false,
-            awaitingConfirmation = true,
-            pendingActionId = pendingId,
-            status = "awaiting_confirmation",
-            message = summary,
-            data = data
-        )
     }
 
     /**
@@ -1048,10 +1552,13 @@ class DeviceActionExecutor(private val context: Context) {
         }
         val ok = parsed.optBoolean("success", false)
         val failReason = parsed.optString("failureReason", "").ifBlank { null }
+        val explicitStatus = parsed.optString("executionStatus", parsed.optString("status", "")).trim()
+        val target = parsed.optString("target", "").trim()
         val status = when {
-            ok -> "executed"
             failReason == "accessibility_service_disabled" -> "permission_missing"
             failReason == "protected_banking_or_auth_screen" || failReason == "sensitive_screen_content" || failReason == "password_field_blocked" -> "blocked"
+            explicitStatus.isNotEmpty() -> explicitStatus
+            ok -> "executed"
             else -> "failed"
         }
         return TypedActionResult(
@@ -1060,6 +1567,8 @@ class DeviceActionExecutor(private val context: Context) {
             success = ok,
             verified = parsed.optBoolean("verified", false),
             status = status,
+            executionStatus = status,
+            target = target,
             message = parsed.optString("message", if (ok) "Accessibility action completed." else "Accessibility action failed."),
             failureReason = failReason,
             requiredPermissions = if (failReason == "accessibility_service_disabled") listOf("ACCESSIBILITY_SERVICE") else emptyList(),
@@ -1152,6 +1661,38 @@ class DeviceActionExecutor(private val context: Context) {
                     false
                 }
             }
+        }
+    }
+
+    /**
+     * Sends an SMS directly using Android's official SmsManager when SEND_SMS permission is granted.
+     * Uses multipart messaging so Bengali/Unicode and long messages transmit intact without alteration.
+     */
+    fun sendSmsDirect(phoneNumber: String, message: String): Boolean {
+        val cleanNumber = phoneNumber.filter { it.isDigit() || it == '+' }
+        val cleanMessage = message.trim()
+        if (cleanNumber.isBlank() || cleanMessage.isBlank()) return false
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
+            return false
+        }
+        return try {
+            val smsManager: SmsManager? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                context.getSystemService(SmsManager::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                SmsManager.getDefault()
+            }
+            if (smsManager == null) return false
+            val parts = smsManager.divideMessage(cleanMessage)
+            if (parts != null && parts.size > 1) {
+                smsManager.sendMultipartTextMessage(cleanNumber, null, parts, null, null)
+            } else {
+                smsManager.sendTextMessage(cleanNumber, null, cleanMessage, null, null)
+            }
+            true
+        } catch (e: Exception) {
+            Log.w("ZoniActionExecutor", "Direct SmsManager send failed: ${e.message}")
+            false
         }
     }
 
