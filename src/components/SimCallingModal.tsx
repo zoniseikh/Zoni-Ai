@@ -110,35 +110,37 @@ export const SimCallingModal: React.FC<SimCallingModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md p-3 sm:p-5 overflow-y-auto">
-      <div className="w-full max-w-2xl bg-slate-950 border border-cyan-500/40 rounded-2xl shadow-[0_0_60px_rgba(6,182,212,0.3)] flex flex-col overflow-hidden my-auto">
+    <div className="zoni-modal-backdrop bg-black/75 backdrop-blur-md" role="dialog" aria-modal="true" aria-label="Android SIM Calling Hub">
+      <div className="zoni-modal-card max-w-2xl bg-slate-950 border border-cyan-500/40 rounded-2xl shadow-[0_0_60px_rgba(6,182,212,0.3)]">
         {/* Header */}
-        <div className="flex items-center justify-between p-4 sm:p-5 border-b border-cyan-500/20 bg-slate-900/60">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-cyan-950/80 border border-cyan-400/50 flex items-center justify-center text-cyan-400">
+        <div className="shrink-0 flex items-center justify-between p-4 sm:p-5 border-b border-cyan-500/20 bg-slate-900/60">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-9 h-9 shrink-0 rounded-xl bg-cyan-950/80 border border-cyan-400/50 flex items-center justify-center text-cyan-400">
               <PhoneCall className="w-5 h-5" />
             </div>
-            <div>
-              <h2 className="font-sci-fi text-base font-bold text-cyan-200 tracking-wide">
+            <div className="min-w-0">
+              <h2 className="font-sci-fi text-base font-bold text-cyan-200 tracking-wide truncate">
                 ANDROID SIM CALLING HUB
               </h2>
-              <p className="text-xs font-hud text-pink-400">
+              <p className="text-xs font-hud text-pink-400 truncate">
                 নেটিভ Android SIM কলিং, কন্টাক্ট সার্চ এবং বাংলা/ইংরেজি নম্বর নরমালাইজার ({selectedAffectionName})
               </p>
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
             aria-label="Close SIM Calling Hub"
-            className="p-1.5 rounded-lg border border-cyan-500/30 text-cyan-400 hover:bg-cyan-950/50 transition-colors"
+            className="shrink-0 p-1.5 rounded-lg border border-cyan-500/30 text-cyan-400 hover:bg-cyan-950/50 transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
         {/* Tabs */}
-        <div className="flex border-b border-cyan-500/20 bg-slate-900/30 px-4 pt-2 gap-2 text-xs font-hud tracking-wider overflow-x-auto">
+        <div className="shrink-0 flex border-b border-cyan-500/20 bg-slate-900/30 px-4 pt-2 gap-2 text-xs font-hud tracking-wider overflow-x-auto">
           <button
+            type="button"
             onClick={() => setActiveTab('sim')}
             className={`pb-2.5 px-3 font-semibold border-b-2 transition-all shrink-0 ${
               activeTab === 'sim'
@@ -149,6 +151,7 @@ export const SimCallingModal: React.FC<SimCallingModalProps> = ({
             📞 1. SIM CALLING &amp; CONTACTS
           </button>
           <button
+            type="button"
             onClick={() => setActiveTab('history')}
             className={`pb-2.5 px-3 font-semibold border-b-2 transition-all shrink-0 ${
               activeTab === 'history'
@@ -161,7 +164,7 @@ export const SimCallingModal: React.FC<SimCallingModalProps> = ({
         </div>
 
         {/* Body */}
-        <div className="p-4 sm:p-6 overflow-y-auto max-h-[70vh] space-y-4">
+        <div className="zoni-modal-scroll p-4 sm:p-6 space-y-4">
           {activeTab === 'sim' && (
             <div className="space-y-4">
               <div className="p-4 rounded-xl bg-slate-900/70 border border-cyan-500/30 space-y-3">
@@ -349,13 +352,14 @@ export const SimCallingModal: React.FC<SimCallingModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="p-3 sm:p-4 border-t border-cyan-500/20 bg-slate-900/60 flex items-center justify-between">
-          <span className="text-[11px] font-hud text-cyan-400/80">
+        <div className="shrink-0 p-3 sm:p-4 border-t border-cyan-500/20 bg-slate-900/60 flex items-center justify-between gap-2">
+          <span className="text-[11px] font-hud text-cyan-400/80 truncate">
             ZONI ANDROID TELECOM // NATIVE SIM CALLING
           </span>
           <button
+            type="button"
             onClick={onClose}
-            className="px-4 py-1.5 rounded-lg bg-cyan-600/80 hover:bg-cyan-500 text-white font-hud text-xs tracking-wider"
+            className="shrink-0 px-4 py-1.5 rounded-lg bg-cyan-600/80 hover:bg-cyan-500 text-white font-hud text-xs tracking-wider"
           >
             CLOSE
           </button>

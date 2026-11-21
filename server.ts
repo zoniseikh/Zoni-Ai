@@ -45,11 +45,15 @@ const readCliArg = (flag: string): string | undefined => {
 const PORT = Number(readCliArg('--port') || process.env.PORT || 3000);
 const HOST = readCliArg('--host') || process.env.HOST || '0.0.0.0';
 
-// Shared server-side Gemini client
+const isGeminiConfigured = (): boolean => Boolean(process.env.GEMINI_API_KEY?.trim());
+
+// Shared server-side Gemini client (credentials remain strictly server-side)
 const getGeminiClient = () => {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not configured on the server.');
+    const err = new Error('GEMINI_API_KEY is not configured on the backend server.');
+    (err as any).code = 'GEMINI_KEY_MISSING';
+    throw err;
   }
   return new GoogleGenAI({
     apiKey,
@@ -305,37 +309,69 @@ IMPORTANT GUIDELINES FOR SPOKEN VOICE:
 - Never break character: You are Zoni AI, created by Zoni Seikh, his devoted Jarvis-style AI girlfriend & mobile assistant.`;
 };
 
-// API Status
+// API Status & Backend Health Monitoring
 app.get('/api/status', (req: Request, res: Response) => {
   const istLive = getLiveTimeInfo('Asia/Kolkata');
+  const geminiConfigured = isGeminiConfigured();
   res.json({
-    status: 'online',
+    status: geminiConfigured ? 'online' : 'degraded',
     assistant: 'Zoni AI',
     creator: 'Zoni Seikh',
     version: 'Zoni AI Jarvis Core',
     androidPackage: 'com.zoni.jarvis.assistant',
     defaultTimezone: 'Asia/Kolkata (IST, UTC+05:30)',
     currentTimeIST: `${istLive.time12} (${istLive.time24})`,
-    geminiLiveSupported: true,
+    serverTimeIso: new Date().toISOString(),
+    uptimeSeconds: Math.floor(process.uptime()),
+    geminiConfigured,
+    configurationError: geminiConfigured
+      ? null
+      : 'GEMINI_API_KEY is not configured on this backend server. Set GEMINI_API_KEY in the server environment variables and restart.',
+    chatEndpoint: '/api/chat',
+    liveWsPath: '/live',
+    geminiLiveSupported: geminiConfigured,
     simCallingSupported: true,
-    screenAwarenessSupported: true,
-    notificationSmartReplySupported: true,
+    screenAwarenessSupported: geminiConfigured,
+    notificationSmartReplySupported: geminiConfigured,
   });
 });
 
-function mapGeminiError(err: any): { status: number; message: string } {
+function mapGeminiError(err: any): { status: number; code: string; retryable: boolean; message: string } {
   const clean = sanitizeErrorMessage(err);
   const lower = clean.toLowerCase();
+  if (err?.code === 'GEMINI_KEY_MISSING' || lower.includes('gemini_api_key is not configured')) {
+    return {
+      status: 503,
+      code: 'GEMINI_KEY_MISSING',
+      retryable: false,
+      message: 'GEMINI_API_KEY is not configured on the backend server. Please configure GEMINI_API_KEY on your hosted backend.',
+    };
+  }
   if (lower.includes('api_key_invalid') || lower.includes('api key not valid') || lower.includes('permission_denied') || lower.includes('401') || lower.includes('403')) {
-    return { status: 401, message: 'Gemini API key is missing or invalid. Please check your Gemini API key configuration.' };
+    return {
+      status: 401,
+      code: 'GEMINI_KEY_INVALID',
+      retryable: false,
+      message: 'Server Gemini API key is invalid or unauthorized. Please verify GEMINI_API_KEY on the backend server.',
+    };
   }
   if (lower.includes('429') || lower.includes('quota') || lower.includes('resource_exhausted') || lower.includes('rate limit')) {
-    return { status: 429, message: 'Gemini API quota or rate limit reached. Please wait a moment and try again.' };
+    return {
+      status: 429,
+      code: 'GEMINI_RATE_LIMIT',
+      retryable: true,
+      message: 'Gemini API quota or rate limit reached. Please wait a moment and try again.',
+    };
   }
   if (lower.includes('enotfound') || lower.includes('econnreset') || lower.includes('etimedout') || lower.includes('fetch failed')) {
-    return { status: 503, message: 'Temporary network issue contacting Gemini AI. Please check internet connectivity.' };
+    return {
+      status: 503,
+      code: 'GEMINI_NETWORK_ERROR',
+      retryable: true,
+      message: 'Temporary network issue contacting Gemini AI. Please check server internet connectivity.',
+    };
   }
-  return { status: 500, message: clean || 'Gemini AI request failed.' };
+  return { status: 500, code: 'GEMINI_UPSTREAM_ERROR', retryable: true, message: clean || 'Gemini AI request failed.' };
 }
 
 // Multimodal Screen Awareness Endpoint (User-authorized MediaProjection screenshot + visible text)
@@ -510,15 +546,15 @@ app.post('/api/chat', async (req: Request, res: Response) => {
       nickname = 'Boss',
       selectedAffectionName,
       lang = 'bn-BD',
-    } = req.body;
-    if (!message) {
-      return res.status(400).json({ error: 'Message is required.' });
+    } = req.body || {};
+    if (typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ error: 'Message is required.', code: 'INVALID_REQUEST' });
     }
-
-    const activeAffectionName = (selectedAffectionName || nickname || 'Boss').trim();
+    const cleanMessage = message.trim().slice(0, 4000);
+    const activeAffectionName = String(selectedAffectionName || nickname || 'Boss').trim().slice(0, 60);
 
     // Direct India Time, Date, and Weekday resolution according to exact ZONI AI rules (Asia/Kolkata)
-    const dtQuery = detectDateTimeQuery(message);
+    const dtQuery = detectDateTimeQuery(cleanMessage);
     if (dtQuery === 'time') {
       const reply = formatBengaliSpokenTime();
       return res.json({ reply, lang: 'bn-BD', isDirectTime: true });
@@ -533,7 +569,7 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     }
 
     // Check if the user explicitly mentioned another location
-    const lowerMessage = message.toLowerCase();
+    const lowerMessage = cleanMessage.toLowerCase();
     let explicitLocation: string | undefined = undefined;
     for (const cityKey of Object.keys(CITY_TIMEZONE_MAP)) {
       // Don't match generic substring like "in" inside other words
@@ -551,17 +587,17 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     const contents: any[] = [];
     if (Array.isArray(history)) {
       for (const turn of history.slice(-10)) {
-        if (turn.text && turn.role) {
+        if (turn && typeof turn.text === 'string' && turn.text.trim() && turn.role) {
           contents.push({
             role: turn.role === 'user' ? 'user' : 'model',
-            parts: [{ text: turn.text }],
+            parts: [{ text: turn.text.trim().slice(0, 4000) }],
           });
         }
       }
     }
     contents.push({
       role: 'user',
-      parts: [{ text: message }],
+      parts: [{ text: cleanMessage }],
     });
 
     let response;
@@ -576,7 +612,7 @@ app.post('/api/chat', async (req: Request, res: Response) => {
         },
       });
     } catch (primaryErr: any) {
-      console.warn('Fast flash-lite temporary notice, attempting gemini-4-hydrogen:', primaryErr?.message);
+      console.warn('[ZONI-CHAT] Primary flash-lite fallback -> gemini-4-hydrogen:', sanitizeErrorMessage(primaryErr));
       response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
         contents,
@@ -587,15 +623,15 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     }
 
     const reply =
-      response.text ||
+      response.text?.trim() ||
       (lang === 'bn-BD'
         ? `আমি সবসময় আপনার পাশে আছি ${activeAffectionName} ❤️`
         : `Main hamesha aapke saath hoon ${activeAffectionName} ❤️`);
-    res.json({ reply, lang });
+    res.json({ reply, lang, transport: 'http-chat' });
   } catch (err: any) {
     const mapped = mapGeminiError(err);
-    console.error('Chat error:', mapped.message);
-    res.status(mapped.status).json({ error: mapped.message });
+    console.error(`[ZONI-CHAT] Error (${mapped.code}):`, mapped.message);
+    res.status(mapped.status).json({ error: mapped.message, code: mapped.code, retryable: mapped.retryable });
   }
 });
 
@@ -693,9 +729,12 @@ function sanitizeErrorMessage(err: any): string {
 
 // Gemini Live real-time bidirectional voice + Chat Box connection handler
 wss.on('connection', async (clientWs: WebSocket, request: any) => {
-  console.log('Client connected to Zoni Live WebSocket');
+  console.log('[ZONI-LIVE] Client connected to /live WebSocket');
   let liveSession: any = null;
   let isAlive = true;
+  let liveInitFailed = false;
+  let liveInitErrorMsg = '';
+  let liveInitErrorCode = 'LIVE_INIT_FAILED';
   let currentTurnId = 1;
   let userSpeechTurnId = 1;
   const pendingClientMessages: string[] = [];
@@ -705,14 +744,14 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
       try {
         clientWs.send(JSON.stringify(payload));
       } catch (sendErr) {
-        console.warn('Failed to send WS payload to client:', sanitizeErrorMessage(sendErr));
+        console.warn('[ZONI-LIVE] Failed to send WS payload to client:', sanitizeErrorMessage(sendErr));
       }
     }
   };
 
   // Handle client-level WebSocket errors gracefully
   clientWs.on('error', (err: any) => {
-    console.warn('Client WebSocket notice:', sanitizeErrorMessage(err));
+    console.warn('[ZONI-LIVE] Client WebSocket notice:', sanitizeErrorMessage(err));
   });
 
   // Keep connection alive with periodic ping for Cloud Run & reverse proxies
@@ -725,6 +764,7 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
   clientWs.on('close', () => {
     clearInterval(pingInterval);
     isAlive = false;
+    pendingClientMessages.length = 0;
     if (liveSession && typeof liveSession.close === 'function') {
       try {
         liveSession.close();
@@ -735,6 +775,16 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
   });
 
   const handleIncomingClientPayload = (rawStr: string) => {
+    if (liveInitFailed) {
+      sendToClient({
+        type: 'error',
+        code: liveInitErrorCode,
+        retryable: liveInitErrorCode !== 'GEMINI_KEY_MISSING' && liveInitErrorCode !== 'GEMINI_KEY_INVALID',
+        message: liveInitErrorMsg || 'Gemini Live session is unavailable.',
+      });
+      return;
+    }
+
     if (!liveSession) {
       if (pendingClientMessages.length < 30) {
         pendingClientMessages.push(rawStr);
@@ -1125,6 +1175,7 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
         ? 'Zoni Live Link resumed with existing session handle.'
         : 'Zoni Live Link established.',
     });
+    console.log(`[ZONI-LIVE] Gemini Live handshake succeeded (resumed=${sessionResumed})`);
 
     // Flush any client messages queued during handshake
     while (pendingClientMessages.length > 0) {
@@ -1134,11 +1185,17 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
       }
     }
   } catch (err: any) {
-    const cleanErr = sanitizeErrorMessage(err);
-    console.warn('Gemini Live session initialization notice:', cleanErr);
+    const mapped = mapGeminiError(err);
+    liveInitFailed = true;
+    liveInitErrorMsg = mapped.message;
+    liveInitErrorCode = mapped.code;
+    pendingClientMessages.length = 0;
+    console.warn(`[ZONI-LIVE] Initialization failed (${mapped.code}):`, mapped.message);
     sendToClient({
       type: 'live_init_failed',
-      message: cleanErr || 'Could not connect to Gemini Live.',
+      code: mapped.code,
+      retryable: mapped.retryable,
+      message: mapped.message || 'Could not connect to Gemini Live.',
     });
   }
 });
@@ -1191,9 +1248,14 @@ setupFrontend()
   .then(() => {
     server.listen(PORT, HOST, () => {
       console.log(`[ZONI-JARVIS] Server listening on http://${HOST}:${PORT}`);
+      console.log(
+        `[ZONI-JARVIS] Diagnostics: GET /api/status | POST /api/chat | WS /live | GEMINI_API_KEY=${
+          isGeminiConfigured() ? 'CONFIGURED' : 'MISSING (set server-side GEMINI_API_KEY)'
+        }`
+      );
     });
   })
   .catch((err) => {
-    console.error('[ZONI-JARVIS] Failed to start server:', err);
+    console.error('[ZONI-JARVIS] Failed to start server:', sanitizeErrorMessage(err));
     process.exit(1);
   });

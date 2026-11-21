@@ -237,8 +237,14 @@ class ZoniWebAppInterface(
 
     @JavascriptInterface
     fun setBackendUrl(url: String): Boolean {
-        if (url.isBlank()) return false
-        keyManager.saveBackendUrl(url)
+        val clean = url.trim().trimEnd('/')
+        if (clean.isBlank()) return false
+        if ((!clean.startsWith("http://") && !clean.startsWith("https://")) ||
+            clean.contains("appassets.androidplatform.net", ignoreCase = true)
+        ) {
+            return false
+        }
+        keyManager.saveBackendUrl(clean)
         return true
     }
 

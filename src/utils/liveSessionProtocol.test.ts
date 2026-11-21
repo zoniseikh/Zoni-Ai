@@ -7,6 +7,8 @@ import {
   upsertAssistantTurnMessage,
   upsertUserSpeechTurnMessage,
   getReconnectDelayMs,
+  shouldAutoReconnectLiveWs,
+  shouldUseHttpChatFallback,
 } from './liveSessionProtocol';
 import { ChatMessage } from '../types';
 
@@ -94,4 +96,20 @@ test('getReconnectDelayMs increases exponentially up to maxMs', () => {
   assert.equal(d0, 1000);
   assert.ok(d1 > d0);
   assert.equal(d10, 10000);
+});
+
+test('shouldAutoReconnectLiveWs stops on non-retryable auth/config errors and respects maxAttempts', () => {
+  assert.equal(shouldAutoReconnectLiveWs('GEMINI_KEY_MISSING', false, 0), false);
+  assert.equal(shouldAutoReconnectLiveWs('GEMINI_KEY_INVALID', undefined, 0), false);
+  assert.equal(shouldAutoReconnectLiveWs('BACKEND_URL_MISSING', undefined, 0), false);
+  assert.equal(shouldAutoReconnectLiveWs(undefined, true, 0, 5), true);
+  assert.equal(shouldAutoReconnectLiveWs(undefined, true, 5, 5), false);
+});
+
+test('shouldUseHttpChatFallback falls back unless Live WS is both OPEN and server-handshake ready', () => {
+  assert.equal(shouldUseHttpChatFallback(1, true, 'connected'), false);
+  assert.equal(shouldUseHttpChatFallback(1, false, 'connecting'), true);
+  assert.equal(shouldUseHttpChatFallback(0, false, 'connecting'), true);
+  assert.equal(shouldUseHttpChatFallback(3, false, 'error'), true);
+  assert.equal(shouldUseHttpChatFallback(undefined, false, 'disconnected'), true);
 });

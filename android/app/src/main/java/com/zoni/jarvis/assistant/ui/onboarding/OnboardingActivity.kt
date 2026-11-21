@@ -3,8 +3,6 @@ package com.zoni.jarvis.assistant.ui.onboarding
 import android.Manifest
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -42,25 +40,26 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.zoni.jarvis.assistant.ZoniApplication
+import com.zoni.jarvis.assistant.data.SecureKeyManager
 import com.zoni.jarvis.assistant.hardware.AndroidPermissionsSnapshot
 import com.zoni.jarvis.assistant.ui.theme.ZoniColors
 import com.zoni.jarvis.assistant.ui.theme.ZoniTheme
 import kotlinx.coroutines.launch
 
 /**
- * Genuine 3-Step Native Android Setup Wizard mirroring PermissionsSetupModal.tsx 100%:
- * - Step 1: Gemini API Key (EncryptedSharedPreferences)
- * - Step 2: Real Android Runtime Permissions (RECORD_AUDIO required + 9 optional)
+ * Genuine 3-Step Native Android Setup Wizard aligned with PermissionsSetupModal.tsx:
+ * - Step 1: Zoni Backend Server URL Configuration (Gemini API credentials stay strictly server-side)
+ * - Step 2: Real Android Runtime Permissions (RECORD_AUDIO required + optional phone permissions)
  * - Step 3: Real Android Background Availability System Screens (Battery, Overlay, Notification Listener, Accessibility, Default Assistant)
  */
 class OnboardingActivity : ComponentActivity() {
 
     private lateinit var app: ZoniApplication
+    private lateinit var keyManager: SecureKeyManager
     private var permissionsState by mutableStateOf<AndroidPermissionsSnapshot?>(null)
 
     private val requestPermissionsLauncher = registerForActivityResult(
@@ -72,22 +71,31 @@ class OnboardingActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         app = application as ZoniApplication
+        keyManager = SecureKeyManager(applicationContext)
         permissionsState = app.hardwareController.getPermissionsSnapshot()
 
         setContent {
             ZoniTheme {
                 OnboardingScreen(
-                    initialKey = app.preferences.getGeminiApiKey(),
+                    initialBackendUrl = keyManager.getBackendUrl(),
                     permissions = permissionsState ?: app.hardwareController.getPermissionsSnapshot(),
-                    onOpenAiStudioKeyPage = {
-                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://aistudio.google.com/app/apikey")))
-                    },
                     onReadClipboard = {
                         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                         cm?.primaryClip?.getItemAt(0)?.text?.toString()?.trim().orEmpty()
                     },
-                    onSaveKey = { key ->
-                        if (key.isNotBlank()) app.preferences.saveGeminiApiKey(key)
+                    onSaveBackendUrl = { url ->
+                        val clean = url.trim().trimEnd('/')
+                        if ((clean.startsWith("http://") || clean.startsWith("https://")) &&
+                            !clean.contains("appassets.androidplatform.net", ignoreCase = true)
+                        ) {
+                            keyManager.saveBackendUrl(clean)
+                            lifecycleScope.launch {
+                                app.preferences.setBackendServerUrl(clean)
+                            }
+                            true
+                        } else {
+                            false
+                        }
                     },
                     onRequestPermission = { perms ->
                         requestPermissionsLauncher.launch(perms)
@@ -101,6 +109,7 @@ class OnboardingActivity : ComponentActivity() {
                     onFinish = {
                         lifecycleScope.launch {
                             app.preferences.setOnboardingCompleted(true)
+                            keyManager.setOnboardingCompleted(true)
                             finish()
                         }
                     }
@@ -140,18 +149,18 @@ class OnboardingActivity : ComponentActivity() {
 
 @Composable
 private fun OnboardingScreen(
-    initialKey: String,
+    initialBackendUrl: String,
     permissions: AndroidPermissionsSnapshot,
-    onOpenAiStudioKeyPage: () -> Unit,
     onReadClipboard: () -> String,
-    onSaveKey: (String) -> Unit,
+    onSaveBackendUrl: (String) -> Boolean,
     onRequestPermission: (Array<String>) -> Unit,
     onRequestAllPermissions: () -> Unit,
     onOpenSystemScreen: (String) -> Unit,
     onFinish: () -> Unit
 ) {
     var step by remember { mutableIntStateOf(1) }
-    var apiKey by remember { mutableStateOf(initialKey) }
+    var backendUrl by remember { mutableStateOf(initialBackendUrl) }
+    var urlError by remember { mutableStateOf<String?>(null) }
 
     Column(
         modifier = Modifier
@@ -177,25 +186,27 @@ private fun OnboardingScreen(
         ) {
             when (step) {
                 1 -> {
-                    Text("Add your Gemini key", color = ZoniColors.Cyan50, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                     Text(
-                        "Zoni AI's voice and brain run on Gemini. Stored encrypted with AES-256 on your Android device (optional if using Zoni cloud server).",
+                        "Connect Zoni Backend Server",
+                        color = ZoniColors.Cyan50,
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        "Zoni AI connects to your hosted Express + WebSocket backend server. Gemini API credentials (GEMINI_API_KEY) remain strictly on the backend server and are never stored in this APK.",
                         color = ZoniColors.Slate400,
                         fontSize = 13.sp
                     )
-                    Button(
-                        onClick = onOpenAiStudioKeyPage,
-                        colors = ButtonDefaults.buttonColors(containerColor = ZoniColors.Cyan500)
-                    ) {
-                        Text("GET A FREE KEY", color = ZoniColors.Slate950, fontWeight = FontWeight.Bold)
-                    }
                     OutlinedTextField(
-                        value = apiKey,
-                        onValueChange = { apiKey = it },
+                        value = backendUrl,
+                        onValueChange = {
+                            backendUrl = it
+                            urlError = null
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        label = { Text("Your key goes here") },
+                        label = { Text("Backend Server URL (https://...)") },
+                        placeholder = { Text("https://your-zoni-backend.run.app") },
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = ZoniColors.Cyan400,
                             unfocusedBorderColor = ZoniColors.Slate800,
@@ -203,25 +214,40 @@ private fun OnboardingScreen(
                             unfocusedTextColor = ZoniColors.Cyan50
                         )
                     )
-                    OutlinedButton(onClick = { apiKey = onReadClipboard() }) {
-                        Text("PASTE FROM CLIPBOARD", color = ZoniColors.Pink300)
+                    if (urlError != null) {
+                        Text(
+                            text = urlError ?: "",
+                            color = ZoniColors.Rose400,
+                            fontSize = 12.sp
+                        )
+                    }
+                    OutlinedButton(onClick = {
+                        backendUrl = onReadClipboard()
+                        urlError = null
+                    }) {
+                        Text("PASTE SERVER URL", color = ZoniColors.Pink300)
                     }
                     Spacer(Modifier.height(10.dp))
                     Button(
                         onClick = {
-                            onSaveKey(apiKey)
-                            step = 2
+                            if (backendUrl.isBlank()) {
+                                urlError = "Please enter your deployed Zoni backend URL (https://...) or tap Skip to configure later."
+                            } else if (onSaveBackendUrl(backendUrl)) {
+                                step = 2
+                            } else {
+                                urlError = "Invalid URL. Use https:// or http:// (cannot be appassets.androidplatform.net)."
+                            }
                         },
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = ZoniColors.Pink500)
                     ) {
-                        Text("SAVE & CONTINUE", color = Color.White, fontWeight = FontWeight.Bold)
+                        Text("SAVE BACKEND URL & CONTINUE", color = Color.White, fontWeight = FontWeight.Bold)
                     }
                     OutlinedButton(
                         onClick = { step = 2 },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("SKIP FOR NOW (USE CLOUD RELAY)", color = ZoniColors.Slate400)
+                        Text("SKIP FOR NOW (CONFIGURE LATER)", color = ZoniColors.Slate400)
                     }
                 }
 

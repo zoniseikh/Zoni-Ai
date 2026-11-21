@@ -28,6 +28,7 @@ export const ControlDock: React.FC<ControlDockProps> = ({
 }) => {
   const [inputText, setInputText] = useState('');
   const [isDictating, setIsDictating] = useState(false);
+  const [dictationNotice, setDictationNotice] = useState<string | null>(null);
   const recognitionRef = useRef<any>(null);
 
   useEffect(() => {
@@ -59,7 +60,12 @@ export const ControlDock: React.FC<ControlDockProps> = ({
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
     if (!SpeechRecClass) {
-      setInputText('টাইপ করে মেসেজ পাঠান...');
+      const msg =
+        activeLanguage === 'bn-BD'
+          ? 'এই ব্রাউজারে স্পিচ ডিক্টেশন সাপোর্টেড নয় — অনুগ্রহ করে টাইপ করুন অথবা Gemini Live ভয়েস চালু করুন।'
+          : 'Browser speech dictation is not supported here — type your message or use Gemini Live Voice.';
+      setDictationNotice(msg);
+      setTimeout(() => setDictationNotice((cur) => (cur === msg ? null : cur)), 4500);
       return;
     }
 
@@ -116,18 +122,28 @@ export const ControlDock: React.FC<ControlDockProps> = ({
         <div className="flex flex-wrap items-center justify-between gap-3">
           {/* Primary Live Voice Mode Activation Button */}
           <button
+            type="button"
+            disabled={state === 'connecting' && !isLiveActive}
             onClick={() => {
               if (soundFxEnabled) playProceduralSfx('boot');
               onToggleLiveMode();
             }}
-            className={`flex-1 min-w-[200px] py-2.5 px-4 rounded-xl font-hud font-bold text-sm tracking-wider uppercase flex items-center justify-center gap-2.5 transition-all shadow-lg select-none ${
+            className={`flex-1 min-w-[200px] py-2.5 px-4 rounded-xl font-hud font-bold text-sm tracking-wider uppercase flex items-center justify-center gap-2.5 transition-all shadow-lg select-none disabled:opacity-70 disabled:cursor-wait ${
               isLiveActive
                 ? 'bg-rose-600 hover:bg-rose-500 text-white shadow-[0_0_25px_rgba(244,63,94,0.6)] border border-rose-400 animate-pulse'
+                : state === 'connecting'
+                ? 'bg-slate-800 text-cyan-200 border border-cyan-400/60'
                 : 'bg-gradient-to-r from-cyan-600 via-pink-600 to-cyan-500 hover:from-cyan-500 hover:via-pink-500 hover:to-cyan-400 text-white shadow-[0_0_25px_rgba(6,182,212,0.4)] border border-cyan-300'
             }`}
           >
-            <Radio className={`w-4 h-4 ${isLiveActive ? 'animate-spin' : 'animate-pulse'}`} />
-            <span>{isLiveActive ? 'END GEMINI LIVE CALL' : 'START GEMINI LIVE VOICE LINK'}</span>
+            <Radio className={`w-4 h-4 ${isLiveActive || state === 'connecting' ? 'animate-spin' : 'animate-pulse'}`} />
+            <span>
+              {isLiveActive
+                ? 'END GEMINI LIVE CALL'
+                : state === 'connecting'
+                ? 'CONNECTING GEMINI LIVE...'
+                : 'START GEMINI LIVE VOICE LINK'}
+            </span>
           </button>
 
           {/* Controls: Mic Mute & Interrupt */}
@@ -184,6 +200,7 @@ export const ControlDock: React.FC<ControlDockProps> = ({
           {/* Voice Command Dictation Button */}
           <button
             type="button"
+            aria-label={isDictating ? 'Stop voice dictation' : 'Start voice dictation'}
             onClick={handleToggleDictation}
             className={`p-2.5 rounded-xl border transition-all flex items-center justify-center ${
               isDictating
@@ -201,6 +218,7 @@ export const ControlDock: React.FC<ControlDockProps> = ({
 
           <button
             type="submit"
+            aria-label="Send message"
             disabled={!inputText.trim() || state === 'thinking'}
             className="p-2.5 rounded-xl bg-gradient-to-r from-cyan-600 to-pink-600 hover:from-cyan-500 hover:to-pink-500 disabled:opacity-40 disabled:cursor-not-allowed text-white shadow-[0_0_15px_rgba(6,182,212,0.3)] transition-all"
             title="Send Message"
@@ -208,6 +226,9 @@ export const ControlDock: React.FC<ControlDockProps> = ({
             <Send className="w-4 h-4" />
           </button>
         </form>
+        {dictationNotice && (
+          <p className="text-[11px] text-amber-300 font-hud px-1">{dictationNotice}</p>
+        )}
       </div>
     </div>
   );

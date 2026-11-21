@@ -68,6 +68,8 @@ export interface IncomingLiveWsMessage {
   resumed?: boolean;
   sessionId?: string;
   message?: string;
+  code?: string;
+  retryable?: boolean;
   timeLeft?: string;
 }
 
@@ -245,3 +247,37 @@ export function getReconnectDelayMs(attempt: number, baseMs = 1500, maxMs = 1500
   const delay = baseMs * Math.pow(1.6, safeAttempt);
   return Math.min(maxMs, Math.round(delay));
 }
+
+/**
+ * Determines whether the client should schedule an automatic WebSocket reconnect.
+ * Stops futile retry loops on non-retryable auth/config failures or after maxAttempts.
+ */
+export function shouldAutoReconnectLiveWs(
+  errorCode: string | undefined,
+  retryable: boolean | undefined,
+  attempt: number,
+  maxAttempts: number = 5
+): boolean {
+  if (retryable === false) return false;
+  if (errorCode === 'GEMINI_KEY_MISSING' || errorCode === 'GEMINI_KEY_INVALID' || errorCode === 'BACKEND_URL_MISSING') {
+    return false;
+  }
+  return attempt < maxAttempts;
+}
+
+/**
+ * Determines whether a typed chat message should immediately use the HTTP /api/chat
+ * fallback rather than waiting on an unavailable/failed Gemini Live WebSocket.
+ */
+export function shouldUseHttpChatFallback(
+  wsReadyState: number | undefined,
+  isSessionReady: boolean,
+  wsStatus: WsConnectionStatus
+): boolean {
+  const WS_OPEN = 1;
+  if (wsReadyState === WS_OPEN && isSessionReady && wsStatus === 'connected') {
+    return false;
+  }
+  return true;
+}
+

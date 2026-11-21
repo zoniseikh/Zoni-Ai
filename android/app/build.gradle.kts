@@ -21,6 +21,13 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+
+        val configuredBackendUrl = (System.getenv("ZONI_BACKEND_URL") ?: "")
+            .trim()
+            .trimEnd('/')
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+        buildConfigField("String", "ZONI_BACKEND_URL", "\"$configuredBackendUrl\"")
     }
 
     signingConfigs {

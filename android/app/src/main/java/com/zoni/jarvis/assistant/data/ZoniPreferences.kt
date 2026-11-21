@@ -10,6 +10,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import com.zoni.jarvis.assistant.BuildConfig
 import com.zoni.jarvis.assistant.domain.CompanionMode
 import com.zoni.jarvis.assistant.domain.SupportedLanguage
 import com.zoni.jarvis.assistant.domain.VoiceProfile
@@ -31,7 +32,7 @@ data class ZoniUserSettings(
     val backendServerUrl: String = DEFAULT_BACKEND_URL
 ) {
     companion object {
-        const val DEFAULT_BACKEND_URL = "https://ais-pre-5yp7pnjuvq2sy7cixzinuw-982211778522.asia-east1.run.app"
+        val DEFAULT_BACKEND_URL: String = BuildConfig.ZONI_BACKEND_URL
     }
 }
 
@@ -122,7 +123,9 @@ class ZoniPreferences(private val context: Context) {
 
     suspend fun setBackendServerUrl(url: String) {
         val clean = url.trim().trimEnd('/')
-        if (clean.startsWith("http://") || clean.startsWith("https://")) {
+        if ((clean.startsWith("http://") || clean.startsWith("https://")) &&
+            !clean.contains("appassets.androidplatform.net", ignoreCase = true)
+        ) {
             context.zoniDataStore.edit { it[Keys.BACKEND_URL] = clean }
         }
     }

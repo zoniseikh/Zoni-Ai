@@ -43,6 +43,8 @@ jobs:
           npm run lint
 
       - name: Build React Dashboard & Sync into Android Assets
+        env:
+          VITE_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL }}
         run: npm run android:sync
 
       # 3. Java 17 (compatible with AGP 8.5.2 & Gradle 8.7)
@@ -80,6 +82,8 @@ jobs:
 
       # 8. Build Debug APK (never requires signing secrets)
       - name: Build Debug APK
+        env:
+          ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL }}
         run: |
           ./android/gradlew -p android --no-daemon :app:assembleDebug --stacktrace
           test -f android/app/build/outputs/apk/debug/app-debug.apk
@@ -87,6 +91,8 @@ jobs:
 
       # 9. Build Release APK
       - name: Build Release APK
+        env:
+          ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL }}
         run: |
           ./android/gradlew -p android --no-daemon :app:assembleRelease --stacktrace
           ls -lh android/app/build/outputs/apk/release/

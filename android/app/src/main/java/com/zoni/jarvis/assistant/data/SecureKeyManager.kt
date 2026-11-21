@@ -30,12 +30,24 @@ class SecureKeyManager(context: Context) {
 
     fun saveBackendUrl(url: String) {
         val trimmed = url.trim().trimEnd('/')
-        securePrefs.edit().putString(KEY_BACKEND_URL, trimmed).apply()
+        if (trimmed.isBlank()) {
+            securePrefs.edit().remove(KEY_BACKEND_URL).apply()
+            return
+        }
+        if ((trimmed.startsWith("http://") || trimmed.startsWith("https://")) &&
+            !trimmed.contains("appassets.androidplatform.net", ignoreCase = true)
+        ) {
+            securePrefs.edit().putString(KEY_BACKEND_URL, trimmed).apply()
+        }
     }
 
     fun getBackendUrl(): String {
-        val saved = securePrefs.getString(KEY_BACKEND_URL, null)
-        return if (saved.isNullOrBlank()) DEFAULT_BACKEND_URL else saved
+        val saved = securePrefs.getString(KEY_BACKEND_URL, null)?.trim().orEmpty()
+        val candidate = if (saved.isBlank()) DEFAULT_BACKEND_URL else saved
+        if (candidate.contains("appassets.androidplatform.net", ignoreCase = true)) {
+            return ""
+        }
+        return candidate
     }
 
     fun saveResumptionHandle(handle: String?) {
@@ -80,6 +92,6 @@ class SecureKeyManager(context: Context) {
         private const val KEY_RESUMPTION_HANDLE = "zoni_live_resumption_handle"
         private const val KEY_GEMINI_API_KEY = "gemini_api_key_encrypted"
         private const val KEY_ONBOARDING_COMPLETED = "zoni_onboarding_completed"
-        const val DEFAULT_BACKEND_URL = ZoniUserSettings.DEFAULT_BACKEND_URL
+        val DEFAULT_BACKEND_URL: String = ZoniUserSettings.DEFAULT_BACKEND_URL
     }
 }

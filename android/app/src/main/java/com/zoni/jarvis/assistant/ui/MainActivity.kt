@@ -281,9 +281,15 @@ class MainActivity : ComponentActivity() {
 
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
-                                val quotedBackendUrl = JSONObject.quote(keyManager.getBackendUrl())
+                                val savedBackend = keyManager.getBackendUrl().trim()
+                                val hasValidBackend = (savedBackend.startsWith("http://") || savedBackend.startsWith("https://")) &&
+                                    !savedBackend.contains("appassets.androidplatform.net", ignoreCase = true)
+                                val quotedBackendUrl = JSONObject.quote(if (hasValidBackend) savedBackend else "")
                                 view?.evaluateJavascript(
-                                    "window.__ZONI_ANDROID_NATIVE__ = true; if (!localStorage.getItem('zoni_backend_url') && $quotedBackendUrl) { localStorage.setItem('zoni_backend_url', $quotedBackendUrl); }",
+                                    "window.__ZONI_ANDROID_NATIVE__ = true; " +
+                                        "if ($quotedBackendUrl && !localStorage.getItem('zoni_backend_url')) { " +
+                                        "localStorage.setItem('zoni_backend_url', $quotedBackendUrl); " +
+                                        "window.dispatchEvent(new CustomEvent('zoni:backend-url-updated')); }",
                                     null
                                 )
                             }

@@ -23,9 +23,14 @@ import {
   PhoneCall,
 } from 'lucide-react';
 
+import { WsConnectionStatus } from '../utils/liveSessionProtocol';
+import { BackendHealthSnapshot } from './ZoniSettingsModal';
+
 interface HudHeaderProps {
   vitals: SystemVitals;
   permissionsReport?: ChromePermissionsReport;
+  wsStatus?: WsConnectionStatus;
+  backendHealth?: BackendHealthSnapshot | null;
   onToggleSoundFx: () => void;
   onToggleChatDrawer: () => void;
   onOpenSettings?: () => void;
@@ -41,6 +46,8 @@ interface HudHeaderProps {
 export const HudHeader: React.FC<HudHeaderProps> = ({
   vitals,
   permissionsReport,
+  wsStatus = 'disconnected',
+  backendHealth,
   onToggleSoundFx,
   onToggleChatDrawer,
   onOpenSettings,
@@ -73,11 +80,63 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    if (!isLangMenuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setIsLangMenuOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isLangMenuOpen]);
+
   const handleHeartClick = () => {
     if (vitals.soundFxEnabled) {
       playProceduralSfx('heartbeat');
     }
   };
+
+  const liveBadge = (() => {
+    if (backendHealth?.checked && !backendHealth.reachable) {
+      return {
+        text: 'BACKEND OFFLINE',
+        cls: 'border-rose-500/40 text-rose-300',
+        icon: <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />,
+      };
+    }
+    if (backendHealth?.checked && !backendHealth.geminiConfigured) {
+      return {
+        text: 'KEY UNCONFIGURED',
+        cls: 'border-amber-500/40 text-amber-300',
+        icon: <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />,
+      };
+    }
+    if (wsStatus === 'connected') {
+      return {
+        text: 'GEMINI LIVE ONLINE',
+        cls: 'border-emerald-500/40 text-emerald-300',
+        icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />,
+      };
+    }
+    if (wsStatus === 'connecting' || wsStatus === 'reconnecting') {
+      return {
+        text: wsStatus === 'reconnecting' ? 'RECONNECTING...' : 'CONNECTING LIVE...',
+        cls: 'border-cyan-500/40 text-cyan-300',
+        icon: <Radio className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />,
+      };
+    }
+    if (wsStatus === 'error') {
+      return {
+        text: 'LIVE ERROR / CHAT MODE',
+        cls: 'border-amber-500/40 text-amber-300',
+        icon: <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />,
+      };
+    }
+    return {
+      text: 'LIVE STANDBY',
+      cls: 'border-cyan-500/30 text-cyan-300',
+      icon: <ShieldCheck className="w-3.5 h-3.5 text-cyan-400" />,
+    };
+  })();
 
   const getLanguageLabel = (code: SupportedLanguage) => {
     switch (code) {
@@ -118,7 +177,8 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
 
       {/* Center Jarvis Telemetry Bar (Hidden on tiny mobile screens) */}
       <div className="hidden lg:flex items-center gap-3 xl:gap-4 text-xs font-hud tracking-wider">
-        <div
+        <button
+          type="button"
           onClick={handleHeartClick}
           className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-900/60 border border-pink-500/30 cursor-pointer hover:border-pink-400 transition-colors"
           title={`Click to feel Zoni's heart beat for ${vitals.selectedAffectionName || vitals.userNickname || 'Boss'}`}
@@ -126,17 +186,22 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
           <Heart className="w-3.5 h-3.5 text-pink-500 animate-pulse" />
           <span className="text-pink-300 font-semibold">{vitals.heartRate} BPM</span>
           <span className="text-[9px] text-pink-400/70 font-mono">(IN LOVE)</span>
-        </div>
+        </button>
 
         <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-900/60 border border-cyan-500/30">
           <Activity className="w-3.5 h-3.5 text-cyan-400" />
           <span className="text-cyan-300 font-semibold">AFFECTION: {vitals.affectionLevel}%</span>
         </div>
 
-        <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-900/60 border border-cyan-500/30">
-          <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-          <span className="text-emerald-300 font-mono text-[11px]">GEMINI 3.8 LIVE</span>
-        </div>
+        <button
+          type="button"
+          onClick={() => onOpenPermissionsModal?.()}
+          className={`flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-900/60 border transition-colors hover:brightness-110 ${liveBadge.cls}`}
+          title="Click to inspect Backend & Gemini Live status"
+        >
+          {liveBadge.icon}
+          <span className="font-mono text-[11px]">{liveBadge.text}</span>
+        </button>
 
         <div
           className="px-2 py-1 font-mono text-[11px] text-cyan-400/80 bg-slate-900/40 rounded border border-cyan-500/20"

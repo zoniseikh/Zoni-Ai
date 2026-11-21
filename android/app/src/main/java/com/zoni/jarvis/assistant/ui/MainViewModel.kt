@@ -98,13 +98,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 if (!initializedConnection) {
                     initializedConnection = true
-                    liveClient.connect(
-                        backendBaseUrl = userSettings.backendServerUrl,
-                        mode = userSettings.activeMode,
-                        affectionName = userSettings.selectedAffectionName,
-                        voice = userSettings.selectedVoice,
-                        language = userSettings.activeLanguage
-                    )
+                    val backend = userSettings.backendServerUrl.trim()
+                    if ((backend.startsWith("http://") || backend.startsWith("https://")) &&
+                        !backend.contains("appassets.androidplatform.net", ignoreCase = true)
+                    ) {
+                        liveClient.connect(
+                            backendBaseUrl = backend,
+                            mode = userSettings.activeMode,
+                            affectionName = userSettings.selectedAffectionName,
+                            voice = userSettings.selectedVoice,
+                            language = userSettings.activeLanguage
+                        )
+                    } else {
+                        _uiState.update {
+                            it.copy(
+                                wsStatus = WsConnectionStatus.ERROR,
+                                latestTranscript = "Backend server URL is not configured. Open Setup or Settings to enter your deployed Zoni backend URL."
+                            )
+                        }
+                    }
                 }
             }
         }

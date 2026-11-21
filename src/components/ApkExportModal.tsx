@@ -49,7 +49,7 @@ import {
   loadAutoReplyConfig,
   saveAutoReplyConfig,
 } from '../utils/autoReplyRules';
-import { getApiBaseUrl } from '../utils/apiConfig';
+import { getApiBaseUrl, getBackendConfigError } from '../utils/apiConfig';
 import { playProceduralSfx } from '../utils/audio';
 
 interface ApkExportModalProps {
@@ -141,6 +141,11 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
 
   const handleAnalyzeScreen = async () => {
     if (soundFxEnabled) playProceduralSfx('click');
+    const configErr = getBackendConfigError();
+    if (configErr) {
+      setScreenAnalysis(configErr);
+      return;
+    }
     setIsAnalyzingScreen(true);
     setActionFeedback('');
     try {
@@ -195,6 +200,11 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
 
   const handleGenerateSmartReply = async (item: NativeNotificationItem) => {
     if (soundFxEnabled) playProceduralSfx('click');
+    const configErr = getBackendConfigError();
+    if (configErr) {
+      setActionFeedback(configErr);
+      return;
+    }
     setIsGeneratingReply(true);
     try {
       const res = await fetch(`${getApiBaseUrl()}/api/notifications/smart-reply`, {
@@ -266,35 +276,37 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md p-3 sm:p-5 overflow-y-auto">
-      <div className="w-full max-w-2xl bg-slate-950 border border-cyan-500/40 rounded-2xl shadow-[0_0_60px_rgba(6,182,212,0.3)] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200 my-auto">
+    <div className="zoni-modal-backdrop bg-black/75 backdrop-blur-md" role="dialog" aria-modal="true" aria-label="Android Native APK and Assistant Hub">
+      <div className="zoni-modal-card max-w-2xl bg-slate-950 border border-cyan-500/40 rounded-2xl shadow-[0_0_60px_rgba(6,182,212,0.3)] animate-in fade-in zoom-in-95 duration-200">
         {/* Header */}
-        <div className="flex items-center justify-between p-4 sm:p-5 border-b border-cyan-500/20 bg-slate-900/60">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-cyan-950/80 border border-cyan-400/50 flex items-center justify-center text-cyan-400">
+        <div className="shrink-0 flex items-center justify-between p-4 sm:p-5 border-b border-cyan-500/20 bg-slate-900/60">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-9 h-9 shrink-0 rounded-xl bg-cyan-950/80 border border-cyan-400/50 flex items-center justify-center text-cyan-400">
               <Smartphone className="w-5 h-5" />
             </div>
-            <div>
-              <h2 className="font-sci-fi text-base font-bold text-cyan-200 tracking-wide">
+            <div className="min-w-0">
+              <h2 className="font-sci-fi text-base font-bold text-cyan-200 tracking-wide truncate">
                 ANDROID NATIVE APK &amp; ASSISTANT HUB
               </h2>
-              <p className="text-xs font-hud text-pink-400">
+              <p className="text-xs font-hud text-pink-400 truncate">
                 পূর্ণাঙ্গ নেটিভ Android Kotlin/Compose অ্যাপ এবং মোবাইল অ্যাসিস্ট্যান্ট (APK)
               </p>
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
             aria-label="Close Android Hub"
-            className="p-1.5 rounded-lg border border-cyan-500/30 text-cyan-400 hover:bg-cyan-950/50 transition-colors"
+            className="shrink-0 p-1.5 rounded-lg border border-cyan-500/30 text-cyan-400 hover:bg-cyan-950/50 transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
         {/* Tab Switcher */}
-        <div className="flex border-b border-cyan-500/20 bg-slate-900/30 px-4 pt-2 gap-2 text-xs font-hud tracking-wider overflow-x-auto">
+        <div className="shrink-0 flex border-b border-cyan-500/20 bg-slate-900/30 px-4 pt-2 gap-2 text-xs font-hud tracking-wider overflow-x-auto">
           <button
+            type="button"
             onClick={() => setActiveTab('apk')}
             className={`pb-2.5 px-3 font-semibold border-b-2 transition-all shrink-0 ${
               activeTab === 'apk'
@@ -305,6 +317,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
             📱 1. BUILD APK / INSTALL
           </button>
           <button
+            type="button"
             onClick={() => setActiveTab('actions')}
             className={`pb-2.5 px-3 font-semibold border-b-2 transition-all shrink-0 ${
               activeTab === 'actions'
@@ -315,6 +328,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
             ⚡ 2. MOBILE ASSISTANT ACTIONS
           </button>
           <button
+            type="button"
             onClick={() => setActiveTab('permissions')}
             className={`pb-2.5 px-3 font-semibold border-b-2 transition-all shrink-0 ${
               activeTab === 'permissions'
@@ -327,7 +341,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
         </div>
 
         {/* Tab Body */}
-        <div className="p-4 sm:p-6 overflow-y-auto max-h-[70vh] space-y-4">
+        <div className="zoni-modal-scroll p-4 sm:p-6 space-y-4">
           {activeTab === 'apk' && (
             <div className="space-y-4">
               {/* Build Metadata & GitHub Actions Pipeline Banner */}
@@ -868,13 +882,14 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`}
         </div>
 
         {/* Footer */}
-        <div className="p-3 sm:p-4 border-t border-cyan-500/20 bg-slate-900/60 flex items-center justify-between">
-          <span className="text-[11px] font-hud text-cyan-400/80">
-            ZONI JARVIS ASSISTANT // ANDROID CAPACITOR READY
+        <div className="shrink-0 p-3 sm:p-4 border-t border-cyan-500/20 bg-slate-900/60 flex items-center justify-between gap-2">
+          <span className="text-[11px] font-hud text-cyan-400/80 truncate">
+            ZONI JARVIS ASSISTANT // ANDROID NATIVE READY
           </span>
           <button
+            type="button"
             onClick={onClose}
-            className="px-4 py-1.5 rounded-lg bg-cyan-600/80 hover:bg-cyan-500 text-white font-hud text-xs tracking-wider"
+            className="shrink-0 px-4 py-1.5 rounded-lg bg-cyan-600/80 hover:bg-cyan-500 text-white font-hud text-xs tracking-wider"
           >
             CLOSE
           </button>

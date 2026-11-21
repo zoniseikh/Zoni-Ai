@@ -6,8 +6,9 @@ import { ControlDock } from './components/ControlDock';
 import { ChatTranscriptDrawer } from './components/ChatTranscriptDrawer';
 import { ApkExportModal } from './components/ApkExportModal';
 import { PermissionsSetupModal } from './components/PermissionsSetupModal';
-import { ZoniSettingsModal } from './components/ZoniSettingsModal';
+import { ZoniSettingsModal, BackendHealthSnapshot } from './components/ZoniSettingsModal';
 import { SimCallingModal } from './components/SimCallingModal';
+import { AlertTriangle, RefreshCw, Settings2, X } from 'lucide-react';
 import { OfflineIndicator } from './components/PWAInstallButton';
 import {
   LiveAudioPlayer,
@@ -38,7 +39,12 @@ import {
   ChromePermissionsReport,
   requestMicrophoneAccess,
 } from './utils/permissionManager';
-import { getApiBaseUrl, getLiveWsUrl } from './utils/apiConfig';
+import {
+  getApiBaseUrl,
+  getLiveWsUrl,
+  getBackendConfigError,
+  getDisplayBackendUrl,
+} from './utils/apiConfig';
 import {
   callContactViaNativeBridge,
   prepareWhatsAppContactViaNativeBridge,
@@ -57,6 +63,8 @@ import {
   upsertAssistantTurnMessage,
   upsertUserSpeechTurnMessage,
   getReconnectDelayMs,
+  shouldAutoReconnectLiveWs,
+  shouldUseHttpChatFallback,
 } from './utils/liveSessionProtocol';
 
 export default function App() {
@@ -65,6 +73,8 @@ export default function App() {
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [wsStatus, setWsStatus] = useState<WsConnectionStatus>('disconnected');
   const [sessionResumed, setSessionResumed] = useState<boolean>(false);
+  const [backendHealth, setBackendHealth] = useState<BackendHealthSnapshot | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
   // Initialize global selectedAffectionName from localStorage, defaulting to "Boss" on first launch
   const [selectedAffectionName, setSelectedAffectionName] = useState<string>(() => {
@@ -127,21 +137,42 @@ export default function App() {
   });
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
 
-  const [vitals, setVitals] = useState<SystemVitals>({
-    heartRate: 74,
-    affectionLevel: 100,
-    syncRate: 99.8,
-    batteryCore: 99,
-    activeMode: 'romantic',
-    selectedAffectionName: 'Boss',
-    userNickname: 'Boss',
-    selectedVoice: 'Kore',
-    soundFxEnabled: true,
-    totalInteractions: 3,
-    loveUnlockedPoints: 120,
-    activeLanguage: 'bn-BD',
-    voiceAutoPlay: true,
-    voiceMuted: false,
+  const [vitals, setVitals] = useState<SystemVitals>(() => {
+    let savedMode: CompanionMode = 'romantic';
+    let savedVoice = 'Kore';
+    let savedSfx = true;
+    let savedName = 'Boss';
+    let savedLang: SupportedLanguage = 'bn-BD';
+    if (typeof window !== 'undefined') {
+      const m = localStorage.getItem('zoni_companion_mode');
+      if (m === 'romantic' || m === 'jarvis_gf' || m === 'playful' || m === 'late_night') {
+        savedMode = m;
+      }
+      const v = localStorage.getItem('zoni_selected_voice');
+      if (v && v.trim()) savedVoice = v.trim();
+      const sfx = localStorage.getItem('zoni_sound_fx_enabled');
+      if (sfx !== null) savedSfx = sfx !== 'false';
+      const n = localStorage.getItem('zoni_selected_affection_name');
+      if (n && n.trim()) savedName = n.trim();
+      const l = localStorage.getItem('zoni_active_language');
+      if (l === 'bn-BD' || l === 'hi-IN' || l === 'en-US') savedLang = l;
+    }
+    return {
+      heartRate: 74,
+      affectionLevel: 100,
+      syncRate: 99.8,
+      batteryCore: 99,
+      activeMode: savedMode,
+      selectedAffectionName: savedName,
+      userNickname: savedName,
+      selectedVoice: savedVoice,
+      soundFxEnabled: savedSfx,
+      totalInteractions: 3,
+      loveUnlockedPoints: 120,
+      activeLanguage: savedLang,
+      voiceAutoPlay: true,
+      voiceMuted: false,
+    };
   });
 
   // Sync vitals with top-level state
@@ -176,6 +207,13 @@ export default function App() {
   // Shared WebSocket & Audio refs (using useRef to avoid stale closures inside callbacks)
   const liveAudioPlayerRef = useRef<LiveAudioPlayer | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const wsConnectPromiseRef = useRef<Promise<void> | null>(null);
+  const wsHandshakeResolverRef = useRef<{
+    resolve: () => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
+  const liveNonRetryableErrorRef = useRef<string | null>(null);
   const isSessionReadyRef = useRef<boolean>(false);
   const resumptionHandleRef = useRef<string | undefined>(undefined);
   const hadConnectedOnceRef = useRef<boolean>(false);
@@ -184,6 +222,13 @@ export default function App() {
   const turnTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const outgoingQueueRef = useRef<string[]>([]);
   const isUnmountedRef = useRef<boolean>(false);
+  const pendingChatFallbackRef = useRef<{
+    clientMsgId: string;
+    text: string;
+    historySnapshot: Array<{ role: 'user' | 'assistant'; text: string }>;
+    answered: boolean;
+    fallbackStarted: boolean;
+  } | null>(null);
 
   const currentTurnIdRef = useRef<number>(1);
   const userSpeechTurnIdRef = useRef<number>(1);
@@ -195,6 +240,8 @@ export default function App() {
   const lastFlashlightActionRef = useRef<{ payload: string; time: number } | null>(null);
 
   // Latest state refs for WebSocket / Audio callbacks
+  const messagesRef = useRef<ChatMessage[]>(messages);
+  const wsStatusRef = useRef<WsConnectionStatus>(wsStatus);
   const isLiveActiveRef = useRef(isLiveActive);
   const isMicMutedRef = useRef(isMicMuted);
   const voiceMutedRef = useRef(voiceMuted);
@@ -204,6 +251,12 @@ export default function App() {
   const activeModeRef = useRef<CompanionMode>(vitals.activeMode);
   const selectedVoiceRef = useRef<string>(vitals.selectedVoice);
 
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+  useEffect(() => {
+    wsStatusRef.current = wsStatus;
+  }, [wsStatus]);
   useEffect(() => {
     isLiveActiveRef.current = isLiveActive;
   }, [isLiveActive]);
@@ -245,8 +298,86 @@ export default function App() {
     }
   }, []);
 
+  const settlePendingHandshake = useCallback((error?: Error) => {
+    const pending = wsHandshakeResolverRef.current;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    wsHandshakeResolverRef.current = null;
+    wsConnectPromiseRef.current = null;
+    if (error) {
+      pending.reject(error);
+    } else {
+      pending.resolve();
+    }
+  }, []);
+
+  // Probe live backend health & server-side Gemini API key status
+  const checkBackendHealth = useCallback(async (): Promise<BackendHealthSnapshot> => {
+    const backendUrl = getDisplayBackendUrl();
+    const configError = getBackendConfigError();
+    if (configError) {
+      const snap: BackendHealthSnapshot = {
+        checked: true,
+        reachable: false,
+        geminiConfigured: false,
+        statusText: 'UNCONFIGURED',
+        configurationError: configError,
+        backendUrl,
+      };
+      setBackendHealth(snap);
+      setConnectionError(configError);
+      setWsStatus('error');
+      return snap;
+    }
+
+    try {
+      const base = getApiBaseUrl();
+      const res = await fetch(`${base}/api/status`, { cache: 'no-store' });
+      const data = await res.json().catch(() => ({}));
+      const geminiConfigured = Boolean(data.geminiConfigured);
+      const errMsg =
+        data.configurationError ||
+        (!res.ok ? `Backend returned HTTP ${res.status}` : null);
+      const snap: BackendHealthSnapshot = {
+        checked: true,
+        reachable: res.ok,
+        geminiConfigured,
+        statusText: res.ok
+          ? geminiConfigured
+            ? 'ONLINE (READY)'
+            : 'DEGRADED (KEY MISSING)'
+          : 'OFFLINE',
+        configurationError: errMsg,
+        backendUrl,
+      };
+      setBackendHealth(snap);
+      if (!snap.reachable || !snap.geminiConfigured) {
+        setConnectionError(errMsg || 'ZONI backend requires configuration.');
+      } else {
+        setConnectionError((prev) =>
+          prev && prev.includes('Backend') ? null : prev
+        );
+      }
+      return snap;
+    } catch (err: any) {
+      const message =
+        err?.message || 'Unable to reach the ZONI AI backend server.';
+      const snap: BackendHealthSnapshot = {
+        checked: true,
+        reachable: false,
+        geminiConfigured: false,
+        statusText: 'OFFLINE',
+        configurationError: message,
+        backendUrl,
+      };
+      setBackendHealth(snap);
+      setConnectionError(message);
+      return snap;
+    }
+  }, []);
+
   // Stop only microphone audio capture while keeping the shared Gemini Live WebSocket session open
-  const stopVoiceCapture = useCallback(() => {
+  const stopVoiceCapture = useCallback((preserveErrorState = false) => {
     if (scriptProcessorRef.current) {
       try {
         scriptProcessorRef.current.disconnect();
@@ -269,21 +400,182 @@ export default function App() {
     }
     setIsLiveActive(false);
     isLiveActiveRef.current = false;
-    setAssistantState('idle');
+    if (!preserveErrorState) {
+      setAssistantState('idle');
+    }
   }, []);
 
-  // Connect or reuse the single shared Gemini Live WebSocket session
+  // Reliable HTTP /api/chat fallback whenever Gemini Live WebSocket is unavailable, disconnected, or times out
+  const sendViaHttpChatFallback = useCallback(
+    async (
+      cleanText: string,
+      clientMsgId: string,
+      historySnapshot: Array<{ role: 'user' | 'assistant'; text: string }>
+    ) => {
+      clearTurnTimeout();
+      const pending = pendingChatFallbackRef.current;
+      if (pending && pending.clientMsgId === clientMsgId) {
+        if (pending.answered || pending.fallbackStarted) return;
+        pending.fallbackStarted = true;
+      }
+
+      const configError = getBackendConfigError();
+      if (configError) {
+        setConnectionError(configError);
+        setLatestTranscript(configError);
+        setAssistantState('error');
+        setMessages((prev) => {
+          if (prev.some((m) => m.id === `${clientMsgId}-error`)) return prev;
+          return [
+            ...prev,
+            {
+              id: `${clientMsgId}-error`,
+              role: 'assistant',
+              text: configError,
+              timestamp: new Date(),
+              lang: activeLanguageRef.current,
+            },
+          ];
+        });
+        return;
+      }
+
+      try {
+        const base = getApiBaseUrl();
+        const res = await fetch(`${base}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: cleanText,
+            history: historySnapshot,
+            mode: activeModeRef.current,
+            nickname: selectedAffectionNameRef.current,
+            selectedAffectionName: selectedAffectionNameRef.current,
+            lang: activeLanguageRef.current,
+          }),
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const errMessage =
+            data?.error ||
+            `ZONI AI backend error (HTTP ${res.status}). Check server GEMINI_API_KEY configuration.`;
+          setConnectionError(errMessage);
+          setLatestTranscript(errMessage);
+          setAssistantState('error');
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === `${clientMsgId}-error`)) return prev;
+            return [
+              ...prev,
+              {
+                id: `${clientMsgId}-error`,
+                role: 'assistant',
+                text: `Error: ${errMessage}`,
+                timestamp: new Date(),
+                lang: activeLanguageRef.current,
+              },
+            ];
+          });
+          return;
+        }
+
+        const rawReply = typeof data.reply === 'string' ? data.reply.trim() : '';
+        if (!rawReply) {
+          throw new Error('Empty response returned by /api/chat.');
+        }
+
+        const { cleanText: replyClean, action } = extractActionTagFromText(rawReply);
+        if (action) {
+          executeAssistantActionDirectly(action);
+        }
+        const finalReply = replyClean || rawReply;
+
+        if (pendingChatFallbackRef.current?.clientMsgId === clientMsgId) {
+          pendingChatFallbackRef.current.answered = true;
+        }
+
+        setMessages((prev) => {
+          if (prev.some((m) => m.id === `${clientMsgId}-http-reply`)) return prev;
+          return [
+            ...prev,
+            {
+              id: `${clientMsgId}-http-reply`,
+              role: 'assistant',
+              text: finalReply,
+              timestamp: new Date(),
+              lang: activeLanguageRef.current,
+            },
+          ];
+        });
+        setLatestTranscript(finalReply);
+        setVitals((prev) => ({
+          ...prev,
+          totalInteractions: prev.totalInteractions + 1,
+          affectionLevel: Math.min(100, prev.affectionLevel + 1),
+        }));
+        if (!liveNonRetryableErrorRef.current) {
+          setConnectionError(null);
+        }
+        setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
+      } catch (err: any) {
+        const errMessage =
+          err?.message ||
+          'Failed to reach ZONI AI backend (/api/chat). Please verify your server connection.';
+        setConnectionError(errMessage);
+        setLatestTranscript(errMessage);
+        setAssistantState('error');
+        setMessages((prev) => {
+          if (prev.some((m) => m.id === `${clientMsgId}-error`)) return prev;
+          return [
+            ...prev,
+            {
+              id: `${clientMsgId}-error`,
+              role: 'assistant',
+              text: `Error: ${errMessage}`,
+              timestamp: new Date(),
+              lang: activeLanguageRef.current,
+            },
+          ];
+        });
+      }
+    },
+    [clearTurnTimeout]
+  );
+
+  // Connect or reuse the single shared Gemini Live WebSocket session, resolving ONLY after server 'connected' handshake
   const connectSharedLiveWs = useCallback(
-    (forceReconnect = false) => {
-      if (isUnmountedRef.current) return;
+    (forceReconnect = false): Promise<void> => {
+      if (isUnmountedRef.current) {
+        return Promise.reject(new Error('Component unmounted'));
+      }
+
+      const configError = getBackendConfigError();
+      if (configError) {
+        setWsStatus('error');
+        setConnectionError(configError);
+        if (isLiveActiveRef.current) {
+          stopVoiceCapture(true);
+          setAssistantState('error');
+        }
+        return Promise.reject(new Error(configError));
+      }
+
+      if (forceReconnect) {
+        liveNonRetryableErrorRef.current = null;
+        reconnectAttemptRef.current = 0;
+      }
 
       if (
         !forceReconnect &&
         wsRef.current &&
-        (wsRef.current.readyState === WebSocket.OPEN ||
-          wsRef.current.readyState === WebSocket.CONNECTING)
+        wsRef.current.readyState === WebSocket.OPEN &&
+        isSessionReadyRef.current
       ) {
-        return;
+        return Promise.resolve();
+      }
+
+      if (!forceReconnect && wsConnectPromiseRef.current) {
+        return wsConnectPromiseRef.current;
       }
 
       if (reconnectTimerRef.current) {
@@ -291,9 +583,12 @@ export default function App() {
         reconnectTimerRef.current = null;
       }
 
+      settlePendingHandshake(new Error('Replaced by newer Live WebSocket connection attempt.'));
+
       if (wsRef.current) {
         try {
           wsRef.current.onclose = null;
+          wsRef.current.onerror = null;
           wsRef.current.close();
         } catch {
           // ignore
@@ -312,220 +607,352 @@ export default function App() {
         resumptionHandleRef.current
       );
 
-      try {
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
+      if (!wsUrl) {
+        const errText =
+          getBackendConfigError() || 'Backend WebSocket URL is not configured.';
+        setWsStatus('error');
+        setConnectionError(errText);
+        return Promise.reject(new Error(errText));
+      }
 
-        ws.onopen = () => {
-          if (isUnmountedRef.current || wsRef.current !== ws) return;
-          // Wait for server 'connected' event confirming Gemini Live upstream handshake
+      const connectPromise = new Promise<void>((resolve, reject) => {
+        const handshakeTimer = setTimeout(() => {
+          if (wsHandshakeResolverRef.current) {
+            const timeoutErr = new Error(
+              'Timed out waiting for Gemini Live server handshake (/live).'
+            );
+            setWsStatus('error');
+            setConnectionError(timeoutErr.message);
+            settlePendingHandshake(timeoutErr);
+          }
+        }, 12000);
+
+        wsHandshakeResolverRef.current = {
+          resolve,
+          reject,
+          timer: handshakeTimer,
         };
 
-        ws.onmessage = (event) => {
-          if (isUnmountedRef.current || wsRef.current !== ws) return;
-          try {
-            const msg = JSON.parse(event.data);
+        try {
+          const ws = new WebSocket(wsUrl);
+          wsRef.current = ws;
 
-            if (msg.type === 'connected') {
-              isSessionReadyRef.current = true;
-              reconnectAttemptRef.current = 0;
-              setWsStatus('connected');
-              const wasResumed = Boolean(msg.resumed);
-              setSessionResumed(wasResumed);
+          ws.onopen = () => {
+            if (isUnmountedRef.current || wsRef.current !== ws) return;
+            // Wait for server 'connected' event confirming Gemini Live upstream handshake
+          };
 
-              if (hadConnectedOnceRef.current && !wasResumed && outgoingQueueRef.current.length === 0) {
-                // Truthfully notify if reconnection started a fresh Live session
-                const freshNotice =
-                  activeLanguageRef.current === 'bn-BD'
-                    ? `নতুন Gemini Live সেশন সংযুক্ত হয়েছে ${selectedAffectionNameRef.current}!`
-                    : `Connected to a new Gemini Live session, ${selectedAffectionNameRef.current}!`;
-                setLatestTranscript(freshNotice);
-              }
-              hadConnectedOnceRef.current = true;
+          ws.onmessage = (event) => {
+            if (isUnmountedRef.current || wsRef.current !== ws) return;
+            try {
+              const msg = JSON.parse(event.data);
 
-              // Flush any queued messages (e.g. typed Chat Box messages sent while connecting)
-              while (outgoingQueueRef.current.length > 0 && ws.readyState === WebSocket.OPEN) {
-                const queuedPayload = outgoingQueueRef.current.shift();
-                if (queuedPayload) {
-                  ws.send(queuedPayload);
+              if (msg.type === 'connected') {
+                isSessionReadyRef.current = true;
+                reconnectAttemptRef.current = 0;
+                liveNonRetryableErrorRef.current = null;
+                setWsStatus('connected');
+                setConnectionError(null);
+                const wasResumed = Boolean(msg.resumed);
+                setSessionResumed(wasResumed);
+                settlePendingHandshake();
+
+                if (
+                  hadConnectedOnceRef.current &&
+                  !wasResumed &&
+                  outgoingQueueRef.current.length === 0
+                ) {
+                  const freshNotice =
+                    activeLanguageRef.current === 'bn-BD'
+                      ? `নতুন Gemini Live সেশন সংযুক্ত হয়েছে ${selectedAffectionNameRef.current}!`
+                      : `Connected to a new Gemini Live session, ${selectedAffectionNameRef.current}!`;
+                  setLatestTranscript(freshNotice);
                 }
+                hadConnectedOnceRef.current = true;
+
+                // Flush any queued messages (e.g. typed Chat Box messages sent while connecting)
+                while (
+                  outgoingQueueRef.current.length > 0 &&
+                  ws.readyState === WebSocket.OPEN
+                ) {
+                  const queuedPayload = outgoingQueueRef.current.shift();
+                  if (queuedPayload) {
+                    ws.send(queuedPayload);
+                  }
+                }
+                return;
               }
-              return;
-            }
 
-            if (msg.type === 'session_resumption') {
-              if (msg.newHandle && typeof msg.newHandle === 'string') {
-                resumptionHandleRef.current = msg.newHandle;
+              if (msg.type === 'session_resumption') {
+                if (msg.newHandle && typeof msg.newHandle === 'string') {
+                  resumptionHandleRef.current = msg.newHandle;
+                }
+                return;
               }
-              return;
-            }
 
-            if (msg.type === 'flashlight') {
-              const turnOn = Boolean(msg.enable);
-              toggleFlashlight(turnOn);
-              const feedback =
-                activeLanguageRef.current === 'bn-BD'
-                  ? turnOn
-                    ? 'টর্চ লাইট জ্বালানো হয়েছে।'
-                    : 'টর্চ লাইট বন্ধ করা হয়েছে।'
-                  : turnOn
-                  ? 'Flashlight turned on.'
-                  : 'Flashlight turned off.';
-              setLatestTranscript(feedback);
-              return;
-            }
-
-            if (msg.type === 'user_transcript' && msg.text) {
-              const speechTurnId =
-                typeof msg.turnId === 'number' ? msg.turnId : userSpeechTurnIdRef.current;
-
-              // Add or update spoken user message in the shared conversation feed
-              setMessages((prev) =>
-                upsertUserSpeechTurnMessage(prev, msg.text, speechTurnId, activeLanguageRef.current)
-              );
-
-              if (isFlashlightOnCommand(msg.text)) {
-                toggleFlashlight(true);
+              if (msg.type === 'flashlight') {
+                const turnOn = Boolean(msg.enable);
+                toggleFlashlight(turnOn);
                 const feedback =
                   activeLanguageRef.current === 'bn-BD'
-                    ? 'টর্চ লাইট জ্বালানো হয়েছে।'
-                    : 'Flashlight turned on.';
-                setLatestTranscript(feedback);
-              } else if (isFlashlightOffCommand(msg.text)) {
-                toggleFlashlight(false);
-                const feedback =
-                  activeLanguageRef.current === 'bn-BD'
-                    ? 'টর্চ লাইট বন্ধ করা হয়েছে।'
+                    ? turnOn
+                      ? 'টর্চ লাইট জ্বালানো হয়েছে।'
+                      : 'টর্চ লাইট বন্ধ করা হয়েছে।'
+                    : turnOn
+                    ? 'Flashlight turned on.'
                     : 'Flashlight turned off.';
                 setLatestTranscript(feedback);
-              }
-              return;
-            }
-
-            if (msg.type === 'audio' && msg.audio) {
-              clearTurnTimeout();
-              receivedAudioInTurnRef.current = true;
-              if (!voiceMutedRef.current && (isLiveActiveRef.current || voiceAutoPlayRef.current)) {
-                setAssistantState('speaking');
-                liveAudioPlayerRef.current?.playPcmChunk(msg.audio, 24000);
-              }
-              return;
-            }
-
-            if ((msg.type === 'output_transcript' || msg.type === 'text') && msg.text) {
-              clearTurnTimeout();
-              const turnId =
-                typeof msg.turnId === 'number' ? msg.turnId : currentTurnIdRef.current;
-
-              // Directly execute supported hardware/assistant action tags without intermediate popup
-              const { cleanText, action } = extractActionTagFromText(msg.text);
-              if (action) {
-                executeAssistantActionDirectly(action);
+                return;
               }
 
-              // Check language switch command
-              const liveLangSwitch = detectLanguageSwitchCommand(
-                cleanText || msg.text,
-                selectedAffectionNameRef.current
-              );
-              if (liveLangSwitch && liveLangSwitch.lang !== activeLanguageRef.current) {
-                setActiveLanguage(liveLangSwitch.lang);
-                localStorage.setItem('zoni_active_language', liveLangSwitch.lang);
-              }
+              if (msg.type === 'user_transcript' && msg.text) {
+                const speechTurnId =
+                  typeof msg.turnId === 'number'
+                    ? msg.turnId
+                    : userSpeechTurnIdRef.current;
 
-              // Upsert assistant message for this turnId so audio + text parts never duplicate
-              setMessages((prev) => {
-                const { messages: updated, latestFullText } = upsertAssistantTurnMessage(
-                  prev,
-                  msg.text,
-                  turnId,
-                  activeLanguageRef.current
+                setMessages((prev) =>
+                  upsertUserSpeechTurnMessage(
+                    prev,
+                    msg.text,
+                    speechTurnId,
+                    activeLanguageRef.current
+                  )
                 );
-                if (latestFullText) {
-                  setLatestTranscript(latestFullText);
+
+                if (isFlashlightOnCommand(msg.text)) {
+                  toggleFlashlight(true);
+                  const feedback =
+                    activeLanguageRef.current === 'bn-BD'
+                      ? 'টর্চ লাইট জ্বালানো হয়েছে।'
+                      : 'Flashlight turned on.';
+                  setLatestTranscript(feedback);
+                } else if (isFlashlightOffCommand(msg.text)) {
+                  toggleFlashlight(false);
+                  const feedback =
+                    activeLanguageRef.current === 'bn-BD'
+                      ? 'টর্চ লাইট বন্ধ করা হয়েছে।'
+                      : 'Flashlight turned off.';
+                  setLatestTranscript(feedback);
                 }
-                return updated;
-              });
+                return;
+              }
 
-              return;
-            }
+              if (msg.type === 'audio' && msg.audio) {
+                clearTurnTimeout();
+                receivedAudioInTurnRef.current = true;
+                if (pendingChatFallbackRef.current) {
+                  pendingChatFallbackRef.current.answered = true;
+                }
+                if (
+                  !voiceMutedRef.current &&
+                  (isLiveActiveRef.current || voiceAutoPlayRef.current)
+                ) {
+                  setAssistantState('speaking');
+                  liveAudioPlayerRef.current?.playPcmChunk(msg.audio, 24000);
+                }
+                return;
+              }
 
-            if (msg.type === 'interrupted') {
-              clearTurnTimeout();
-              stopAllSpeechPlayback();
-              receivedAudioInTurnRef.current = false;
-              currentTurnIdRef.current =
-                typeof msg.turnId === 'number' ? msg.turnId + 1 : currentTurnIdRef.current + 1;
-              setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
-              return;
-            }
+              if ((msg.type === 'output_transcript' || msg.type === 'text') && msg.text) {
+                clearTurnTimeout();
+                if (pendingChatFallbackRef.current) {
+                  pendingChatFallbackRef.current.answered = true;
+                }
+                const turnId =
+                  typeof msg.turnId === 'number'
+                    ? msg.turnId
+                    : currentTurnIdRef.current;
 
-            if (msg.type === 'turnComplete') {
-              clearTurnTimeout();
-              const completedTurnId =
-                typeof msg.turnId === 'number' ? msg.turnId : currentTurnIdRef.current;
-              currentTurnIdRef.current = completedTurnId + 1;
-              userSpeechTurnIdRef.current += 1;
+                const { cleanText, action } = extractActionTagFromText(msg.text);
+                if (action) {
+                  executeAssistantActionDirectly(action);
+                }
 
-              // Reset per-turn audio tracking flag; genuine Gemini Live audio is decoded and streamed directly
-              receivedAudioInTurnRef.current = false;
+                const liveLangSwitch = detectLanguageSwitchCommand(
+                  cleanText || msg.text,
+                  selectedAffectionNameRef.current
+                );
+                if (
+                  liveLangSwitch &&
+                  liveLangSwitch.lang !== activeLanguageRef.current
+                ) {
+                  setActiveLanguage(liveLangSwitch.lang);
+                  localStorage.setItem('zoni_active_language', liveLangSwitch.lang);
+                }
 
-              setVitals((prev) => ({
-                ...prev,
-                totalInteractions: prev.totalInteractions + 1,
-                affectionLevel: Math.min(100, prev.affectionLevel + 1),
-              }));
+                setMessages((prev) => {
+                  const { messages: updated, latestFullText } =
+                    upsertAssistantTurnMessage(
+                      prev,
+                      msg.text,
+                      turnId,
+                      activeLanguageRef.current
+                    );
+                  if (latestFullText) {
+                    setLatestTranscript(latestFullText);
+                  }
+                  return updated;
+                });
 
-              setTimeout(() => {
+                return;
+              }
+
+              if (msg.type === 'interrupted') {
+                clearTurnTimeout();
+                stopAllSpeechPlayback();
+                receivedAudioInTurnRef.current = false;
+                currentTurnIdRef.current =
+                  typeof msg.turnId === 'number'
+                    ? msg.turnId + 1
+                    : currentTurnIdRef.current + 1;
                 setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
-              }, 400);
-              return;
-            }
+                return;
+              }
 
-            if (msg.type === 'error' || msg.type === 'live_init_failed') {
-              clearTurnTimeout();
-              console.warn('Live API event:', msg.message);
-              setWsStatus('error');
+              if (msg.type === 'turnComplete') {
+                clearTurnTimeout();
+                const completedTurnId =
+                  typeof msg.turnId === 'number'
+                    ? msg.turnId
+                    : currentTurnIdRef.current;
+                currentTurnIdRef.current = completedTurnId + 1;
+                userSpeechTurnIdRef.current += 1;
+                receivedAudioInTurnRef.current = false;
+                pendingChatFallbackRef.current = null;
+
+                setVitals((prev) => ({
+                  ...prev,
+                  totalInteractions: prev.totalInteractions + 1,
+                  affectionLevel: Math.min(100, prev.affectionLevel + 1),
+                }));
+
+                setTimeout(() => {
+                  setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
+                }, 400);
+                return;
+              }
+
+              if (msg.type === 'error' || msg.type === 'live_init_failed') {
+                clearTurnTimeout();
+                isSessionReadyRef.current = false;
+                const serverErr =
+                  msg.message || 'Gemini Live session could not initialize.';
+                console.warn('Live API event:', serverErr, msg.code || '');
+                setWsStatus('error');
+                setConnectionError(serverErr);
+
+                if (
+                  !shouldAutoReconnectLiveWs(
+                    msg.code,
+                    msg.retryable,
+                    reconnectAttemptRef.current
+                  )
+                ) {
+                  liveNonRetryableErrorRef.current = serverErr;
+                }
+
+                // Immediately halt mic capture so UI never falsely displays LISTENING
+                if (isLiveActiveRef.current) {
+                  stopVoiceCapture(true);
+                }
+                setAssistantState('error');
+                setLatestTranscript(serverErr);
+                settlePendingHandshake(new Error(serverErr));
+
+                // If a typed chat turn was awaiting this Live WS, fall back once to /api/chat
+                const pendingChat = pendingChatFallbackRef.current;
+                if (pendingChat && !pendingChat.answered && !pendingChat.fallbackStarted) {
+                  void sendViaHttpChatFallback(
+                    pendingChat.text,
+                    pendingChat.clientMsgId,
+                    pendingChat.historySnapshot
+                  );
+                }
+              }
+            } catch (e) {
+              console.warn('Live message parse notice:', e);
+            }
+          };
+
+          ws.onerror = () => {
+            if (isUnmountedRef.current || wsRef.current !== ws) return;
+            setWsStatus('error');
+          };
+
+          ws.onclose = () => {
+            if (isUnmountedRef.current || wsRef.current !== ws) return;
+            isSessionReadyRef.current = false;
+            wsRef.current = null;
+
+            const disconnectReason =
+              liveNonRetryableErrorRef.current ||
+              'Gemini Live WebSocket disconnected. Chat messages will automatically use /api/chat fallback.';
+
+            settlePendingHandshake(new Error(disconnectReason));
+
+            // Never leave microphone active / UI showing LISTENING after WS disconnects
+            if (isLiveActiveRef.current) {
+              stopVoiceCapture(true);
               setAssistantState('error');
-              const errNotice =
+              setConnectionError(disconnectReason);
+              setLatestTranscript(
                 activeLanguageRef.current === 'bn-BD'
-                  ? `লাইভ সেশনে সংযোগ সমস্যা: ${msg.message || 'দয়া করে আবার চেষ্টা করুন'}`
-                  : `Live session notice: ${msg.message || 'Please try again'}`;
-              setLatestTranscript(errNotice);
-              setTimeout(() => {
-                setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
-              }, 2500);
+                  ? `লাইভ ভয়েস সংযোগ বিচ্ছিন্ন হয়েছে: ${disconnectReason}`
+                  : `Live voice disconnected: ${disconnectReason}`
+              );
             }
-          } catch (e) {
-            console.warn('Live message parse notice:', e);
-          }
-        };
 
-        ws.onerror = () => {
-          if (isUnmountedRef.current || wsRef.current !== ws) return;
+            // If a typed chat turn was awaiting this Live WS, immediately fall back to /api/chat
+            const pendingChat = pendingChatFallbackRef.current;
+            if (pendingChat && !pendingChat.answered && !pendingChat.fallbackStarted) {
+              void sendViaHttpChatFallback(
+                pendingChat.text,
+                pendingChat.clientMsgId,
+                pendingChat.historySnapshot
+              );
+            }
+
+            if (
+              !liveNonRetryableErrorRef.current &&
+              shouldAutoReconnectLiveWs(undefined, true, reconnectAttemptRef.current)
+            ) {
+              setWsStatus('reconnecting');
+              const delay = getReconnectDelayMs(reconnectAttemptRef.current);
+              reconnectAttemptRef.current += 1;
+              reconnectTimerRef.current = setTimeout(() => {
+                if (!isUnmountedRef.current) {
+                  connectSharedLiveWs(false).catch(() => {
+                    // Handled via wsStatus & connectionError
+                  });
+                }
+              }, delay);
+            } else {
+              setWsStatus('error');
+              if (liveNonRetryableErrorRef.current) {
+                setConnectionError(liveNonRetryableErrorRef.current);
+              }
+            }
+          };
+        } catch (err: any) {
+          const msg = err?.message || 'WebSocket creation failed.';
+          console.warn('WebSocket creation failed:', err);
           setWsStatus('error');
-        };
+          setConnectionError(msg);
+          settlePendingHandshake(new Error(msg));
+        }
+      });
 
-        ws.onclose = () => {
-          if (isUnmountedRef.current || wsRef.current !== ws) return;
-          isSessionReadyRef.current = false;
-          wsRef.current = null;
-          setWsStatus('reconnecting');
-
-          const delay = getReconnectDelayMs(reconnectAttemptRef.current);
-          reconnectAttemptRef.current += 1;
-          reconnectTimerRef.current = setTimeout(() => {
-            if (!isUnmountedRef.current) {
-              connectSharedLiveWs(true);
-            }
-          }, delay);
-        };
-      } catch (err) {
-        console.warn('WebSocket creation failed:', err);
-        setWsStatus('error');
-      }
+      wsConnectPromiseRef.current = connectPromise;
+      return connectPromise;
     },
-    [clearTurnTimeout, stopAllSpeechPlayback]
+    [
+      clearTurnTimeout,
+      sendViaHttpChatFallback,
+      settlePendingHandshake,
+      stopAllSpeechPlayback,
+      stopVoiceCapture,
+    ]
   );
 
   // Send a JSON payload over the shared Gemini Live WebSocket (queueing if connecting)
@@ -545,20 +972,29 @@ export default function App() {
         }
       }
 
+      if (getBackendConfigError() || liveNonRetryableErrorRef.current) {
+        return false;
+      }
+
       if (outgoingQueueRef.current.length < 30) {
         outgoingQueueRef.current.push(serialized);
       }
-      connectSharedLiveWs();
+      connectSharedLiveWs().catch(() => {
+        // Error surfaced in wsStatus/connectionError
+      });
       return false;
     },
     [connectSharedLiveWs]
   );
 
-  // Initialize Audio Player, Shared Live WebSocket & Online/Offline listeners
+  // Initialize Audio Player, Backend Health Check, Shared Live WebSocket & Online/Offline listeners
   useEffect(() => {
     isUnmountedRef.current = false;
     liveAudioPlayerRef.current = new LiveAudioPlayer();
-    connectSharedLiveWs();
+    void checkBackendHealth();
+    connectSharedLiveWs().catch(() => {
+      // Surfacing via connectionError & wsStatus
+    });
 
     const handleBeforeInstall = (e: any) => {
       e.preventDefault();
@@ -567,30 +1003,50 @@ export default function App() {
 
     const handleOnline = () => {
       reconnectAttemptRef.current = 0;
-      connectSharedLiveWs(true);
+      liveNonRetryableErrorRef.current = null;
+      void checkBackendHealth();
+      connectSharedLiveWs(true).catch(() => {
+        // Surfacing via connectionError
+      });
     };
 
     const handleOffline = () => {
       setWsStatus('disconnected');
+      if (isLiveActiveRef.current) {
+        stopVoiceCapture(true);
+      }
       const offlineMsg =
         activeLanguageRef.current === 'bn-BD'
           ? `ইন্টারনেট সংযোগ বিচ্ছিন্ন হয়েছে ${selectedAffectionNameRef.current}। সংযোগ ফিরে এলে স্বয়ংক্রিয়ভাবে যুক্ত হবে।`
           : `Network disconnected, ${selectedAffectionNameRef.current}. Will reconnect automatically when back online.`;
+      setConnectionError(offlineMsg);
       setLatestTranscript(offlineMsg);
+    };
+
+    const handleBackendUrlUpdated = () => {
+      liveNonRetryableErrorRef.current = null;
+      reconnectAttemptRef.current = 0;
+      void checkBackendHealth();
+      connectSharedLiveWs(true).catch(() => {
+        // Handled via connectionError
+      });
     };
 
     window.addEventListener('beforeinstallprompt', handleBeforeInstall);
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    window.addEventListener('zoni:backend-url-updated', handleBackendUrlUpdated);
 
     return () => {
       isUnmountedRef.current = true;
       window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('zoni:backend-url-updated', handleBackendUrlUpdated);
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
       }
+      settlePendingHandshake(new Error('App unmounted'));
       clearTurnTimeout();
       if (wsRef.current) {
         try {
@@ -601,7 +1057,13 @@ export default function App() {
         }
       }
     };
-  }, [connectSharedLiveWs, clearTurnTimeout]);
+  }, [
+    checkBackendHealth,
+    clearTurnTimeout,
+    connectSharedLiveWs,
+    settlePendingHandshake,
+    stopVoiceCapture,
+  ]);
 
   // Startup Permissions Verification & Realtime Listener
   useEffect(() => {
@@ -699,17 +1161,41 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Start Live Voice microphone capture over the shared Gemini Live WebSocket session
+  // Start Live Voice microphone capture ONLY after the Gemini Live WebSocket handshake actually succeeds
   const startVoiceCapture = useCallback(async () => {
+    stopVoiceCapture();
+    const configError = getBackendConfigError();
+    if (configError) {
+      setAssistantState('error');
+      setConnectionError(configError);
+      setLatestTranscript(configError);
+      return;
+    }
+
+    setAssistantState('connecting');
+    setConnectionError(null);
+    setLatestTranscript(
+      activeLanguageRef.current === 'bn-BD'
+        ? `Gemini Live সার্ভারের সাথে সংযোগ করা হচ্ছে ${selectedAffectionNameRef.current}...`
+        : `Connecting to Gemini Live server, ${selectedAffectionNameRef.current}...`
+    );
+    getAudioContext();
+
+    // 1. Await real server 'connected' handshake BEFORE activating mic or showing LISTENING
     try {
-      // Prevent duplicate audio capture streams
-      stopVoiceCapture();
-      setAssistantState('connecting');
-      getAudioContext();
+      await connectSharedLiveWs(wsStatusRef.current === 'error');
+    } catch (wsErr: any) {
+      const wsMsg =
+        wsErr?.message ||
+        'Could not establish Gemini Live WebSocket session. Verify backend health and server GEMINI_API_KEY.';
+      setAssistantState('error');
+      setConnectionError(wsMsg);
+      setLatestTranscript(wsMsg);
+      return;
+    }
 
-      // Ensure shared WebSocket session is open
-      connectSharedLiveWs();
-
+    // 2. Request microphone hardware stream
+    try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -718,6 +1204,22 @@ export default function App() {
           noiseSuppression: true,
         },
       });
+
+      // Re-verify WebSocket remained connected while user responded to mic prompt
+      if (
+        !wsRef.current ||
+        wsRef.current.readyState !== WebSocket.OPEN ||
+        !isSessionReadyRef.current
+      ) {
+        stream.getTracks().forEach((track) => track.stop());
+        const droppedMsg =
+          'Gemini Live connection closed before microphone capture started. Please retry.';
+        setAssistantState('error');
+        setConnectionError(droppedMsg);
+        setLatestTranscript(droppedMsg);
+        return;
+      }
+
       mediaStreamRef.current = stream;
 
       const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
@@ -728,17 +1230,29 @@ export default function App() {
       scriptProcessorRef.current = processor;
 
       processor.onaudioprocess = (e) => {
+        if (isMicMutedRef.current) return;
         if (
-          isMicMutedRef.current ||
           !wsRef.current ||
           wsRef.current.readyState !== WebSocket.OPEN ||
           !isSessionReadyRef.current
         ) {
+          // Stop capture immediately instead of silently discarding audio
+          stopVoiceCapture(true);
+          setAssistantState('error');
+          setConnectionError(
+            'Live WebSocket connection lost — microphone stopped.'
+          );
           return;
         }
         const channelData = e.inputBuffer.getChannelData(0);
         const base64Audio = pcm16ToBase64(channelData);
-        wsRef.current.send(JSON.stringify({ audio: base64Audio }));
+        try {
+          wsRef.current.send(JSON.stringify({ audio: base64Audio }));
+        } catch {
+          stopVoiceCapture(true);
+          setAssistantState('error');
+          setConnectionError('Failed sending microphone audio to Gemini Live.');
+        }
       };
 
       source.connect(processor);
@@ -753,16 +1267,17 @@ export default function App() {
           : `Zoni AI Live Link connected! Speak freely with me, ${selectedAffectionNameRef.current} ❤️`;
       setLatestTranscript(connectMsg);
     } catch (err: any) {
-      console.error('Failed to start Live Voice:', err);
+      console.error('Failed to start Live Voice microphone:', err);
+      stopVoiceCapture(true);
       setAssistantState('error');
       checkAllPermissions().then((fresh) => setPermissionsReport(fresh));
       const errMsg =
         activeLanguageRef.current === 'bn-BD'
           ? 'মাইক্রোফোন পারমিশন প্রয়োজন। Chrome Site Settings থেকে Allow করুন!'
-          : 'Microphone access is needed for live voice. Please allow it in Chrome Site Settings!';
+          : 'Microphone access is needed for live voice. Please allow microphone permissions.';
+      setConnectionError(errMsg);
       setLatestTranscript(errMsg);
       setIsPermissionsModalOpen(true);
-      setTimeout(() => setAssistantState('idle'), 4000);
     }
   }, [connectSharedLiveWs, stopVoiceCapture]);
 
@@ -1230,24 +1745,71 @@ export default function App() {
         return;
       }
 
-      // 4. Send the typed message through the single active Gemini Live WebSocket session
-      sendOverSharedWs(payload);
+      // Check backend URL configuration before sending remote chat requests
+      const configError = getBackendConfigError();
+      if (configError) {
+        setConnectionError(configError);
+        setLatestTranscript(configError);
+        setAssistantState('error');
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${clientMsgId}-config-err`,
+            role: 'assistant',
+            text: configError,
+            timestamp: new Date(),
+            lang: activeLanguage,
+          },
+        ]);
+        return;
+      }
 
-      // Set safety timeout in case the WebSocket disconnects mid-turn
+      const historySnapshot = messagesRef.current.slice(-10).map((m) => ({
+        role: m.role,
+        text: m.text,
+      }));
+
+      pendingChatFallbackRef.current = {
+        clientMsgId,
+        text: cleanText,
+        historySnapshot,
+        answered: false,
+        fallbackStarted: false,
+      };
+
+      // 4. Route via /api/chat immediately when Live WS is unavailable/error; otherwise send over Live WS with automatic /api/chat fallback
+      const useFallbackImmediately =
+        Boolean(liveNonRetryableErrorRef.current) ||
+        shouldUseHttpChatFallback(
+          wsRef.current?.readyState,
+          isSessionReadyRef.current,
+          wsStatusRef.current
+        );
+
+      if (useFallbackImmediately) {
+        await sendViaHttpChatFallback(cleanText, clientMsgId, historySnapshot);
+        return;
+      }
+
+      const sentDirectly = sendOverSharedWs(payload);
+      if (!sentDirectly) {
+        await sendViaHttpChatFallback(cleanText, clientMsgId, historySnapshot);
+        return;
+      }
+
+      // Safety fallback timeout: if Live WS produces no transcript/audio within 12s, fall back once to /api/chat
       clearTurnTimeout();
       turnTimeoutRef.current = setTimeout(() => {
-        setAssistantState((current) => {
-          if (current === 'thinking') {
-            const timeoutNotice =
-              activeLanguageRef.current === 'bn-BD'
-                ? `লাইভ সেশনের উত্তর পেতে দেরি হচ্ছে ${selectedAffectionNameRef.current}, সংযোগটি পুনরায় যাচাই করা হচ্ছে...`
-                : `Live session response timed out, ${selectedAffectionNameRef.current}. Reconnecting...`;
-            setLatestTranscript(timeoutNotice);
-            return isLiveActiveRef.current ? 'listening' : 'idle';
-          }
-          return current;
-        });
-      }, 20000);
+        const pending = pendingChatFallbackRef.current;
+        if (
+          pending &&
+          pending.clientMsgId === clientMsgId &&
+          !pending.answered &&
+          !pending.fallbackStarted
+        ) {
+          void sendViaHttpChatFallback(cleanText, clientMsgId, historySnapshot);
+        }
+      }, 12000);
     },
     [
       selectedAffectionName,
@@ -1255,22 +1817,61 @@ export default function App() {
       switchLanguage,
       stopAllSpeechPlayback,
       sendOverSharedWs,
+      sendViaHttpChatFallback,
       clearTurnTimeout,
     ]
   );
 
-  // Replay speech audio from transcript
+  // Replay speech audio from transcript (uses active Live WS or /api/tts fallback)
   const handleReplayAudio = async (text: string) => {
     if (vitals.soundFxEnabled) playProceduralSfx('click');
     stopAllSpeechPlayback();
-    setAssistantState('speaking');
 
-    // Request Gemini Live over the shared session to speak the phrase in its genuine voice
-    sendOverSharedWs({
-      type: 'client_text',
-      text: `[System directive: Replay this response to Boss in ${activeLanguage} using your Gemini Live voice: "${text}"]`,
-      clientMsgId: `replay-${Date.now()}`,
-    });
+    const configError = getBackendConfigError();
+    if (configError) {
+      setConnectionError(configError);
+      setLatestTranscript(configError);
+      return;
+    }
+
+    if (
+      wsRef.current &&
+      wsRef.current.readyState === WebSocket.OPEN &&
+      isSessionReadyRef.current
+    ) {
+      setAssistantState('speaking');
+      sendOverSharedWs({
+        type: 'client_text',
+        text: `[System directive: Replay this response to ${selectedAffectionName} in ${activeLanguage} using your Gemini Live voice: "${text}"]`,
+        clientMsgId: `replay-${Date.now()}`,
+      });
+      return;
+    }
+
+    // Fallback to HTTP /api/tts when Live WS is offline
+    setAssistantState('speaking');
+    try {
+      const res = await fetch(`${getApiBaseUrl()}/api/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          voice: vitals.selectedVoice,
+          lang: activeLanguage,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.audioBase64) {
+        throw new Error(data?.error || `Audio replay unavailable (HTTP ${res.status})`);
+      }
+      liveAudioPlayerRef.current?.playPcmChunk(data.audioBase64, 24000);
+      setTimeout(() => {
+        setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
+      }, 1200);
+    } catch (err: any) {
+      setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
+      setConnectionError(err?.message || 'Unable to replay voice audio.');
+    }
   };
 
   // Interruption
@@ -1321,6 +1922,24 @@ export default function App() {
     }
   };
 
+  const handleToggleSoundFx = useCallback(() => {
+    setVitals((v) => {
+      const nextVal = !v.soundFxEnabled;
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('zoni_sound_fx_enabled', String(nextVal));
+      }
+      return { ...v, soundFxEnabled: nextVal };
+    });
+  }, []);
+
+  const handleManualReconnectLive = useCallback(() => {
+    setConnectionError(null);
+    void checkBackendHealth();
+    connectSharedLiveWs(true).catch(() => {
+      // Surfacing via connectionError
+    });
+  }, [checkBackendHealth, connectSharedLiveWs]);
+
   return (
     <div className="relative min-h-screen w-full bg-slate-950 text-cyan-50 flex flex-col justify-between overflow-x-hidden selection:bg-pink-500/30 selection:text-pink-200">
       {/* Background Animated Sci-Fi Ambient Glow & Grid */}
@@ -1332,9 +1951,9 @@ export default function App() {
       <HudHeader
         vitals={vitals}
         permissionsReport={permissionsReport}
-        onToggleSoundFx={() =>
-          setVitals((v) => ({ ...v, soundFxEnabled: !v.soundFxEnabled }))
-        }
+        wsStatus={wsStatus}
+        backendHealth={backendHealth}
+        onToggleSoundFx={handleToggleSoundFx}
         onToggleChatDrawer={() => setIsChatDrawerOpen(!isChatDrawerOpen)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
         onOpenApkModal={() => setIsApkModalOpen(true)}
@@ -1360,6 +1979,45 @@ export default function App() {
             onReactorClick={handleReactorClick}
           />
         </div>
+
+        {/* Authoritative Connection / Backend Configuration Error Banner */}
+        {connectionError && (
+          <div
+            role="alert"
+            className="w-full max-w-2xl mt-3 px-3.5 py-2.5 rounded-xl bg-rose-950/85 border border-rose-500/50 text-rose-100 text-xs font-hud flex flex-col sm:flex-row sm:items-center justify-between gap-2 shadow-[0_0_20px_rgba(244,63,94,0.2)]"
+          >
+            <div className="flex items-start gap-2 min-w-0">
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <span className="leading-snug break-words">{connectionError}</span>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={handleManualReconnectLive}
+                className="px-2.5 py-1 rounded-lg bg-rose-900/70 hover:bg-rose-800/80 border border-rose-400/40 text-rose-100 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+              >
+                <RefreshCw className="w-3 h-3" />
+                <span>Retry</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsPermissionsModalOpen(true)}
+                className="px-2.5 py-1 rounded-lg bg-cyan-950/80 hover:bg-cyan-900/80 border border-cyan-400/40 text-cyan-200 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+              >
+                <Settings2 className="w-3 h-3" />
+                <span>Setup</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setConnectionError(null)}
+                aria-label="Dismiss error banner"
+                className="p-1 rounded hover:bg-rose-900/60 text-rose-300 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
       </main>
 
       {/* Bottom Control Dock: Live Voice Link & Typing Input */}
@@ -1388,7 +2046,6 @@ export default function App() {
         userNickname={selectedAffectionName}
       />
 
-
       {/* Native Android SIM Calling Hub Modal */}
       <SimCallingModal
         isOpen={isCallingModalOpen}
@@ -1415,12 +2072,20 @@ export default function App() {
         vitals={vitals}
         selectedAffectionName={selectedAffectionName}
         isLiveActive={isLiveActive}
+        wsStatus={wsStatus}
+        backendHealth={backendHealth}
         onSelectMode={handleSelectMode}
         onUpdateAffectionName={handleUpdateAffectionName}
         onSelectVoice={handleSelectVoice}
+        onToggleSoundFx={handleToggleSoundFx}
+        onReconnectLive={handleManualReconnectLive}
+        onOpenBackendSetup={() => {
+          setIsSettingsModalOpen(false);
+          setIsPermissionsModalOpen(true);
+        }}
       />
 
-      {/* Chrome Permissions & Security Setup Modal */}
+      {/* Backend Health, Permissions & Background Setup Wizard Modal */}
       <PermissionsSetupModal
         isOpen={isPermissionsModalOpen}
         onClose={() => setIsPermissionsModalOpen(false)}
@@ -1432,6 +2097,9 @@ export default function App() {
         soundFxEnabled={vitals.soundFxEnabled}
         activeLanguage={activeLanguage}
         selectedAffectionName={selectedAffectionName}
+        backendHealth={backendHealth}
+        onRefreshBackendHealth={checkBackendHealth}
+        onBackendUrlChanged={handleManualReconnectLive}
       />
       {/* Offline connectivity indicator */}
       <OfflineIndicator />

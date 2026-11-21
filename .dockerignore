@@ -1,0 +1,13 @@
+node_modules
+dist
+android
+.git
+.github
+.playwright-cli
+.env
+.env.*
+!.env.example
+*.apk
+*.aab
+*.jks
+*.keystore
