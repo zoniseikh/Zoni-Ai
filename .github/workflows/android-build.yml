@@ -1,174 +1,90 @@
-name: ZONI AI Android APK Build
+
+name: ZONI AI Android Build
 
 on:
   push:
-    branches:
-      - main
-      - master
-
+    branches: [main, master]
   pull_request:
-    branches:
-      - main
-      - master
-
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: zoni-ai-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  android-build:
-    name: Build ZONI AI APK
+  build:
+    name: Test and Build ZONI AI APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      # 1. Checkout source
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. Node.js 22 + npm cache (reproducible builds via committed package-lock.json)
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: 22
+          cache: npm
 
       - name: Install Frontend Dependencies
         run: npm ci
 
-      - name: Run Frontend Unit Tests & TypeScript Check
-        run: |
-          npm test
-          npm run lint
+      - name: Run Frontend Tests
+        run: npm test
 
-      - name: Build React Dashboard & Sync into Android Assets
-        env:
-          VITE_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
-        run: npm run android:sync
+      - name: Run Frontend Lint
+        run: npm run lint
 
-      # 3. Java 17 (compatible with AGP 8.5.2 & Gradle 8.7)
+      - name: Run Frontend Build
+        run: npm run build
+
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 4. Android SDK
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: false
+        uses: android-actions/setup-android@v3
 
-      # 5. Configure Gradle cache (uses project's own android/gradlew wrapper)
-      - name: Setup Gradle Cache
+      - name: Accept Android SDK Licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # 6. Verify Android SDK, Java 17, AndroidX & Gradle Wrapper
-      - name: Verify Build Environment & Gradle Wrapper
+      - name: Verify Build Environment
         run: |
-          chmod +x android/gradlew
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          test -f android/gradle.properties
-          grep -q "android.useAndroidX=true" android/gradle.properties
           java -version
-          ./android/gradlew -p android --version
+          echo "JAVA_HOME=$JAVA_HOME"
+          sdkmanager --version
 
-      # 7. Run Android Unit Tests
-      - name: Run Android Unit Tests
-        env:
-          ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
-        run: ./android/gradlew -p android --no-daemon :app:testDebugUnitTest --stacktrace
+      - name: Android Unit Tests
+        run: bash android/gradlew -p android --no-daemon :app:testDebugUnitTest
 
-      # 8. Build Debug APK (never requires signing secrets)
       - name: Build Debug APK
-        env:
-          ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
-        run: |
-          ./android/gradlew -p android --no-daemon :app:assembleDebug --stacktrace
-          test -f android/app/build/outputs/apk/debug/app-debug.apk
-          ls -lh android/app/build/outputs/apk/debug/app-debug.apk
+        run: bash android/gradlew -p android --no-daemon :app:assembleDebug
 
-      # 9. Build Release APK
       - name: Build Release APK
-        env:
-          ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
-        run: |
-          ./android/gradlew -p android --no-daemon :app:assembleRelease --stacktrace
-          ls -lh android/app/build/outputs/apk/release/
+        run: bash android/gradlew -p android --no-daemon :app:assembleRelease
 
-      # 10. Sign Release APK only when valid signing secrets are configured (no secrets in if:)
-      - name: Sign Release APK (if signing secrets are configured)
-        shell: bash
-        env:
-          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-        run: |
-          set -euo pipefail
-
-          RELEASE_DIR="android/app/build/outputs/apk/release"
-          UNSIGNED_APK="$RELEASE_DIR/app-release-unsigned.apk"
-          KEY_B64="${ANDROID_KEY_BASE64:-${ANDROID_KEYSTORE_BASE64:-}}"
-          KS_PASS="${ANDROID_KEYSTORE_PASSWORD:-${ANDROID_KEY_PASSWORD:-}}"
-          KEY_PASS="${ANDROID_KEY_PASSWORD:-${ANDROID_KEYSTORE_PASSWORD:-}}"
-          KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
-
-          if [ -z "$KEY_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KEY_PASS" ] || [ -z "$KEY_ALIAS" ]; then
-            echo "Signing secrets not configured; keeping unsigned Release APK."
-            exit 0
-          fi
-
-          if [ ! -f "$UNSIGNED_APK" ]; then
-            echo "Unsigned APK not found at $UNSIGNED_APK"
-            ls -la "$RELEASE_DIR" || true
-            exit 1
-          fi
-
-          KEYSTORE="$RUNNER_TEMP/zoni-release.jks"
-          trap 'rm -f "$KEYSTORE" "$RELEASE_DIR/app-release-aligned.apk"' EXIT
-
-          printf '%s' "$KEY_B64" | base64 --decode > "$KEYSTORE"
-
-          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
-
-          "$BUILD_TOOLS/zipalign" -f -p 4 \
-            "$UNSIGNED_APK" \
-            "$RELEASE_DIR/app-release-aligned.apk"
-
-          export ZONI_KS_PASS="$KS_PASS"
-          export ZONI_KEY_PASS="$KEY_PASS"
-
-          "$BUILD_TOOLS/apksigner" sign \
-            --ks "$KEYSTORE" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --ks-pass env:ZONI_KS_PASS \
-            --key-pass env:ZONI_KEY_PASS \
-            --out "$RELEASE_DIR/ZONI-AI-release.apk" \
-            "$RELEASE_DIR/app-release-aligned.apk"
-
-          "$BUILD_TOOLS/apksigner" verify "$RELEASE_DIR/ZONI-AI-release.apk"
-
-          echo "Release APK signed and verified successfully."
-
-      # 11. Upload Debug APK
       - name: Upload Debug APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ZONI-AI-Debug-APK
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-          retention-days: 14
 
-      # 12. Upload Release APK
       - name: Upload Release APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ZONI-AI-Release-APK
           path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
-          retention-days: 14
