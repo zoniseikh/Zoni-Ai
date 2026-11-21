@@ -246,7 +246,10 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
       const base = getApiBaseUrl();
       const res = await fetch(`${base}/api/status`, { cache: 'no-store' });
       const data = await res.json().catch(() => ({}));
-      const geminiConfigured = Boolean(data.geminiConfigured);
+      const geminiConfigured =
+        typeof data.geminiConfigured === 'boolean'
+          ? data.geminiConfigured
+          : Boolean(data.geminiLiveSupported || data.status === 'online');
       const snap: BackendHealthSnapshot = {
         checked: true,
         reachable: res.ok,
@@ -316,7 +319,7 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
     if (!trimmed) {
       if (isNativeAndroid) {
         setBackendUrlError(
-          'Enter your deployed ZONI backend HTTPS URL (for example https://zoni-backend.run.app).'
+          'Enter your deployed ZONI backend HTTPS URL (for example https://zoni-ai-675435111499.asia-southeast1.run.app).'
         );
         return;
       }
@@ -800,7 +803,14 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                       setBackendUrlInput(e.target.value);
                       setBackendUrlError(null);
                     }}
-                    placeholder="https://your-zoni-backend.run.app"
+                    onFocus={(e) => {
+                      const target = e.currentTarget;
+                      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      window.setTimeout(() => {
+                        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      }, 250);
+                    }}
+                    placeholder="https://zoni-ai-675435111499.asia-southeast1.run.app"
                     className="flex-1 py-2.5 px-3.5 rounded-xl bg-slate-950 border border-cyan-500/40 text-xs sm:text-sm text-cyan-100 font-mono placeholder:text-slate-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50"
                   />
                   <button

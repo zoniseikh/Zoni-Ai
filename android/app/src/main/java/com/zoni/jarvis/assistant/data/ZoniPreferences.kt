@@ -32,7 +32,19 @@ data class ZoniUserSettings(
     val backendServerUrl: String = DEFAULT_BACKEND_URL
 ) {
     companion object {
-        val DEFAULT_BACKEND_URL: String = BuildConfig.ZONI_BACKEND_URL
+        const val PRODUCTION_BACKEND_URL = "https://zoni-ai-675435111499.asia-southeast1.run.app"
+        val DEFAULT_BACKEND_URL: String = BuildConfig.ZONI_BACKEND_URL.ifBlank { PRODUCTION_BACKEND_URL }
+
+        fun isValidProductionBackendUrl(raw: String?): Boolean {
+            val clean = raw?.trim()?.trimEnd('/').orEmpty()
+            if (clean.isBlank()) return false
+            if (!clean.startsWith("https://") && !clean.startsWith("http://")) return false
+            val lower = clean.lowercase()
+            if (lower.contains("appassets.androidplatform.net")) return false
+            if (lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://0.0.0.0")) return false
+            if (lower.contains("ais-pre-")) return false
+            return true
+        }
     }
 }
 
@@ -79,7 +91,8 @@ class ZoniPreferences(private val context: Context) {
             soundFxEnabled = prefs[Keys.SOUND_FX] ?: true,
             onboardingCompleted = prefs[Keys.ONBOARDING_DONE] ?: false,
             floatingOrbEnabled = prefs[Keys.FLOATING_ORB] ?: false,
-            backendServerUrl = prefs[Keys.BACKEND_URL]?.takeIf { it.isNotBlank() }
+            backendServerUrl = prefs[Keys.BACKEND_URL]
+                ?.takeIf { ZoniUserSettings.isValidProductionBackendUrl(it) }
                 ?: ZoniUserSettings.DEFAULT_BACKEND_URL
         )
     }
@@ -123,9 +136,7 @@ class ZoniPreferences(private val context: Context) {
 
     suspend fun setBackendServerUrl(url: String) {
         val clean = url.trim().trimEnd('/')
-        if ((clean.startsWith("http://") || clean.startsWith("https://")) &&
-            !clean.contains("appassets.androidplatform.net", ignoreCase = true)
-        ) {
+        if (ZoniUserSettings.isValidProductionBackendUrl(clean)) {
             context.zoniDataStore.edit { it[Keys.BACKEND_URL] = clean }
         }
     }

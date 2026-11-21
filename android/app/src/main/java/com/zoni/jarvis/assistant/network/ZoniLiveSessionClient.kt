@@ -29,7 +29,11 @@ sealed class LiveServerEvent {
     data class Flashlight(val enable: Boolean) : LiveServerEvent()
     data class Interrupted(val turnId: Int) : LiveServerEvent()
     data class TurnComplete(val turnId: Int) : LiveServerEvent()
-    data class Error(val message: String) : LiveServerEvent()
+    data class Error(
+        val message: String,
+        val code: String? = null,
+        val retryable: Boolean = true
+    ) : LiveServerEvent()
     data class StatusChanged(val status: WsConnectionStatus) : LiveServerEvent()
 }
 
@@ -57,7 +61,12 @@ class ZoniLiveSessionClient(
     private var isSessionReady = false
 
     @Volatile
+    private var nonRetryableError: String? = null
+
+    @Volatile
     private var resumptionHandle: String? = null
+
+    fun isConnected(): Boolean = webSocket != null && isSessionReady
 
     private var lastBackendUrl: String = ""
     private var lastMode: CompanionMode = CompanionMode.ROMANTIC
@@ -76,6 +85,10 @@ class ZoniLiveSessionClient(
         forceReconnect: Boolean = false
     ) {
         isClosedManually = false
+        if (forceReconnect) {
+            nonRetryableError = null
+            reconnectAttempt = 0
+        }
         lastBackendUrl = backendBaseUrl
         lastMode = mode
         lastAffectionName = affectionName
@@ -132,15 +145,29 @@ class ZoniLiveSessionClient(
     }
 
     private fun scheduleReconnect() {
-        if (isClosedManually || lastBackendUrl.isBlank()) return
+        if (isClosedManually || lastBackendUrl.isBlank() || nonRetryableError != null) {
+            onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.ERROR))
+            return
+        }
+        if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+            onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.ERROR))
+            onEvent(
+                LiveServerEvent.Error(
+                    message = "Unable to reconnect to Gemini Live after $MAX_RECONNECT_ATTEMPTS attempts.",
+                    code = "WS_MAX_RETRIES",
+                    retryable = false
+                )
+            )
+            return
+        }
         onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.RECONNECTING))
         val delayMs = MobileAssistantEngine.getReconnectDelayMs(reconnectAttempt)
         reconnectAttempt += 1
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             delay(delayMs)
-            if (!isClosedManually) {
-                connect(lastBackendUrl, lastMode, lastAffectionName, lastVoice, lastLanguage, forceReconnect = true)
+            if (!isClosedManually && nonRetryableError == null) {
+                connect(lastBackendUrl, lastMode, lastAffectionName, lastVoice, lastLanguage, forceReconnect = false)
             }
         }
     }
@@ -152,6 +179,7 @@ class ZoniLiveSessionClient(
                 "connected" -> {
                     isSessionReady = true
                     reconnectAttempt = 0
+                    nonRetryableError = null
                     onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.CONNECTED))
                     onEvent(LiveServerEvent.Connected(json.optBoolean("resumed", false)))
                     flushQueue()
@@ -188,7 +216,15 @@ class ZoniLiveSessionClient(
                     onEvent(LiveServerEvent.TurnComplete(json.optInt("turnId", 1)))
                 }
                 "error", "live_init_failed" -> {
-                    onEvent(LiveServerEvent.Error(json.optString("message", "Live connection error")))
+                    isSessionReady = false
+                    val errMsg = json.optString("message", "Live connection error")
+                    val errCode = json.optString("code", "").ifBlank { null }
+                    val retryable = json.optBoolean("retryable", errCode != "GEMINI_KEY_MISSING" && errCode != "GEMINI_KEY_INVALID")
+                    if (!retryable) {
+                        nonRetryableError = errMsg
+                    }
+                    onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.ERROR))
+                    onEvent(LiveServerEvent.Error(message = errMsg, code = errCode, retryable = retryable))
                 }
             }
         } catch (_: Exception) {
@@ -264,6 +300,8 @@ class ZoniLiveSessionClient(
     }
 
     companion object {
+        private const val MAX_RECONNECT_ATTEMPTS = 5
+
         fun buildLiveWsUrl(
             backendBaseUrl: String,
             mode: String,

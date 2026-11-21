@@ -10,6 +10,7 @@
  */
 
 export const ANDROID_LOCAL_ASSET_HOST = 'appassets.androidplatform.net';
+export const PRODUCTION_BACKEND_URL = 'https://zoni-ai-675435111499.asia-southeast1.run.app';
 
 export function isLocalAndroidAssetHost(urlOrHost: string): boolean {
   const trimmed = urlOrHost.trim().toLowerCase();
@@ -22,13 +23,45 @@ export function isLocalAndroidAssetHost(urlOrHost: string): boolean {
   }
 }
 
-export function isValidBackendUrl(url: string | null | undefined): boolean {
+export function isStaleOrLocalDeviceHost(urlOrHost: string): boolean {
+  const trimmed = urlOrHost.trim().toLowerCase();
+  if (!trimmed) return true;
+  if (trimmed.includes('ais-pre-')) return true;
+  try {
+    const parsed = trimmed.includes('://') ? new URL(trimmed) : new URL(`https://${trimmed}`);
+    const host = parsed.hostname.toLowerCase();
+    return (
+      host === ANDROID_LOCAL_ASSET_HOST ||
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '0.0.0.0' ||
+      host === '[::1]'
+    );
+  } catch {
+    return true;
+  }
+}
+
+export function isValidBackendUrl(
+  url: string | null | undefined,
+  options?: { allowLocalhost?: boolean }
+): boolean {
   if (!url) return false;
   const trimmed = url.trim();
   if (!/^https?:\/\//i.test(trimmed)) return false;
   try {
     const parsed = new URL(trimmed);
-    if (!parsed.hostname || parsed.hostname === ANDROID_LOCAL_ASSET_HOST) {
+    const host = parsed.hostname.toLowerCase();
+    if (!host || host === ANDROID_LOCAL_ASSET_HOST) {
+      return false;
+    }
+    if (host.includes('ais-pre-')) {
+      return false;
+    }
+    if (
+      !options?.allowLocalhost &&
+      (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '[::1]')
+    ) {
       return false;
     }
     return parsed.protocol === 'http:' || parsed.protocol === 'https:';
@@ -70,6 +103,9 @@ export function resolveNativeBackendUrl(win: Window): string {
     if (isValidBackendUrl(storedUrl)) {
       return normalizeBackendUrl(storedUrl!);
     }
+    if (storedUrl && isStaleOrLocalDeviceHost(storedUrl)) {
+      win.localStorage?.removeItem('zoni_backend_url');
+    }
   } catch {
     // ignore storage access issues
   }
@@ -77,7 +113,7 @@ export function resolveNativeBackendUrl(win: Window): string {
   if (isValidBackendUrl(envUrl)) {
     return normalizeBackendUrl(envUrl);
   }
-  return '';
+  return PRODUCTION_BACKEND_URL;
 }
 
 export function saveCustomBackendUrl(
@@ -94,10 +130,13 @@ export function saveCustomBackendUrl(
       error: `Cannot use ${ANDROID_LOCAL_ASSET_HOST} as a Gemini backend. Enter your deployed Zoni backend server URL.`,
     };
   }
-  if (!isValidBackendUrl(trimmed)) {
+  const allowLocalhost = win ? !isNativeAndroidWebShell(win) : true;
+  if (!isValidBackendUrl(trimmed, { allowLocalhost })) {
     return {
       ok: false,
-      error: 'Invalid backend URL. Use a full URL like https://your-zoni-backend.run.app.',
+      error: isStaleOrLocalDeviceHost(trimmed)
+        ? `Invalid or unreachable device/legacy host. Use your production Cloud Run URL (${PRODUCTION_BACKEND_URL}).`
+        : `Invalid backend URL. Use a full URL like ${PRODUCTION_BACKEND_URL}.`,
     };
   }
   const normalized = normalizeBackendUrl(trimmed);
@@ -137,8 +176,8 @@ export function getBackendConfigError(
   if (!win) return null;
   if (isNativeAndroidWebShell(win)) {
     const resolved = resolveNativeBackendUrl(win);
-    if (!resolved) {
-      return 'Android backend server URL is not configured. Open Zoni Setup → Step 1 (Backend Link) and enter your deployed Zoni backend URL (https://...).';
+    if (!isValidBackendUrl(resolved)) {
+      return `Android backend server URL is not configured. Open Zoni Setup → Step 1 (Backend Link) and set ${PRODUCTION_BACKEND_URL}.`;
     }
   }
   return null;
@@ -150,13 +189,13 @@ export function getBackendConfigError(
 export function getDisplayBackendUrl(
   win: Window | undefined = typeof window !== 'undefined' ? window : undefined
 ): string {
-  if (!win) return 'http://localhost:3000';
+  if (!win) return PRODUCTION_BACKEND_URL;
   if (isNativeAndroidWebShell(win)) {
     return resolveNativeBackendUrl(win);
   }
   try {
     const stored = win.localStorage?.getItem('zoni_backend_url')?.trim();
-    if (isValidBackendUrl(stored)) {
+    if (isValidBackendUrl(stored, { allowLocalhost: true })) {
       return normalizeBackendUrl(stored!);
     }
   } catch {
@@ -170,12 +209,12 @@ export function getApiBaseUrl(
 ): string {
   if (!win) return '';
   if (isNativeAndroidWebShell(win)) {
-    // Never silently fall back to appassets.androidplatform.net
+    // Never silently fall back to appassets.androidplatform.net or localhost
     return resolveNativeBackendUrl(win);
   }
   try {
     const stored = win.localStorage?.getItem('zoni_backend_url')?.trim();
-    if (isValidBackendUrl(stored)) {
+    if (isValidBackendUrl(stored, { allowLocalhost: true })) {
       return normalizeBackendUrl(stored!);
     }
   } catch {

@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -44,6 +45,7 @@ import com.zoni.jarvis.assistant.BuildConfig
 import com.zoni.jarvis.assistant.bridge.ZoniWebAppInterface
 import com.zoni.jarvis.assistant.calling.SimCallManager
 import com.zoni.jarvis.assistant.data.SecureKeyManager
+import com.zoni.jarvis.assistant.data.ZoniUserSettings
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
 import com.zoni.jarvis.assistant.service.ScreenCaptureService
 import com.zoni.jarvis.assistant.ui.components.AndroidHardwareHubDialog
@@ -223,6 +225,7 @@ class MainActivity : ComponentActivity() {
                 .fillMaxSize()
                 .background(ZoniColors.Slate950)
                 .safeDrawingPadding()
+                .imePadding()
         ) {
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
@@ -233,6 +236,11 @@ class MainActivity : ComponentActivity() {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
                         settings.databaseEnabled = true
+                        settings.useWideViewPort = true
+                        settings.loadWithOverviewMode = true
+                        settings.setSupportZoom(false)
+                        settings.builtInZoomControls = false
+                        settings.displayZoomControls = false
                         settings.mediaPlaybackRequiresUserGesture = false
                         settings.allowFileAccess = false
                         settings.allowContentAccess = false
@@ -282,14 +290,17 @@ class MainActivity : ComponentActivity() {
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
                                 val savedBackend = keyManager.getBackendUrl().trim()
-                                val hasValidBackend = (savedBackend.startsWith("http://") || savedBackend.startsWith("https://")) &&
-                                    !savedBackend.contains("appassets.androidplatform.net", ignoreCase = true)
-                                val quotedBackendUrl = JSONObject.quote(if (hasValidBackend) savedBackend else "")
+                                val hasValidBackend = ZoniUserSettings.isValidProductionBackendUrl(savedBackend)
+                                val quotedBackendUrl = JSONObject.quote(if (hasValidBackend) savedBackend else ZoniUserSettings.DEFAULT_BACKEND_URL)
                                 view?.evaluateJavascript(
-                                    "window.__ZONI_ANDROID_NATIVE__ = true; " +
-                                        "if ($quotedBackendUrl && !localStorage.getItem('zoni_backend_url')) { " +
+                                    "(function(){ " +
+                                        "window.__ZONI_ANDROID_NATIVE__ = true; " +
+                                        "var cur = (localStorage.getItem('zoni_backend_url') || '').trim(); " +
+                                        "var stale = !cur || cur.indexOf('ais-pre-') !== -1 || cur.indexOf('appassets.androidplatform.net') !== -1 || cur.indexOf('://localhost') !== -1 || cur.indexOf('://127.0.0.1') !== -1; " +
+                                        "if (stale && $quotedBackendUrl) { " +
                                         "localStorage.setItem('zoni_backend_url', $quotedBackendUrl); " +
-                                        "window.dispatchEvent(new CustomEvent('zoni:backend-url-updated')); }",
+                                        "if (cur !== $quotedBackendUrl) { window.dispatchEvent(new CustomEvent('zoni:backend-url-updated')); } " +
+                                        "} })();",
                                     null
                                 )
                             }

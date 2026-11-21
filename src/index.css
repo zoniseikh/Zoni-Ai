@@ -109,19 +109,21 @@
 }
 
 .zoni-modal-card {
-  width: 100%;
+  width: min(100%, 672px);
   display: flex;
   flex-direction: column;
+  min-height: 0;
   overflow: hidden;
-  max-height: calc(100vh - 1.5rem);
-  max-height: calc(100dvh - 1.5rem);
+  max-height: calc(100vh - 24px);
+  max-height: calc(var(--zoni-visual-vh, 100dvh) - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 24px);
 }
 
 .zoni-modal-scroll {
   flex: 1 1 0%;
   min-height: 0;
   overflow-y: auto;
-  overscroll-behavior: contain;
+  overscroll-behavior-y: contain;
   -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
 }
 

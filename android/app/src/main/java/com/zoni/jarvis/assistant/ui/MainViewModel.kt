@@ -77,6 +77,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var userSpeechTurnId = 1
     private var currentAssistantTurnId = 1
     private var initializedConnection = false
+    private var pendingVoiceStart = false
 
     init {
         refreshSystemStatus()
@@ -99,9 +100,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (!initializedConnection) {
                     initializedConnection = true
                     val backend = userSettings.backendServerUrl.trim()
-                    if ((backend.startsWith("http://") || backend.startsWith("https://")) &&
-                        !backend.contains("appassets.androidplatform.net", ignoreCase = true)
-                    ) {
+                    if (ZoniUserSettings.isValidProductionBackendUrl(backend)) {
                         liveClient.connect(
                             backendBaseUrl = backend,
                             mode = userSettings.activeMode,
@@ -157,10 +156,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun handleLiveEvent(event: LiveServerEvent) {
         when (event) {
             is LiveServerEvent.StatusChanged -> {
-                _uiState.update { it.copy(wsStatus = event.status) }
+                val droppedWhileLive = (event.status == WsConnectionStatus.ERROR || event.status == WsConnectionStatus.DISCONNECTED) &&
+                    (_uiState.value.isLiveActive || pendingVoiceStart)
+                if (droppedWhileLive) {
+                    pendingVoiceStart = false
+                    audioEngine.stopMicrophoneCapture()
+                    ZoniForegroundService.stop(app)
+                    _uiState.update {
+                        it.copy(
+                            wsStatus = event.status,
+                            isLiveActive = false,
+                            assistantState = AssistantState.ERROR,
+                            latestTranscript = "Live WebSocket disconnected — microphone capture stopped."
+                        )
+                    }
+                } else {
+                    _uiState.update { it.copy(wsStatus = event.status) }
+                }
             }
             is LiveServerEvent.Connected -> {
                 _uiState.update { it.copy(wsStatus = WsConnectionStatus.CONNECTED) }
+                if (pendingVoiceStart) {
+                    pendingVoiceStart = false
+                    activateMicrophoneAfterConnected()
+                }
             }
             is LiveServerEvent.Flashlight -> {
                 hardware.setFlashlight(event.enable)
@@ -245,8 +264,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             is LiveServerEvent.Error -> {
+                pendingVoiceStart = false
+                if (_uiState.value.isLiveActive) {
+                    audioEngine.stopMicrophoneCapture()
+                    ZoniForegroundService.stop(app)
+                }
                 _uiState.update {
                     it.copy(
+                        isLiveActive = false,
+                        wsStatus = WsConnectionStatus.ERROR,
                         assistantState = AssistantState.ERROR,
                         latestTranscript = "লাইভ সেশনে সংযোগ সমস্যা: ${event.message}"
                     )
@@ -255,19 +281,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun startLiveVoice(): Boolean {
-        val perms = hardware.getPermissionsSnapshot()
-        if (!perms.recordAudio) return false
-
+    private fun activateMicrophoneAfterConnected(): Boolean {
         val s = _uiState.value.settings
-        liveClient.connect(
-            backendBaseUrl = s.backendServerUrl,
-            mode = s.activeMode,
-            affectionName = s.selectedAffectionName,
-            voice = s.selectedVoice,
-            language = s.activeLanguage
-        )
-
+        if (!liveClient.isConnected()) {
+            _uiState.update {
+                it.copy(
+                    isLiveActive = false,
+                    assistantState = AssistantState.ERROR,
+                    latestTranscript = "Gemini Live session is not connected yet."
+                )
+            }
+            return false
+        }
         val started = audioEngine.startMicrophoneCapture { base64Chunk ->
             liveClient.sendAudioChunk(base64Chunk)
         }
@@ -288,11 +313,65 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     latestTranscript = msg
                 )
             }
+        } else {
+            _uiState.update {
+                it.copy(
+                    isLiveActive = false,
+                    assistantState = AssistantState.ERROR,
+                    latestTranscript = "Microphone initialization failed. Check RECORD_AUDIO permission."
+                )
+            }
         }
         return started
     }
 
+    fun startLiveVoice(): Boolean {
+        val perms = hardware.getPermissionsSnapshot()
+        if (!perms.recordAudio) return false
+
+        val s = _uiState.value.settings
+        if (!ZoniUserSettings.isValidProductionBackendUrl(s.backendServerUrl)) {
+            _uiState.update {
+                it.copy(
+                    isLiveActive = false,
+                    wsStatus = WsConnectionStatus.ERROR,
+                    assistantState = AssistantState.ERROR,
+                    latestTranscript = "Backend server URL is invalid or unconfigured."
+                )
+            }
+            return false
+        }
+
+        if (liveClient.isConnected()) {
+            return activateMicrophoneAfterConnected()
+        }
+
+        // Wait for authoritative LiveServerEvent.Connected before starting AudioRecord or showing LISTENING
+        pendingVoiceStart = true
+        _uiState.update {
+            it.copy(
+                isLiveActive = false,
+                assistantState = AssistantState.CONNECTING,
+                latestTranscript = if (s.activeLanguage == SupportedLanguage.BENGALI) {
+                    "Gemini Live সার্ভারের সাথে সংযোগ করা হচ্ছে ${s.selectedAffectionName}..."
+                } else {
+                    "Connecting to Gemini Live server, ${s.selectedAffectionName}..."
+                }
+            )
+        }
+        liveClient.connect(
+            backendBaseUrl = s.backendServerUrl,
+            mode = s.activeMode,
+            affectionName = s.selectedAffectionName,
+            voice = s.selectedVoice,
+            language = s.activeLanguage,
+            forceReconnect = _uiState.value.wsStatus == WsConnectionStatus.ERROR
+        )
+        return true
+    }
+
     fun stopLiveVoice() {
+        pendingVoiceStart = false
         audioEngine.stopMicrophoneCapture()
         ZoniForegroundService.stop(app)
         _uiState.update {

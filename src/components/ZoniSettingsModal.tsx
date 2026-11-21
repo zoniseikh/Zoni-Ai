@@ -258,6 +258,13 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
                   type="text"
                   value={customInput}
                   onChange={(e) => setCustomInput(e.target.value)}
+                  onFocus={(e) => {
+                    const target = e.currentTarget;
+                    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    window.setTimeout(() => {
+                      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }, 250);
+                  }}
                   placeholder="Enter custom name (e.g. My Love)..."
                   aria-label="Custom affection name"
                   className="flex-1 min-w-0 px-3 py-1.5 text-xs rounded-lg bg-slate-950 border border-pink-500/60 text-pink-200 placeholder:text-pink-400/40 focus:outline-none focus:border-pink-400 font-medium"

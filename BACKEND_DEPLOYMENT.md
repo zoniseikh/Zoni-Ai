@@ -17,12 +17,20 @@ The **ZONI AI** Android APK (`com.zoni.jarvis.assistant`) and Web dashboard conn
 
 ---
 
-## 2. Option A — Deploy to Google Cloud Run (Recommended)
+## 2. Option A — Redeploy / Update Confirmed Google Cloud Run Service (`zoni-ai`)
+
+Your confirmed production backend service is:
+
+- **URL**: `https://zoni-ai-675435111499.asia-southeast1.run.app`
+- **Service Name**: `zoni-ai`
+- **Region**: `asia-southeast1`
+
+To deploy updated `server.ts` routes (enhanced `/api/status` diagnostics, `/api/chat` structured errors, and `/live` WebSocket session cleanup) directly to the existing Cloud Run service:
 
 ```bash
-gcloud run deploy zoni-ai-backend \
+gcloud run deploy zoni-ai \
   --source . \
-  --region asia-east1 \
+  --region asia-southeast1 \
   --allow-unauthenticated \
   --port 3000 \
   --timeout 3600 \
@@ -37,13 +45,13 @@ gcloud run deploy zoni-ai-backend \
 ## 3. Option B — Deploy with Docker (VPS / Render / Railway)
 
 ```bash
-docker build -t zoni-ai-backend .
+docker build -t zoni-ai .
 docker run -d \
-  --name zoni-ai-backend \
+  --name zoni-ai \
   -p 3000:3000 \
   -e NODE_ENV=production \
   -e GEMINI_API_KEY="YOUR_SERVER_SIDE_GEMINI_API_KEY" \
-  zoni-ai-backend
+  zoni-ai
 ```
 
 If deploying behind **Nginx**, ensure WebSocket upgrade headers are forwarded for `/live`:
@@ -65,31 +73,32 @@ location /live {
 
 1. **Health & Configuration Check**:
    ```bash
-   curl -s https://YOUR-BACKEND-DOMAIN/api/status
+   curl -s https://zoni-ai-675435111499.asia-southeast1.run.app/api/status
    ```
    Confirm the JSON response includes:
    - `"status": "online"`
-   - `"geminiConfigured": true`
+   - `"geminiLiveSupported": true`
+   - `"geminiConfigured": true` (present after redeploying updated `server.ts`)
    - `"liveWsPath": "/live"`
    - `"chatEndpoint": "/api/chat"`
 
 2. **Chat Endpoint Check**:
    ```bash
-   curl -s -X POST https://YOUR-BACKEND-DOMAIN/api/chat \
+   curl -s -X POST https://zoni-ai-675435111499.asia-southeast1.run.app/api/chat \
      -H "Content-Type: application/json" \
      -d '{"message":"হ্যালো জনি","lang":"bn-BD","selectedAffectionName":"Boss"}'
    ```
 
 3. **Live WebSocket Check**:
-   Connect to `wss://YOUR-BACKEND-DOMAIN/live?mode=romantic&nickname=Boss&voice=Kore&lang=bn-BD` and confirm the server returns `{"type":"connected",...}`.
+   Connect to `wss://zoni-ai-675435111499.asia-southeast1.run.app/live?mode=romantic&nickname=Boss&voice=Kore&lang=bn-BD` and confirm the server returns `{"type":"connected",...}`.
 
 ---
 
 ## 5. Connect the Android APK to Your Deployed Backend
 
-Backend deployment is completely independent of APK compilation:
+The Android APK defaults out-of-the-box to **`https://zoni-ai-675435111499.asia-southeast1.run.app`** (and automatically migrates any stale `ais-pre-`, `localhost`, or `appassets.androidplatform.net` saved URLs):
 
 1. **At Runtime (No APK rebuild needed)**:
-   Open ZONI AI on Android → tap **PERMISSIONS / SETUP** → **Step 1: Backend & Gemini Link** → enter `https://YOUR-BACKEND-DOMAIN` → tap **Save & Verify Backend**. The URL is persisted via Android `SecureKeyManager` (AES-256 EncryptedSharedPreferences) and immediately verified against `/api/status`.
-2. **Optional Build-Time Default in GitHub Actions**:
-   Add a repository variable `ZONI_BACKEND_URL` in GitHub Settings → Secrets and variables → Actions → Variables set to `https://YOUR-BACKEND-DOMAIN`. Future builds of `.github/workflows/android-build.yml` will embed that URL as the default `BuildConfig.ZONI_BACKEND_URL` and `VITE_BACKEND_URL`.
+   Open ZONI AI on Android → tap **PERMISSIONS / SETUP** → **Step 1: Backend & Gemini Link** → verify or update the HTTPS URL → tap **Save & Verify**. The URL is persisted via Android `SecureKeyManager` (AES-256 EncryptedSharedPreferences) and immediately verified against `/api/status`.
+2. **Optional Build-Time Override in GitHub Actions**:
+   `.github/workflows/android-build.yml` defaults `ZONI_BACKEND_URL` and `VITE_BACKEND_URL` to `https://zoni-ai-675435111499.asia-southeast1.run.app`. You can override it anytime by setting the repository variable `ZONI_BACKEND_URL` in GitHub Settings → Secrets and variables → Actions → Variables.

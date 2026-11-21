@@ -265,7 +265,9 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
 
         {/* Voice Auto-Play Toggle */}
         <button
+          type="button"
           onClick={onToggleAutoPlay}
+          aria-label={vitals.voiceAutoPlay ? 'Auto-Voice Play enabled' : 'Auto-Voice Play disabled'}
           className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-xs font-hud tracking-wider transition-all ${
             vitals.voiceAutoPlay
               ? 'border-emerald-500/50 bg-emerald-950/40 text-emerald-300 shadow-[0_0_10px_rgba(16,185,129,0.2)]'
@@ -279,7 +281,9 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
 
         {/* Global Sound & Voice Mute Toggle */}
         <button
+          type="button"
           onClick={onToggleVoiceMute}
+          aria-label={vitals.voiceMuted ? 'Muted: Click to unmute' : 'Audio Active: Click to mute'}
           className={`p-1.5 rounded-lg border text-xs transition-colors ${
             vitals.voiceMuted
               ? 'border-rose-500/50 bg-rose-950/40 text-rose-300 shadow-[0_0_10px_rgba(244,63,94,0.3)]'
@@ -293,10 +297,12 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
         {/* Chrome Permissions Status & Setup Button */}
         {onOpenPermissionsModal && (
           <button
+            type="button"
             onClick={() => {
               if (vitals.soundFxEnabled) playProceduralSfx('click');
               onOpenPermissionsModal();
             }}
+            aria-label="Open Permissions and Backend Setup"
             className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg border text-xs font-hud tracking-wider transition-all ${
               permissionsReport?.microphone === 'denied' ||
               permissionsReport?.geolocation === 'denied' ||
@@ -306,7 +312,7 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
                 ? 'border-emerald-500/50 bg-emerald-950/40 text-emerald-300 shadow-[0_0_10px_rgba(16,185,129,0.2)]'
                 : 'border-amber-500/50 bg-amber-950/40 text-amber-300 shadow-[0_0_10px_rgba(245,158,11,0.2)]'
             }`}
-            title="Chrome Permissions Hub: Check and manage Microphone, Location, and Notifications"
+            title="Permissions & Backend Setup Hub: Check and manage Backend URL, Microphone, Location, and Notifications"
           >
             <ShieldCheck className="w-3.5 h-3.5 text-cyan-400" />
             <span className="hidden lg:inline">PERMISSIONS</span>

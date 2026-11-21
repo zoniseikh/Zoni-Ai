@@ -34,20 +34,21 @@ class SecureKeyManager(context: Context) {
             securePrefs.edit().remove(KEY_BACKEND_URL).apply()
             return
         }
-        if ((trimmed.startsWith("http://") || trimmed.startsWith("https://")) &&
-            !trimmed.contains("appassets.androidplatform.net", ignoreCase = true)
-        ) {
+        if (ZoniUserSettings.isValidProductionBackendUrl(trimmed)) {
             securePrefs.edit().putString(KEY_BACKEND_URL, trimmed).apply()
         }
     }
 
     fun getBackendUrl(): String {
         val saved = securePrefs.getString(KEY_BACKEND_URL, null)?.trim().orEmpty()
-        val candidate = if (saved.isBlank()) DEFAULT_BACKEND_URL else saved
-        if (candidate.contains("appassets.androidplatform.net", ignoreCase = true)) {
-            return ""
+        if (ZoniUserSettings.isValidProductionBackendUrl(saved)) {
+            return saved
         }
-        return candidate
+        // Auto-migrate stale/invalid persisted URL (e.g., dead ais-pre, localhost, or appassets)
+        if (saved.isNotBlank()) {
+            securePrefs.edit().remove(KEY_BACKEND_URL).apply()
+        }
+        return DEFAULT_BACKEND_URL
     }
 
     fun saveResumptionHandle(handle: String?) {

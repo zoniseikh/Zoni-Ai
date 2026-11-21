@@ -7,6 +7,7 @@ import android.webkit.JavascriptInterface
 import com.zoni.jarvis.assistant.BuildConfig
 import com.zoni.jarvis.assistant.calling.SimCallManager
 import com.zoni.jarvis.assistant.data.SecureKeyManager
+import com.zoni.jarvis.assistant.data.ZoniUserSettings
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
 import com.zoni.jarvis.assistant.screen.ScreenCaptureManager
 import com.zoni.jarvis.assistant.service.AutoReplyRuleManager
@@ -238,10 +239,7 @@ class ZoniWebAppInterface(
     @JavascriptInterface
     fun setBackendUrl(url: String): Boolean {
         val clean = url.trim().trimEnd('/')
-        if (clean.isBlank()) return false
-        if ((!clean.startsWith("http://") && !clean.startsWith("https://")) ||
-            clean.contains("appassets.androidplatform.net", ignoreCase = true)
-        ) {
+        if (!ZoniUserSettings.isValidProductionBackendUrl(clean)) {
             return false
         }
         keyManager.saveBackendUrl(clean)

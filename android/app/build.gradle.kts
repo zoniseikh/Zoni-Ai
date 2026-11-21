@@ -22,7 +22,10 @@ android {
             useSupportLibrary = true
         }
 
-        val configuredBackendUrl = (System.getenv("ZONI_BACKEND_URL") ?: "")
+        val configuredBackendUrl = (
+            System.getenv("ZONI_BACKEND_URL")?.takeIf { it.isNotBlank() }
+                ?: "https://zoni-ai-675435111499.asia-southeast1.run.app"
+            )
             .trim()
             .trimEnd('/')
             .replace("\\", "\\\\")

@@ -187,6 +187,41 @@ export default function App() {
     }));
   }, [selectedAffectionName, activeLanguage, voiceAutoPlay, voiceMuted]);
 
+  // Lock background page scroll and track Android IME visualViewport height while any modal is open
+  const isAnyModalOpen =
+    isSettingsModalOpen || isPermissionsModalOpen || isApkModalOpen || isCallingModalOpen;
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !isAnyModalOpen) return;
+
+    const root = document.documentElement;
+    const prevBodyOverflow = document.body.style.overflow;
+    const prevHtmlOverflow = root.style.overflow;
+    document.body.style.overflow = 'hidden';
+    root.style.overflow = 'hidden';
+
+    const updateVisualViewportHeight = () => {
+      const vh = window.visualViewport?.height || window.innerHeight;
+      if (vh > 0) {
+        root.style.setProperty('--zoni-visual-vh', `${Math.round(vh)}px`);
+      }
+    };
+
+    updateVisualViewportHeight();
+    window.addEventListener('resize', updateVisualViewportHeight);
+    window.visualViewport?.addEventListener('resize', updateVisualViewportHeight);
+    window.visualViewport?.addEventListener('scroll', updateVisualViewportHeight);
+
+    return () => {
+      document.body.style.overflow = prevBodyOverflow;
+      root.style.overflow = prevHtmlOverflow;
+      root.style.removeProperty('--zoni-visual-vh');
+      window.removeEventListener('resize', updateVisualViewportHeight);
+      window.visualViewport?.removeEventListener('resize', updateVisualViewportHeight);
+      window.visualViewport?.removeEventListener('scroll', updateVisualViewportHeight);
+    };
+  }, [isAnyModalOpen]);
+
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     let initialName = 'Boss';
     if (typeof window !== 'undefined') {
@@ -334,7 +369,10 @@ export default function App() {
       const base = getApiBaseUrl();
       const res = await fetch(`${base}/api/status`, { cache: 'no-store' });
       const data = await res.json().catch(() => ({}));
-      const geminiConfigured = Boolean(data.geminiConfigured);
+      const geminiConfigured =
+        typeof data.geminiConfigured === 'boolean'
+          ? data.geminiConfigured
+          : Boolean(data.geminiLiveSupported || data.status === 'online');
       const errMsg =
         data.configurationError ||
         (!res.ok ? `Backend returned HTTP ${res.status}` : null);

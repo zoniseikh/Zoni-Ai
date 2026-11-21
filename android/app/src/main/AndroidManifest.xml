@@ -86,6 +86,7 @@
         <!-- Main Zoni AI Command Center Activity -->
         <activity
             android:name=".ui.MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:exported="true"
             android:launchMode="singleTask"
             android:theme="@style/Theme.ZoniAI"
