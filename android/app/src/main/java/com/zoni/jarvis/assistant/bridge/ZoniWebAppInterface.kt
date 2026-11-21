@@ -3,6 +3,7 @@ package com.zoni.jarvis.assistant.bridge
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.util.Log
 import android.webkit.JavascriptInterface
 import com.zoni.jarvis.assistant.BuildConfig
 import com.zoni.jarvis.assistant.calling.SimCallManager
@@ -38,8 +39,22 @@ class ZoniWebAppInterface(
     // --- Typed Allowlisted Action Engine (20 tools + explicit confirmation workflow) ---
 
     @JavascriptInterface
-    fun executeTypedActionJson(requestJson: String): String =
-        hardware.deviceActionExecutor.executeTypedActionJson(requestJson)
+    fun executeTypedActionJson(requestJson: String): String {
+        val resultJson = hardware.deviceActionExecutor.executeTypedActionJson(requestJson)
+        try {
+            val parsed = JSONObject(resultJson)
+            Log.d(
+                "ZoniBridge",
+                "executeTypedAction: action=${parsed.optString("actionType")} status=${parsed.optString("status")} failure=${parsed.optString("failureReason")}"
+            )
+        } catch (_: Exception) {
+            // ignore diagnostic parse issue
+        }
+        return resultJson
+    }
+
+    @JavascriptInterface
+    fun getRuntimeDiagnosticsJson(): String = hardware.deviceActionExecutor.getRuntimeDiagnosticsJson()
 
     @JavascriptInterface
     fun confirmPendingActionJson(pendingActionId: String, editedMessage: String, useNotificationReply: Boolean): String =
@@ -110,7 +125,19 @@ class ZoniWebAppInterface(
     fun launchApp(appQuery: String): Boolean = hardware.launchInstalledApp(appQuery)
 
     @JavascriptInterface
-    fun launchAppDetailedJson(appQuery: String): String = hardware.launchInstalledAppDetailedJson(appQuery)
+    fun launchAppDetailedJson(appQuery: String): String {
+        val res = hardware.launchInstalledAppDetailedJson(appQuery)
+        try {
+            val parsed = JSONObject(res)
+            Log.d(
+                "ZoniBridge",
+                "launchAppDetailed: status=${parsed.optString("status")} pkg=${parsed.optString("packageName")} failure=${parsed.optString("failureReason")}"
+            )
+        } catch (_: Exception) {
+            // ignore
+        }
+        return res
+    }
 
     @JavascriptInterface
     fun openSystemSettings(target: String): Boolean = hardware.openSystemSettings(target)

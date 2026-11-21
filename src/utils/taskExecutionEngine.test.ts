@@ -170,9 +170,92 @@ test('buildStructuredTaskPlan leaves ordinary Bengali & English conversation emp
   }
 });
 
+test('Category A & B: buildStructuredTaskPlan handles natural Bengali, English, and Hindi app launch commands', () => {
+  const cases: Array<[string, string]> = [
+    ['WhatsApp খুলে দাও', 'whatsapp'],
+    ['হোয়াটসঅ্যাপ ওপেন করো', 'হোয়াটসঅ্যাপ'],
+    ['ফেসবুকটা খুলে দাও', 'ফেসবুক'],
+    ['ইউটিউব চালু করো', 'ইউটিউব'],
+    ['আমার ফোনে থাকা Chrome চালু করো', 'chrome'],
+    ['Open WhatsApp', 'whatsapp'],
+    ['Open Instagram for me', 'instagram'],
+    ['Launch Calculator', 'calculator'],
+    ['व्हाट्सएप खोलो', 'व्हाट्सएप'],
+    ['यूट्यूब चालू करो', 'यूट्यूब'],
+  ];
+
+  for (const [utterance, expectedTarget] of cases) {
+    const plan = buildStructuredTaskPlan(utterance);
+    assert.equal(plan.steps.length, 1, `Expected 1 step for "${utterance}"`);
+    assert.equal(plan.steps[0].tool, 'open_app', `Expected open_app for "${utterance}"`);
+    assert.equal(
+      String(plan.steps[0].args.appQuery || '').toLowerCase(),
+      expectedTarget,
+      `Mismatch for "${utterance}"`
+    );
+  }
+});
+
+test('Category C: buildStructuredTaskPlan handles natural Bengali, English, and Hindi WhatsApp messaging including empty bodies', () => {
+  const waFirstBn = buildStructuredTaskPlan('WhatsApp-এ রাহুলকে একটা মেসেজ পাঠিয়ে দাও।');
+  assert.equal(waFirstBn.steps[0]?.tool, 'whatsapp_prepare');
+  assert.equal(waFirstBn.steps[0]?.args.contactQuery, 'রাহুল');
+  assert.equal(waFirstBn.steps[0]?.args.message, '');
+  assert.equal(waFirstBn.requiresConfirmation, true);
+
+  const waColonBn = buildStructuredTaskPlan('রাহুলকে WhatsApp মেসেজ পাঠাও: আমি আসছি');
+  assert.equal(waColonBn.steps[0]?.tool, 'whatsapp_prepare');
+  assert.equal(waColonBn.steps[0]?.args.contactQuery, 'রাহুল');
+  assert.equal(waColonBn.steps[0]?.args.message, 'আমি আসছি');
+
+  const waMotherEmpty = buildStructuredTaskPlan('মাকে একটা মেসেজ লিখে দাও');
+  assert.equal(waMotherEmpty.steps[0]?.tool, 'whatsapp_prepare');
+  assert.equal(waMotherEmpty.steps[0]?.args.contactQuery, 'মা');
+  assert.equal(waMotherEmpty.steps[0]?.args.message, '');
+
+  const enNoBody = buildStructuredTaskPlan('Send a WhatsApp message to Rahul');
+  assert.equal(enNoBody.steps[0]?.tool, 'whatsapp_prepare');
+  assert.equal(enNoBody.steps[0]?.args.contactQuery, 'Rahul');
+  assert.equal(enNoBody.steps[0]?.args.message, '');
+
+  const enOnWa = buildStructuredTaskPlan('Message Rahul on WhatsApp saying I am coming');
+  assert.equal(enOnWa.steps[0]?.tool, 'whatsapp_prepare');
+  assert.equal(enOnWa.steps[0]?.args.contactQuery, 'Rahul');
+  assert.equal(enOnWa.steps[0]?.args.message, 'I am coming');
+
+  const hiWa = buildStructuredTaskPlan('राहुल को व्हाट्सएप मैसेज भेजो कि मैं आ रहा हूँ');
+  assert.equal(hiWa.steps[0]?.tool, 'whatsapp_prepare');
+  assert.equal(hiWa.steps[0]?.args.contactQuery, 'राहुल');
+  assert.equal(hiWa.steps[0]?.args.message, 'मैं आ रहा हूँ');
+});
+
+test('Category E: buildStructuredTaskPlan parses supported generic app chat commands (Telegram, Instagram, Messenger) with mandatory confirmation', () => {
+  const tgBn = buildStructuredTaskPlan('টেলিগ্রামে রাহুলকে মেসেজ পাঠাও: আমি আসছি');
+  assert.equal(tgBn.steps[0]?.tool, 'app_chat_prepare');
+  assert.equal(tgBn.steps[0]?.args.appName, 'Telegram');
+  assert.equal(tgBn.steps[0]?.args.contactQuery, 'রাহুল');
+  assert.equal(tgBn.steps[0]?.args.message, 'আমি আসছি');
+  assert.equal(tgBn.requiresConfirmation, true);
+
+  const igEn = buildStructuredTaskPlan('Message Riya on Instagram saying hello there');
+  assert.equal(igEn.steps[0]?.tool, 'app_chat_prepare');
+  assert.equal(igEn.steps[0]?.args.appName, 'Instagram');
+  assert.equal(igEn.steps[0]?.args.contactQuery, 'Riya');
+  assert.equal(igEn.steps[0]?.args.message, 'hello there');
+  assert.equal(igEn.requiresConfirmation, true);
+
+  const msEn = buildStructuredTaskPlan('Send a message to Rahul on Messenger saying call me');
+  assert.equal(msEn.steps[0]?.tool, 'app_chat_prepare');
+  assert.equal(msEn.steps[0]?.args.appName, 'Messenger');
+  assert.equal(msEn.steps[0]?.args.contactQuery, 'Rahul');
+  assert.equal(msEn.steps[0]?.args.message, 'call me');
+  assert.equal(msEn.requiresConfirmation, true);
+});
+
 test('formatHonestTaskOutcome never claims WhatsApp message was automatically sent', () => {
   const msg = formatHonestTaskOutcome('whatsapp_prepare', true);
   assert.ok(msg.includes('WhatsApp'));
   assert.ok(msg.includes('Send'));
   assert.equal(msg.includes('পাঠানো হয়ে গেছে'), false);
 });
+

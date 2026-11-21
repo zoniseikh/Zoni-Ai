@@ -880,26 +880,63 @@ class ZoniAccessibilityService : AccessibilityService() {
             )
         }
 
-        // Verify composer holds the approved message (if blank, enter text safely)
+        // Locate WhatsApp composer and guarantee it contains EXACTLY the user-approved message
         val composerNode = findWhatsAppComposerNode(waRoot)
-        if (composerNode != null && !composerNode.isPassword) {
-            val existingComposerText = composerNode.text?.toString()?.trim().orEmpty()
-            if (existingComposerText.isEmpty()) {
-                composerNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                val args = Bundle().apply {
-                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, cleanMsg)
-                }
-                composerNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-                try {
-                    Thread.sleep(200L)
-                } catch (_: InterruptedException) {
-                    // ignore
-                }
+        if (composerNode == null || composerNode.isPassword) {
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "whatsapp_send_approved",
+                activePackage = activePkg,
+                message = "Could not locate the WhatsApp message composer safely. Please verify and tap Send manually.",
+                failureReason = "composer_not_found"
+            )
+        }
+
+        val existingComposerText = composerNode.text?.toString()?.trim().orEmpty()
+        if (!WhatsAppAutomationValidator.composerMatchesApprovedMessage(existingComposerText, cleanMsg)) {
+            composerNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, cleanMsg)
+            }
+            val setOk = composerNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            if (!setOk) {
+                WhatsAppSendDeduplicator.release(pendingActionId)
+                return AccessibilityActionOutcome(
+                    success = false,
+                    verified = false,
+                    actionType = "whatsapp_send_approved",
+                    activePackage = activePkg,
+                    message = "Could not safely set the approved message in WhatsApp composer. Did not tap Send — please review and send manually.",
+                    failureReason = "composer_set_text_failed"
+                )
+            }
+            try {
+                Thread.sleep(220L)
+            } catch (_: InterruptedException) {
+                // ignore
             }
         }
 
-        // Locate visible, enabled WhatsApp Send button semantically
+        // Refresh node and verify composer text matches the exact approved message before tapping Send
+        composerNode.refresh()
         val freshRoot = rootInActiveWindow ?: waRoot
+        val refreshedComposer = findWhatsAppComposerNode(freshRoot) ?: composerNode
+        val verifiedComposerText = refreshedComposer.text?.toString()?.trim().orEmpty()
+        if (!WhatsAppAutomationValidator.composerMatchesApprovedMessage(verifiedComposerText, cleanMsg)) {
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "whatsapp_send_approved",
+                activePackage = activePkg,
+                message = "WhatsApp composer text did not match the exact message you approved. Stopped before tapping Send — please review and send manually.",
+                failureReason = "composer_verification_failed"
+            )
+        }
+
+        // Locate visible, enabled WhatsApp Send button semantically
         val sendNode = findWhatsAppSendButton(freshRoot)
         if (sendNode == null) {
             WhatsAppSendDeduplicator.release(pendingActionId)
@@ -937,7 +974,7 @@ class ZoniAccessibilityService : AccessibilityService() {
             )
         }
 
-        // Wait briefly and verify outgoing message appears in conversation or composer cleared
+        // Wait briefly and verify outgoing message appears in conversation AND composer cleared
         try {
             Thread.sleep(450L)
         } catch (_: InterruptedException) {
@@ -958,18 +995,276 @@ class ZoniAccessibilityService : AccessibilityService() {
             actionType = "whatsapp_send_approved",
             activePackage = activePkg,
             message = if (sentVerified) {
-                "Send action completed in WhatsApp for $expectedRecipient and verified in chat (delivery/read status depends on WhatsApp network)."
+                "Send action completed in WhatsApp for $expectedRecipient and verified in chat (sent=verified, delivered/read depends on WhatsApp network)."
             } else {
                 "Triggered Send in WhatsApp for $expectedRecipient, but could not visually confirm the outgoing bubble. Please check WhatsApp."
             },
             data = JSONObject()
                 .put("contactName", expectedRecipient)
                 .put("phoneNumber", expectedPhone)
-                .put("messageText", cleanMsg)
                 .put("method", clickMethod)
                 .put("sentVerified", sentVerified)
                 .put("deliveryVerified", false)
+                .put("readVerified", false)
         )
+    }
+
+    /**
+     * Controlled Generic App Chat Automation for explicitly supported accessible messaging apps
+     * (Telegram, Instagram, Messenger) ONLY invoked AFTER explicit user approval.
+     */
+    fun sendApprovedAppChatMessage(
+        appName: String,
+        expectedRecipient: String,
+        expectedMessage: String,
+        pendingActionId: String
+    ): AccessibilityActionOutcome {
+        val adapter = AppChatAdapterRegistry.findAdapter(appName)
+            ?: return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "app_chat_send_approved",
+                activePackage = getActivePackageName(),
+                message = "Automated chat sending is not supported for \"$appName\".",
+                failureReason = "unsupported_chat_app"
+            )
+
+        val cleanMsg = expectedMessage.trim()
+        if (cleanMsg.isEmpty()) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "app_chat_send_approved",
+                activePackage = getActivePackageName(),
+                message = "Cannot send an empty message in ${adapter.appName}.",
+                failureReason = "empty_message"
+            )
+        }
+
+        if (!WhatsAppSendDeduplicator.tryAcquire(pendingActionId)) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "app_chat_send_approved",
+                activePackage = getActivePackageName(),
+                message = "Duplicate send prevented: this approved ${adapter.appName} message was already processed.",
+                failureReason = "duplicate_send_prevented"
+            )
+        }
+
+        // Wait briefly for target messaging app to reach foreground
+        var root: AccessibilityNodeInfo? = null
+        var activePkg = ""
+        for (attempt in 0 until 8) {
+            val candidateRoot = rootInActiveWindow
+            val pkg = candidateRoot?.packageName?.toString().orEmpty()
+            if (candidateRoot != null && adapter.matchesPackage(pkg)) {
+                root = candidateRoot
+                activePkg = pkg
+                break
+            }
+            try {
+                Thread.sleep(300L)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+
+        val appRoot = root ?: run {
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "app_chat_send_approved",
+                activePackage = getActivePackageName(),
+                message = "${adapter.appName} did not reach the foreground in time. Please send your message manually.",
+                failureReason = "target_app_not_in_foreground"
+            )
+        }
+
+        checkScreenSafety(appRoot, "app_chat_send_approved")?.let { blocked ->
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return blocked
+        }
+
+        // Verify expected recipient appears in visible screen labels if recipient is specified
+        val visibleLabels = collectVisibleLabels(appRoot, 45)
+        if (expectedRecipient.isNotBlank() && !WhatsAppAutomationValidator.matchesExpectedRecipient(visibleLabels, expectedRecipient, "")) {
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "app_chat_send_approved",
+                activePackage = activePkg,
+                message = "Opened ${adapter.appName}, but could not verify active chat matches \"$expectedRecipient\". Open their chat and tap Send manually.",
+                failureReason = "recipient_verification_failed"
+            )
+        }
+
+        val composer = findComposerForAdapter(appRoot, adapter)
+        if (composer == null || composer.isPassword) {
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "app_chat_send_approved",
+                activePackage = activePkg,
+                message = "Opened ${adapter.appName}, but no visible chat composer was detected. Open the chat and send manually.",
+                failureReason = "composer_not_found"
+            )
+        }
+
+        composer.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val setArgs = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, cleanMsg)
+        }
+        val setOk = composer.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
+        if (!setOk) {
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "app_chat_send_approved",
+                activePackage = activePkg,
+                message = "Could not enter text into ${adapter.appName} composer. Please type and send manually.",
+                failureReason = "composer_set_text_failed"
+            )
+        }
+        try {
+            Thread.sleep(220L)
+        } catch (_: InterruptedException) {
+            // ignore
+        }
+
+        composer.refresh()
+        val refreshedRoot = rootInActiveWindow ?: appRoot
+        val refreshedComposer = findComposerForAdapter(refreshedRoot, adapter) ?: composer
+        val currentText = refreshedComposer.text?.toString()?.trim().orEmpty()
+        if (!WhatsAppAutomationValidator.composerMatchesApprovedMessage(currentText, cleanMsg)) {
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "app_chat_send_approved",
+                activePackage = activePkg,
+                message = "${adapter.appName} composer text could not be verified against your approved message. Please review and send manually.",
+                failureReason = "composer_verification_failed"
+            )
+        }
+
+        val sendBtn = findSendButtonForAdapter(refreshedRoot, adapter)
+        if (sendBtn == null) {
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "app_chat_send_approved",
+                activePackage = activePkg,
+                message = "Entered your approved message in ${adapter.appName}, but the Send button was not found. Please tap Send manually.",
+                failureReason = "send_button_not_found"
+            )
+        }
+
+        var clicked = sendBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        var clickMethod = "semantic_send_click"
+        if (!clicked) {
+            val rect = Rect()
+            sendBtn.getBoundsInScreen(rect)
+            if (!rect.isEmpty && rect.centerX() > 0 && rect.centerY() > 0) {
+                clicked = dispatchTapGesture(rect.centerX().toFloat(), rect.centerY().toFloat())
+                clickMethod = "bounded_send_gesture"
+            }
+        }
+
+        if (!clicked) {
+            WhatsAppSendDeduplicator.release(pendingActionId)
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "app_chat_send_approved",
+                activePackage = activePkg,
+                message = "Could not trigger Send in ${adapter.appName}. Please tap Send manually.",
+                failureReason = "send_click_rejected"
+            )
+        }
+
+        try {
+            Thread.sleep(450L)
+        } catch (_: InterruptedException) {
+            // ignore
+        }
+        val postRoot = rootInActiveWindow
+        val postLabels = if (postRoot != null) collectVisibleLabels(postRoot, 60) else emptyList()
+        val postComposer = if (postRoot != null) findComposerForAdapter(postRoot, adapter)?.text?.toString().orEmpty() else ""
+        val sentVerified = WhatsAppAutomationValidator.verifyOutgoingMessageVisible(postLabels, postComposer, cleanMsg)
+
+        return AccessibilityActionOutcome(
+            success = true,
+            verified = sentVerified,
+            actionType = "app_chat_send_approved",
+            activePackage = activePkg,
+            message = if (sentVerified) {
+                "Send clicked and verified in ${adapter.appName} for $expectedRecipient."
+            } else {
+                "Triggered Send in ${adapter.appName} for $expectedRecipient, please verify delivery in the app."
+            },
+            data = JSONObject()
+                .put("appName", adapter.appName)
+                .put("packageName", activePkg)
+                .put("contactName", expectedRecipient)
+                .put("method", clickMethod)
+                .put("sentVerified", sentVerified)
+                .put("deliveryVerified", false)
+                .put("readVerified", false)
+        )
+    }
+
+    private fun findComposerForAdapter(root: AccessibilityNodeInfo, adapter: SupportedAppChatAdapter): AccessibilityNodeInfo? {
+        var fallbackEditable: AccessibilityNodeInfo? = null
+        fun search(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+            if (node == null || node.isPassword) return null
+            if (node.isEditable && node.isVisibleToUser) {
+                val vid = node.viewIdResourceName?.lowercase().orEmpty()
+                val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) node.hintText?.toString()?.lowercase().orEmpty() else ""
+                if (AccessibilityGuard.isSensitiveInputHint(hint)) return null
+                if (adapter.composerIdHints.any { vid.contains(it) || hint.contains(it) }) {
+                    return node
+                }
+                if (fallbackEditable == null) fallbackEditable = node
+            }
+            for (i in 0 until node.childCount) {
+                val found = search(node.getChild(i))
+                if (found != null) return found
+            }
+            return null
+        }
+        return search(root) ?: fallbackEditable
+    }
+
+    private fun findSendButtonForAdapter(root: AccessibilityNodeInfo, adapter: SupportedAppChatAdapter): AccessibilityNodeInfo? {
+        fun search(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+            if (node == null || node.isPassword) return null
+            if (adapter.matchesSendButton(
+                    viewId = node.viewIdResourceName,
+                    contentDescription = node.contentDescription?.toString(),
+                    text = node.text?.toString(),
+                    isEnabled = node.isEnabled,
+                    isVisible = node.isVisibleToUser
+                )
+            ) {
+                var target: AccessibilityNodeInfo? = node
+                while (target != null && !target.isClickable) {
+                    target = target.parent
+                }
+                return target ?: node
+            }
+            for (i in 0 until node.childCount) {
+                val found = search(node.getChild(i))
+                if (found != null) return found
+            }
+            return null
+        }
+        return search(root)
     }
 
     private fun findWhatsAppComposerNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
@@ -1085,6 +1380,27 @@ class ZoniAccessibilityService : AccessibilityService() {
             )
         }
 
+        fun sendApprovedAppChatMessage(
+            appName: String,
+            expectedRecipient: String,
+            expectedMessage: String,
+            pendingActionId: String
+        ): AccessibilityActionOutcome {
+            val svc = instance ?: return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "app_chat_send_approved",
+                message = "Zoni Accessibility Service is not enabled. Please enable Accessibility Service or send manually in $appName.",
+                failureReason = "accessibility_service_disabled"
+            )
+            return svc.sendApprovedAppChatMessage(
+                appName = appName,
+                expectedRecipient = expectedRecipient,
+                expectedMessage = expectedMessage,
+                pendingActionId = pendingActionId
+            )
+        }
+
         fun performExplicitActionDetailedJson(command: String): String {
             val svc = instance ?: return AccessibilityActionOutcome(
                 success = false,
@@ -1164,12 +1480,23 @@ object WhatsAppAutomationValidator {
     ): Boolean {
         if (!isEnabled || !isVisible) return false
         val vid = viewId?.trim()?.lowercase().orEmpty()
-        if (vid == "com.whatsapp:id/send" || vid == "com.whatsapp.w4b:id/send" || vid.endsWith(":id/send")) {
+        if (vid == "com.whatsapp:id/send" ||
+            vid == "com.whatsapp.w4b:id/send" ||
+            vid.endsWith(":id/send") ||
+            vid.endsWith(":id/send_container")
+        ) {
             return true
         }
         val desc = contentDescription?.trim()?.lowercase().orEmpty()
         val txt = text?.trim()?.lowercase().orEmpty()
         return desc in SEND_LABELS || txt in SEND_LABELS
+    }
+
+    fun composerMatchesApprovedMessage(composerText: String?, approvedMessage: String): Boolean {
+        val actual = composerText?.trim()?.replace(Regex("\\s+"), " ").orEmpty()
+        val expected = approvedMessage.trim().replace(Regex("\\s+"), " ")
+        if (expected.isEmpty()) return false
+        return actual == expected
     }
 
     fun matchesExpectedRecipient(
@@ -1214,7 +1541,81 @@ object WhatsAppAutomationValidator {
 }
 
 /**
- * Thread-safe idempotency guard ensuring an approved WhatsApp pendingActionId can NEVER be sent twice.
+ * Controlled App-Specific Adapter Registry for Generic Messaging Apps (Root Cause 7).
+ * Never assumes all messaging apps share the same UI — only explicitly tested adapters are allowed.
+ */
+data class SupportedAppChatAdapter(
+    val appName: String,
+    val aliases: Set<String>,
+    val packageNames: Set<String>,
+    val composerIdHints: List<String>,
+    val sendIdHints: List<String>,
+    val sendDescriptions: Set<String>
+) {
+    fun matchesPackage(pkg: String?): Boolean {
+        val clean = pkg?.trim()?.lowercase().orEmpty()
+        return clean in packageNames
+    }
+
+    fun matchesSendButton(
+        viewId: String?,
+        contentDescription: String?,
+        text: String?,
+        isEnabled: Boolean,
+        isVisible: Boolean
+    ): Boolean {
+        if (!isEnabled || !isVisible) return false
+        val vid = viewId?.trim()?.lowercase().orEmpty()
+        if (sendIdHints.any { vid.contains(it) }) return true
+        val desc = contentDescription?.trim()?.lowercase().orEmpty()
+        val txt = text?.trim()?.lowercase().orEmpty()
+        return desc in sendDescriptions || txt in sendDescriptions
+    }
+}
+
+object AppChatAdapterRegistry {
+    private val SEND_COMMON = setOf("send", "পাঠান", "भेजें", "भेजे", "send message")
+
+    val SUPPORTED_ADAPTERS: List<SupportedAppChatAdapter> = listOf(
+        SupportedAppChatAdapter(
+            appName = "Telegram",
+            aliases = setOf("telegram", "টেলিগ্রাম", "टेलीग्राम"),
+            packageNames = setOf("org.telegram.messenger", "org.telegram.messenger.web"),
+            composerIdHints = listOf("message", "chat_edit", "edit"),
+            sendIdHints = listOf(":id/send", "send_button"),
+            sendDescriptions = SEND_COMMON
+        ),
+        SupportedAppChatAdapter(
+            appName = "Instagram",
+            aliases = setOf("instagram", "insta", "ইনস্টাগ্রাম", "ইন্সটাগ্রাম", "इंस्टाग्राम"),
+            packageNames = setOf("com.instagram.android"),
+            composerIdHints = listOf("row_thread_composer_edittext", "message"),
+            sendIdHints = listOf("row_thread_composer_button_send", ":id/send"),
+            sendDescriptions = SEND_COMMON
+        ),
+        SupportedAppChatAdapter(
+            appName = "Messenger",
+            aliases = setOf("messenger", "মেসেঞ্জার", "मैसेंजर"),
+            packageNames = setOf("com.facebook.orca"),
+            composerIdHints = listOf("composer", "message", "text_input"),
+            sendIdHints = listOf(":id/send", "send_button"),
+            sendDescriptions = SEND_COMMON
+        )
+    )
+
+    fun findAdapter(appQuery: String?): SupportedAppChatAdapter? {
+        val clean = appQuery?.trim()?.lowercase().orEmpty()
+        if (clean.isEmpty()) return null
+        return SUPPORTED_ADAPTERS.firstOrNull { adapter ->
+            adapter.appName.equals(clean, ignoreCase = true) ||
+                clean in adapter.aliases ||
+                clean in adapter.packageNames
+        }
+    }
+}
+
+/**
+ * Thread-safe idempotency guard ensuring an approved pendingActionId can NEVER be sent twice.
  */
 object WhatsAppSendDeduplicator {
     private val processedIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()

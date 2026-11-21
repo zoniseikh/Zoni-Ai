@@ -4,6 +4,7 @@ import { playProceduralSfx } from '../utils/audio';
 import { PREDEFINED_AFFECTION_OPTIONS } from './GfStatusPanel';
 import { WsConnectionStatus } from '../utils/liveSessionProtocol';
 import { getDisplayBackendUrl, getBackendConfigError } from '../utils/apiConfig';
+import type { DeviceActionDiagnosticsState } from '../utils/liveToolRelay';
 import {
   X,
   Settings,
@@ -20,6 +21,8 @@ import {
   RefreshCw,
   Server,
   AlertTriangle,
+  Activity,
+  ExternalLink,
 } from 'lucide-react';
 
 export interface BackendHealthSnapshot {
@@ -39,12 +42,15 @@ interface ZoniSettingsModalProps {
   isLiveActive: boolean;
   wsStatus?: WsConnectionStatus;
   backendHealth?: BackendHealthSnapshot | null;
+  deviceDiagnostics?: DeviceActionDiagnosticsState;
   onSelectMode: (mode: CompanionMode) => void;
   onUpdateAffectionName: (name: string) => void;
   onSelectVoice: (voice: string) => void;
   onToggleSoundFx?: () => void;
   onReconnectLive?: () => void;
   onOpenBackendSetup?: () => void;
+  onRefreshDiagnostics?: () => void;
+  onOpenAccessibilitySettings?: () => void;
 }
 
 export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
@@ -55,12 +61,15 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
   isLiveActive,
   wsStatus = 'disconnected',
   backendHealth,
+  deviceDiagnostics,
   onSelectMode,
   onUpdateAffectionName,
   onSelectVoice,
   onToggleSoundFx,
   onReconnectLive,
   onOpenBackendSetup,
+  onRefreshDiagnostics,
+  onOpenAccessibilitySettings,
 }) => {
   const [isEditingCustom, setIsEditingCustom] = useState(false);
   const [customInput, setCustomInput] = useState(selectedAffectionName || 'Boss');
@@ -497,6 +506,170 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
                 </button>
               )}
             </div>
+          </section>
+
+          {/* SECTION 5: REAL-TIME DEVICE ACTION DIAGNOSTICS */}
+          <section
+            data-testid="device-action-diagnostics"
+            className="p-4 rounded-xl bg-slate-900/60 border border-emerald-500/30 space-y-2.5 font-mono text-xs"
+          >
+            <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-emerald-500/20">
+              <div className="flex items-center gap-2 min-w-0">
+                <Activity className="w-4 h-4 text-emerald-400 shrink-0" />
+                <h4 className="font-sci-fi text-[11px] text-emerald-300 tracking-wider uppercase truncate">
+                  5. Device Action Diagnostics (রিয়েল-টাইম ডায়াগনস্টিক্স)
+                </h4>
+              </div>
+              {onRefreshDiagnostics && (
+                <button
+                  type="button"
+                  onClick={onRefreshDiagnostics}
+                  className="shrink-0 px-2 py-1 rounded-md border border-emerald-500/40 bg-emerald-950/50 hover:bg-emerald-900/60 text-emerald-200 text-[10px] font-hud font-bold flex items-center gap-1 cursor-pointer"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  <span>REFRESH</span>
+                </button>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-emerald-500/10">
+              <span className="text-slate-400 shrink-0">ANDROID BRIDGE:</span>
+              <span
+                className={
+                  deviceDiagnostics?.bridgeConnected
+                    ? 'text-emerald-400 font-bold text-right'
+                    : 'text-amber-300 font-bold text-right'
+                }
+              >
+                {deviceDiagnostics?.bridgeConnected
+                  ? 'CONNECTED (NATIVE APK)'
+                  : 'DISCONNECTED (WEB PREVIEW)'}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-emerald-500/10">
+              <span className="text-slate-400 shrink-0">EXECUTION PATH:</span>
+              <span className="text-cyan-300 font-bold text-right">
+                {deviceDiagnostics?.executionPath === 'live_ws'
+                  ? 'LIVE WEBSOCKET TOOL RELAY'
+                  : deviceDiagnostics?.executionPath === 'http_chat'
+                  ? 'HTTP /api/chat FUNCTION CALLING'
+                  : deviceDiagnostics?.executionPath === 'deterministic_native'
+                  ? 'DETERMINISTIC NATIVE ENGINE'
+                  : 'IDLE (READY)'}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-emerald-500/10">
+              <span className="text-slate-400 shrink-0">GEMINI TOOL CALLING:</span>
+              <span
+                className={
+                  deviceDiagnostics?.geminiToolCallingAvailable
+                    ? 'text-emerald-400 font-bold text-right'
+                    : 'text-amber-300 font-bold text-right'
+                }
+              >
+                {deviceDiagnostics?.geminiToolCallingAvailable
+                  ? `AVAILABLE (${deviceDiagnostics.declaredToolsCount || 25} TOOLS)`
+                  : 'UNAVAILABLE'}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-emerald-500/10">
+              <span className="text-slate-400 shrink-0">ACCESSIBILITY SERVICE:</span>
+              <span
+                className={
+                  deviceDiagnostics?.accessibilityEnabled
+                    ? 'text-emerald-400 font-bold text-right'
+                    : 'text-amber-300 font-bold text-right'
+                }
+              >
+                {deviceDiagnostics?.accessibilityEnabled
+                  ? 'CONNECTED & ENABLED'
+                  : deviceDiagnostics?.bridgeConnected
+                  ? 'DISABLED (OPEN SETTINGS)'
+                  : 'APK REQUIRED'}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-emerald-500/10">
+              <span className="text-slate-400 shrink-0">CONTACTS PERMISSION:</span>
+              <span
+                className={
+                  deviceDiagnostics?.contactsPermissionGranted
+                    ? 'text-emerald-400 font-bold text-right'
+                    : 'text-amber-300 font-bold text-right'
+                }
+              >
+                {deviceDiagnostics?.contactsPermissionGranted
+                  ? 'GRANTED'
+                  : deviceDiagnostics?.bridgeConnected
+                  ? 'DENIED'
+                  : 'APK REQUIRED'}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-emerald-500/10">
+              <span className="text-slate-400 shrink-0">APP DISCOVERY:</span>
+              <span className="text-cyan-200 font-bold text-right">
+                {deviceDiagnostics?.installedAppDiscoveryStatus || 'APK REQUIRED'}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-emerald-500/10">
+              <span className="text-slate-400 shrink-0">LAST ACTION:</span>
+              <span
+                data-testid="diag-last-action"
+                className="text-cyan-100 truncate text-right"
+                title={deviceDiagnostics?.lastActionRequested || 'None'}
+              >
+                {deviceDiagnostics?.lastActionRequested || 'None'}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-emerald-500/10">
+              <span className="text-slate-400 shrink-0">LAST RESULT:</span>
+              <span
+                data-testid="diag-last-result"
+                className="text-emerald-200 truncate text-right"
+                title={deviceDiagnostics?.lastActionResult || 'None'}
+              >
+                {deviceDiagnostics?.lastActionResult || 'None'}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 py-1">
+              <span className="text-slate-400 shrink-0">FAILURE REASON:</span>
+              <span
+                data-testid="diag-failure-reason"
+                className={
+                  deviceDiagnostics?.lastFailureReason &&
+                  deviceDiagnostics.lastFailureReason !== 'None'
+                    ? 'text-rose-300 font-bold truncate text-right'
+                    : 'text-slate-400 text-right'
+                }
+                title={deviceDiagnostics?.lastFailureReason || 'None'}
+              >
+                {deviceDiagnostics?.lastFailureReason || 'None'}
+              </span>
+            </div>
+
+            <p className="text-[10px] font-sans text-slate-400 pt-1">
+              Privacy protection: diagnostics never display or log private message contents, phone numbers, or API secrets.
+            </p>
+
+            {onOpenAccessibilitySettings && !deviceDiagnostics?.accessibilityEnabled && (
+              <div className="pt-1 font-hud">
+                <button
+                  type="button"
+                  onClick={onOpenAccessibilitySettings}
+                  className="px-3 py-1.5 rounded-lg border border-amber-500/40 bg-amber-950/50 hover:bg-amber-900/60 text-amber-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>OPEN ACCESSIBILITY SETTINGS</span>
+                </button>
+              </div>
+            )}
           </section>
         </div>
 

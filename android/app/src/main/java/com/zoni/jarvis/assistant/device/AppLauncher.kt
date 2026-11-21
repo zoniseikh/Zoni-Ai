@@ -3,6 +3,7 @@ package com.zoni.jarvis.assistant.device
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.max
@@ -16,8 +17,8 @@ data class InstalledAppInfo(
 sealed class AppLaunchResult {
     data class Success(val appLabel: String, val packageName: String) : AppLaunchResult()
     data class MultipleMatches(val query: String, val candidates: List<InstalledAppInfo>) : AppLaunchResult()
-    data class AppNotFound(val query: String) : AppLaunchResult()
-    data class LaunchFailed(val reason: String) : AppLaunchResult()
+    data class AppNotFound(val query: String, val visibilityRestricted: Boolean = false) : AppLaunchResult()
+    data class LaunchFailed(val reason: String, val failureCode: String = "start_activity_failed") : AppLaunchResult()
 }
 
 /**
@@ -109,11 +110,31 @@ object AppNameResolver {
         "कैलेंडर" to listOf("calendar")
     )
 
+    val KNOWN_DECLARED_PACKAGES: Map<String, List<String>> = mapOf(
+        "whatsapp" to listOf("com.whatsapp", "com.whatsapp.w4b"),
+        "youtube" to listOf("com.google.android.youtube"),
+        "chrome" to listOf("com.android.chrome"),
+        "instagram" to listOf("com.instagram.android"),
+        "facebook" to listOf("com.facebook.katana"),
+        "messenger" to listOf("com.facebook.orca"),
+        "telegram" to listOf("org.telegram.messenger"),
+        "spotify" to listOf("com.spotify.music"),
+        "maps" to listOf("com.google.android.apps.maps"),
+        "gmail" to listOf("com.google.android.gm"),
+        "calculator" to listOf("com.google.android.calculator", "com.android.calculator2"),
+        "settings" to listOf("com.android.settings")
+    )
+
     fun expandQueryVariants(rawQuery: String): List<String> {
-        val cleaned = rawQuery.trim()
+        var cleaned = rawQuery.trim()
             .replace(Regex("[.,?!।]"), "")
+            .replace(Regex("^(?:আমার\\s+ফোনে\\s+থাকা|ফোনে\\s+থাকা|আমার|প্লিজ|please|my|the)\\s+", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s+(?:app|অ্যাপটা|অ্যাপটি|অ্যাপ|for\\s+me)$", RegexOption.IGNORE_CASE), "")
             .replace(Regex("\\s+"), " ")
             .lowercase()
+        if ((cleaned.endsWith("টা") || cleaned.endsWith("টি")) && cleaned.length > 3) {
+            cleaned = cleaned.dropLast(2).trim()
+        }
         if (cleaned.isEmpty()) return emptyList()
 
         val variants = LinkedHashSet<String>()
@@ -278,12 +299,38 @@ class AppLauncher(private val context: Context) {
         }
 
         val installedApps = listInstalledApps()
+        Log.d(TAG, "launchAppByVoiceQuery: query='$query', discoveredApps=${installedApps.size}")
         val resolved = AppNameResolver.resolveMatchingApps(query, installedApps)
 
         return when (resolved) {
             is AppLaunchResult.Success -> launchPackage(resolved.packageName, resolved.appLabel)
-            is AppLaunchResult.MultipleMatches -> resolved
-            is AppLaunchResult.AppNotFound -> resolved
+            is AppLaunchResult.MultipleMatches -> {
+                Log.w(TAG, "launchAppByVoiceQuery: multiple matches (${resolved.candidates.size}) for '$query'")
+                resolved
+            }
+            is AppLaunchResult.AppNotFound -> {
+                // Direct lookup fallback for explicitly declared <queries> packages on Android 11+
+                val variants = AppNameResolver.expandQueryVariants(query)
+                for (variant in variants) {
+                    val candidatePkgs = AppNameResolver.KNOWN_DECLARED_PACKAGES[variant].orEmpty()
+                    for (pkg in candidatePkgs) {
+                        val intent = try {
+                            context.packageManager.getLaunchIntentForPackage(pkg)
+                        } catch (_: Exception) {
+                            null
+                        }
+                        if (intent != null) {
+                            Log.d(TAG, "launchAppByVoiceQuery: resolved declared package '$pkg' for '$query'")
+                            return launchPackage(pkg, variant.replaceFirstChar { it.uppercase() })
+                        }
+                    }
+                }
+                val visibilityRestricted = installedApps.isEmpty()
+                if (visibilityRestricted) {
+                    Log.w(TAG, "launchAppByVoiceQuery: PackageManager returned 0 launchable apps (Android 11+ visibility restriction)")
+                }
+                AppLaunchResult.AppNotFound(query, visibilityRestricted = visibilityRestricted)
+            }
             is AppLaunchResult.LaunchFailed -> resolved
         }
     }
@@ -308,23 +355,31 @@ class AppLauncher(private val context: Context) {
                     .put("success", false)
                     .put("verified", false)
                     .put("query", res.query)
+                    .put("failureReason", "multiple_matches")
                     .put("candidates", arr)
                     .put("message", "Multiple installed apps match \"${res.query}\": ${res.candidates.joinToString(", ") { it.label }}. Which one would you like to open?")
                     .toString()
             }
             is AppLaunchResult.AppNotFound -> JSONObject()
-                .put("status", "not_found")
+                .put("status", if (res.visibilityRestricted) "package_visibility_restricted" else "not_found")
                 .put("success", false)
                 .put("verified", false)
                 .put("query", res.query)
-                .put("failureReason", "app_not_installed")
-                .put("message", "App \"${res.query}\" is not installed on this device.")
+                .put("failureReason", if (res.visibilityRestricted) "package_visibility_restricted" else "app_not_installed")
+                .put(
+                    "message",
+                    if (res.visibilityRestricted) {
+                        "Android package visibility prevented discovering installed apps for \"${res.query}\"."
+                    } else {
+                        "App \"${res.query}\" is not installed on this device."
+                    }
+                )
                 .toString()
             is AppLaunchResult.LaunchFailed -> JSONObject()
                 .put("status", "failed")
                 .put("success", false)
                 .put("verified", false)
-                .put("failureReason", "launch_intent_failed")
+                .put("failureReason", res.failureCode)
                 .put("message", res.reason)
                 .toString()
         }
@@ -332,14 +387,30 @@ class AppLauncher(private val context: Context) {
 
     fun launchPackage(packageName: String, appLabel: String): AppLaunchResult {
         val pm: PackageManager = context.packageManager
-        val launchIntent = pm.getLaunchIntentForPackage(packageName)
-            ?: return AppLaunchResult.LaunchFailed("Could not resolve a launcher activity for $appLabel ($packageName).")
+        val launchIntent = try {
+            pm.getLaunchIntentForPackage(packageName)
+        } catch (e: Exception) {
+            Log.e(TAG, "launchPackage: getLaunchIntentForPackage failed for $packageName: ${e.message}")
+            null
+        } ?: return AppLaunchResult.LaunchFailed(
+            reason = "No launchable launcher activity is available for $appLabel ($packageName).",
+            failureCode = "launch_intent_unavailable"
+        )
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         return try {
             context.startActivity(launchIntent)
+            Log.d(TAG, "launchPackage: startActivity succeeded for $appLabel ($packageName)")
             AppLaunchResult.Success(appLabel, packageName)
         } catch (e: Exception) {
-            AppLaunchResult.LaunchFailed("Failed to launch $appLabel: ${e.message}")
+            Log.e(TAG, "launchPackage: startActivity failed for $appLabel ($packageName): ${e.message}")
+            AppLaunchResult.LaunchFailed(
+                reason = "startActivity failed for $appLabel ($packageName): ${e.message ?: "unknown error"}",
+                failureCode = "start_activity_failed"
+            )
         }
+    }
+
+    companion object {
+        private const val TAG = "ZoniAppLauncher"
     }
 }

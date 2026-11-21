@@ -20,7 +20,12 @@ export interface PendingContactCandidate {
 
 export interface PendingActionDraftState {
   pendingActionId: string;
-  actionType: 'prepare_whatsapp_message' | 'prepare_sms' | 'call_contact';
+  actionType:
+    | 'prepare_whatsapp_message'
+    | 'prepare_sms'
+    | 'call_contact'
+    | 'prepare_app_chat_message';
+  appName?: string;
   recipientName: string;
   phoneNumber: string;
   messageText: string;
@@ -73,8 +78,11 @@ export const ActionConfirmationCard: React.FC<ActionConfirmationCardProps> = ({
   const isHindi = activeLanguage === 'hi-IN';
   const isCall = draft.actionType === 'call_contact';
   const isWhatsApp = draft.actionType === 'prepare_whatsapp_message';
+  const isAppChat = draft.actionType === 'prepare_app_chat_message';
+  const targetAppLabel = draft.appName || 'App Chat';
   const hasCandidates = Array.isArray(draft.candidates) && draft.candidates.length > 1;
   const needsSelection = hasCandidates && !selectedPhone;
+  const needsMessageBody = !isCall && editedMessage.trim().length === 0;
 
   const title = isCall
     ? isBengali
@@ -88,6 +96,12 @@ export const ActionConfirmationCard: React.FC<ActionConfirmationCardProps> = ({
       : isHindi
       ? 'WhatsApp मैसेज समीक्षा और अनुमति'
       : 'Review & Approve WhatsApp Draft'
+    : isAppChat
+    ? isBengali
+      ? `${targetAppLabel} মেসেজ রিভিউ ও অনুমতি`
+      : isHindi
+      ? `${targetAppLabel} मैसेज समीक्षा और अनुमति`
+      : `Review & Approve ${targetAppLabel} Draft`
     : isBengali
     ? 'SMS মেসেজ রিভিউ ও অনুমতি'
     : isHindi
@@ -110,6 +124,12 @@ export const ActionConfirmationCard: React.FC<ActionConfirmationCardProps> = ({
       : isHindi
       ? 'अनुमति से पहले मैसेज नहीं भेजा जाएगा। अनुमति देने पर Zoni रिसीवर व मैसेज जांचकर WhatsApp में भेजेगा (या Accessibility बंद होने पर ड्राफ्ट खोलेगा)।'
       : 'Nothing is sent before your approval. After approving, Zoni verifies the chat & taps Send via Accessibility (or opens the draft for manual Send).'
+    : isAppChat
+    ? isBengali
+      ? `অনুমোদনের আগে ${targetAppLabel}-এ মেসেজ পাঠানো হবে না। অনুমোদন দিলে Zoni শুধুমাত্র যাচাইকৃত ${targetAppLabel} অ্যাডাপ্টারে এই মেসেজটি পাঠাবে।`
+      : isHindi
+      ? `अनुमति से पहले ${targetAppLabel} में मैसेज नहीं भेजा जाएगा। अनुमति देने पर Zoni सत्यापित ${targetAppLabel} एडैप्टर से भेजेगा।`
+      : `Nothing is sent before your approval. Approving runs the verified ${targetAppLabel} Accessibility adapter only after confirming recipient and message.`
     : isBengali
     ? 'অনুমোদন দিলে আপনার SMS অ্যাপ এই মেসেজসহ খুলে যাবে — স্বয়ংক্রিয়ভাবে পাঠানো হবে না।'
     : 'Approving opens your SMS composer with this exact draft — never sent silently.';
@@ -225,7 +245,7 @@ export const ActionConfirmationCard: React.FC<ActionConfirmationCardProps> = ({
         </div>
       </div>
 
-      {/* Editable Message Body (WhatsApp / SMS) */}
+      {/* Editable Message Body (WhatsApp / SMS / Supported App Chat) */}
       {!isCall && (
         <div className="mt-3">
           <label
@@ -242,9 +262,24 @@ export const ActionConfirmationCard: React.FC<ActionConfirmationCardProps> = ({
             rows={2}
             value={editedMessage}
             onChange={(e) => setEditedMessage(e.target.value)}
-            placeholder={isBengali ? 'আপনার মেসেজ লিখুন...' : 'Type your message...'}
+            placeholder={
+              isBengali
+                ? 'কী মেসেজ পাঠাতে চান তা এখানে লিখুন...'
+                : isHindi
+                ? 'आप क्या मैसेज भेजना चाहते हैं यहाँ लिखें...'
+                : 'Type the exact message you want to send...'
+            }
             className="w-full rounded-xl bg-slate-900/90 border border-cyan-500/40 px-3 py-2 text-xs sm:text-sm text-cyan-50 placeholder:text-slate-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50 resize-none"
           />
+          {needsMessageBody && (
+            <p className="mt-1 text-[11px] text-amber-300 font-hud">
+              {isBengali
+                ? 'পাঠানোর আগে অনুগ্রহ করে মেসেজের টেক্সট লিখুন।'
+                : isHindi
+                ? 'भेजने से पहले कृपया मैसेज लिखें।'
+                : 'Please enter the message text before approving.'}
+            </p>
+          )}
         </div>
       )}
 
@@ -285,7 +320,7 @@ export const ActionConfirmationCard: React.FC<ActionConfirmationCardProps> = ({
           <button
             type="button"
             data-testid="approve-pending-action-btn"
-            disabled={needsSelection}
+            disabled={needsSelection || needsMessageBody}
             onClick={() =>
               onApprove({
                 pendingActionId: draft.pendingActionId,
@@ -296,7 +331,7 @@ export const ActionConfirmationCard: React.FC<ActionConfirmationCardProps> = ({
               })
             }
             className={`px-4 py-2 rounded-xl text-xs font-hud font-bold uppercase tracking-wider flex items-center gap-1.5 transition-all ${
-              needsSelection
+              needsSelection || needsMessageBody
                 ? 'bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed'
                 : 'bg-gradient-to-r from-cyan-600 to-pink-600 hover:from-cyan-500 hover:to-pink-500 text-white shadow-[0_0_16px_rgba(6,182,212,0.35)] cursor-pointer'
             }`}
@@ -315,17 +350,23 @@ export const ActionConfirmationCard: React.FC<ActionConfirmationCardProps> = ({
                       ? 'অনুমতি দিন ও রিপ্লাই পাঠান'
                       : isWhatsApp
                       ? 'অনুমতি দিন ও WhatsApp-এ পাঠান'
+                      : isAppChat
+                      ? `অনুমতি দিন ও ${targetAppLabel}-এ পাঠান`
                       : 'অনুমতি দিন ও SMS খুলুন'
                     : isHindi
                     ? useNotificationReply
                       ? 'अनुमति दें और रिप्लाई भेजें'
                       : isWhatsApp
                       ? 'अनुमति दें और WhatsApp भेजें'
+                      : isAppChat
+                      ? `अनुमति दें और ${targetAppLabel} भेजें`
                       : 'अनुमति दें और SMS खोलें'
                     : useNotificationReply
                     ? 'Approve & Reply'
                     : isWhatsApp
                     ? 'Approve & Send via WhatsApp'
+                    : isAppChat
+                    ? `Approve & Send via ${targetAppLabel}`
                     : 'Approve & Open SMS'}
                 </span>
               </>

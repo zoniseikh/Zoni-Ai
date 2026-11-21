@@ -9,7 +9,7 @@
 import type { ToolExecutionReport } from './assistantActionRegistry';
 
 export interface NativeAndroidBridge {
-  // Typed 20-tool allowlisted action engine & confirmation workflow
+  // Typed 25-tool allowlisted action engine & confirmation workflow
   executeTypedActionJson?: (requestJson: string) => string;
   confirmPendingActionJson?: (
     pendingActionId: string,
@@ -18,6 +18,7 @@ export interface NativeAndroidBridge {
   ) => string;
   cancelPendingActionJson?: (pendingActionId: string) => string;
   listInstalledAppsJson?: () => string;
+  getRuntimeDiagnosticsJson?: () => string;
 
   // Hardware, Calls, Contacts, SMS, WhatsApp
   setFlashlight?: (enable: boolean) => boolean;
@@ -316,6 +317,33 @@ export function listInstalledAppsViaNativeBridge(): InstalledAppEntry[] | null {
   try {
     const parsed = JSON.parse(bridge.listInstalledAppsJson());
     return Array.isArray(parsed?.apps) ? (parsed.apps as InstalledAppEntry[]) : [];
+  } catch {
+    return null;
+  }
+}
+
+export interface NativeRuntimeDiagnostics {
+  bridgeConnected: boolean;
+  accessibilityEnabled: boolean;
+  contactsPermissionGranted: boolean;
+  callPhonePermissionGranted?: boolean;
+  recordAudioPermissionGranted?: boolean;
+  notificationsPermissionGranted?: boolean;
+  notificationListenerEnabled?: boolean;
+  installedAppDiscoveryStatus: string;
+  installedAppCount: number;
+  lastActionRequested: string;
+  lastActionResult: string;
+  lastFailureReason: string;
+}
+
+export function getNativeRuntimeDiagnostics(): NativeRuntimeDiagnostics | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getRuntimeDiagnosticsJson) return null;
+  try {
+    const raw = bridge.getRuntimeDiagnosticsJson();
+    if (!raw) return null;
+    return JSON.parse(raw) as NativeRuntimeDiagnostics;
   } catch {
     return null;
   }

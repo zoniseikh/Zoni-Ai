@@ -47,6 +47,9 @@ import {
 } from './utils/apiConfig';
 import {
   getNativeAndroidBridge,
+  detectAndroidRuntimeMode,
+  getNativePermissionsSnapshot,
+  getNativeRuntimeDiagnostics,
   executeTypedActionViaNativeBridge,
   confirmPendingActionViaNativeBridge,
   cancelPendingActionViaNativeBridge,
@@ -64,11 +67,19 @@ import {
 } from './utils/androidBridge';
 import { buildStructuredTaskPlan, TaskStep } from './utils/taskExecutionEngine';
 import {
+  ASSISTANT_TOOL_SPECS,
   validateGeminiToolCall,
   formatLocalizedActionOutcome,
   ToolExecutionReport,
   ValidatedActionRequest,
 } from './utils/assistantActionRegistry';
+import {
+  decideIntentExecutionRoute,
+  RecentActionDeduplicator,
+  DeviceActionDiagnosticsState,
+  sanitizeDiagnosticActionLabel,
+  sanitizeDiagnosticMessage,
+} from './utils/liveToolRelay';
 import {
   WsConnectionStatus,
   buildClientTextPayload,
@@ -79,6 +90,110 @@ import {
   shouldAutoReconnectLiveWs,
   shouldUseHttpChatFallback,
 } from './utils/liveSessionProtocol';
+
+const SUPPORTED_GENERIC_CHAT_APPS = new Set(['telegram', 'instagram', 'messenger']);
+
+function mapTaskStepToAssistantTool(
+  step: TaskStep,
+  fallbackText: string
+): { name: string; args: Record<string, unknown> } | null {
+  switch (step.tool) {
+    case 'sim_call':
+      return {
+        name: 'call_contact',
+        args: {
+          recipient: String(step.args.contactQuery || step.args.phoneNumber || step.args.target || ''),
+        },
+      };
+    case 'whatsapp_prepare':
+      return {
+        name: 'prepare_whatsapp_message',
+        args: {
+          recipient: String(step.args.contactQuery || step.args.phoneNumber || ''),
+          message: String(step.args.message || ''),
+        },
+      };
+    case 'app_chat_prepare':
+      return {
+        name: 'prepare_app_chat_message',
+        args: {
+          app_name: String(step.args.appName || ''),
+          recipient: String(step.args.contactQuery || step.args.recipient || ''),
+          message: String(step.args.message || ''),
+        },
+      };
+    case 'sms_compose':
+      return {
+        name: 'prepare_sms',
+        args: {
+          recipient: String(step.args.phoneNumber || ''),
+          message: String(step.args.message || ''),
+        },
+      };
+    case 'open_app':
+      return {
+        name: 'open_app',
+        args: { app_name: String(step.args.appQuery || '') },
+      };
+    case 'app_search_workflow':
+      return {
+        name: 'open_app',
+        args: {
+          app_name: String(step.args.appQuery || 'YouTube'),
+          search_query: String(step.args.searchQuery || ''),
+        },
+      };
+    case 'list_installed_apps':
+      return { name: 'list_installed_apps', args: {} };
+    case 'open_settings':
+      return {
+        name: 'open_system_settings',
+        args: { target: String(step.args.target || 'main') },
+      };
+    case 'screen_analyze':
+      return {
+        name: 'read_visible_screen',
+        args: { question: String(step.args.question || fallbackText) },
+      };
+    case 'notification_read':
+      return {
+        name: 'read_notifications',
+        args: { whatsapp_only: Boolean(step.args.whatsappOnly) },
+      };
+    case 'accessibility_action': {
+      const cmd = String(step.args.command || '');
+      if (cmd === 'scroll_down') return { name: 'scroll_screen', args: { direction: 'down' } };
+      if (cmd === 'scroll_up') return { name: 'scroll_screen', args: { direction: 'up' } };
+      if (cmd === 'back') return { name: 'go_back', args: {} };
+      if (cmd === 'home') return { name: 'go_home', args: {} };
+      if (cmd.startsWith('tap:')) {
+        return { name: 'tap_visible_element', args: { element_text: cmd.slice(4).trim() } };
+      }
+      return null;
+    }
+    case 'camera_open':
+      return { name: 'camera_open', args: {} };
+    case 'volume_control':
+      return {
+        name: 'volume_control',
+        args: { action: String(step.args.action || 'status') },
+      };
+    case 'flashlight':
+      return { name: 'flashlight_control', args: { enable: Boolean(step.args.enable) } };
+    case 'battery_status':
+      return { name: 'battery_status', args: {} };
+    case 'contact_lookup':
+      return { name: 'contact_search', args: { query: String(step.args.query || '') } };
+    case 'reminder':
+      return { name: 'create_reminder', args: { note: String(step.args.note || '') } };
+    case 'web_search':
+      return { name: 'search_web', args: { query: String(step.args.query || '') } };
+    case 'cancel_current_task':
+      return { name: 'cancel_current_task', args: {} };
+    default:
+      return null;
+  }
+}
 
 export default function App() {
   const [assistantState, setAssistantState] = useState<AssistantState>('idle');
@@ -146,6 +261,28 @@ export default function App() {
   useEffect(() => {
     pendingActionDraftRef.current = pendingActionDraft;
   }, [pendingActionDraft]);
+
+  const [deviceDiagnostics, setDeviceDiagnostics] = useState<DeviceActionDiagnosticsState>(() => {
+    const bridge = getNativeAndroidBridge();
+    const mode = detectAndroidRuntimeMode();
+    return {
+      bridgeConnected: Boolean(bridge),
+      runtimeMode: mode,
+      executionPath: 'idle',
+      geminiToolCallingAvailable: true,
+      declaredToolsCount: ASSISTANT_TOOL_SPECS.length,
+      accessibilityEnabled: bridge ? false : null,
+      contactsPermissionGranted: bridge ? false : null,
+      callPhonePermissionGranted: bridge ? false : null,
+      recordAudioPermissionGranted: bridge ? false : null,
+      notificationListenerEnabled: bridge ? false : null,
+      installedAppDiscoveryStatus: bridge ? 'CHECKING...' : 'WEB PREVIEW (APK REQUIRED)',
+      lastActionRequested: 'None',
+      lastActionResult: 'None',
+      lastFailureReason: 'None',
+      updatedAtIso: new Date().toISOString(),
+    };
+  });
   const [permissionsReport, setPermissionsReport] = useState<ChromePermissionsReport>({
     microphone: 'prompt',
     geolocation: 'prompt',
@@ -291,6 +428,13 @@ export default function App() {
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const lastFlashlightActionRef = useRef<{ payload: string; time: number } | null>(null);
+  const liveToolsReadyRef = useRef<boolean>(false);
+  const liveToolExecutedInTurnRef = useRef<boolean>(false);
+  const currentSpeechTranscriptRef = useRef<string>('');
+  const voiceTranscriptDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recentActionDeduplicatorRef = useRef<RecentActionDeduplicator>(
+    new RecentActionDeduplicator(5000)
+  );
 
   // Latest state refs for WebSocket / Audio callbacks
   const messagesRef = useRef<ChatMessage[]>(messages);
@@ -407,6 +551,14 @@ export default function App() {
         backendUrl,
       };
       setBackendHealth(snap);
+      const declaredCount =
+        Number(data.liveToolsCount || data.assistantToolsCount) || ASSISTANT_TOOL_SPECS.length;
+      setDeviceDiagnostics((prev) => ({
+        ...prev,
+        geminiToolCallingAvailable: Boolean(res.ok && geminiConfigured),
+        declaredToolsCount: declaredCount,
+        updatedAtIso: new Date().toISOString(),
+      }));
       if (!snap.reachable || !snap.geminiConfigured) {
         setConnectionError(errMsg || 'ZONI backend requires configuration.');
       } else {
@@ -431,6 +583,93 @@ export default function App() {
       return snap;
     }
   }, []);
+
+  const refreshDeviceDiagnostics = useCallback(() => {
+    const bridge = getNativeAndroidBridge();
+    const mode = detectAndroidRuntimeMode();
+    const nativeDiag = getNativeRuntimeDiagnostics();
+    const nativePerms = getNativePermissionsSnapshot();
+    const apps = bridge ? listInstalledAppsViaNativeBridge() : null;
+
+    setDeviceDiagnostics((prev) => ({
+      ...prev,
+      bridgeConnected: Boolean(bridge),
+      runtimeMode: mode,
+      accessibilityEnabled: nativeDiag
+        ? nativeDiag.accessibilityEnabled
+        : nativePerms
+        ? nativePerms.accessibilityEnabled
+        : null,
+      contactsPermissionGranted: nativeDiag
+        ? nativeDiag.contactsPermissionGranted
+        : nativePerms
+        ? nativePerms.readContacts
+        : null,
+      callPhonePermissionGranted: nativeDiag?.callPhonePermissionGranted ?? nativePerms?.callPhone ?? null,
+      recordAudioPermissionGranted:
+        nativeDiag?.recordAudioPermissionGranted ?? nativePerms?.recordAudio ?? null,
+      notificationListenerEnabled:
+        nativeDiag?.notificationListenerEnabled ?? nativePerms?.notificationListenerEnabled ?? null,
+      installedAppDiscoveryStatus: nativeDiag
+        ? `${nativeDiag.installedAppDiscoveryStatus.toUpperCase()} (${nativeDiag.installedAppCount} APPS)`
+        : bridge
+        ? apps && apps.length > 0
+          ? `READY (${apps.length} APPS)`
+          : 'RESTRICTED OR EMPTY'
+        : 'WEB PREVIEW (APK REQUIRED)',
+      lastActionRequested:
+        nativeDiag?.lastActionRequested && nativeDiag.lastActionRequested !== 'none'
+          ? sanitizeDiagnosticMessage(nativeDiag.lastActionRequested)
+          : prev.lastActionRequested,
+      lastActionResult:
+        nativeDiag?.lastActionResult && nativeDiag.lastActionResult !== 'none'
+          ? sanitizeDiagnosticMessage(nativeDiag.lastActionResult)
+          : prev.lastActionResult,
+      lastFailureReason:
+        nativeDiag?.lastFailureReason && nativeDiag.lastFailureReason !== 'none'
+          ? sanitizeDiagnosticMessage(nativeDiag.lastFailureReason)
+          : prev.lastFailureReason,
+      updatedAtIso: new Date().toISOString(),
+    }));
+  }, []);
+
+  const recordActionDiagnostic = useCallback(
+    (
+      path: DeviceActionDiagnosticsState['executionPath'],
+      actionType: string,
+      args: Record<string, unknown>,
+      report: ToolExecutionReport
+    ) => {
+      const safeLabel = sanitizeDiagnosticActionLabel(actionType, args);
+      const failureCode =
+        !report.success
+          ? String(
+              (report.data as Record<string, unknown> | undefined)?.failureReason ||
+                report.status ||
+                'action_failed'
+            )
+          : 'None';
+      const resultSummary = `${report.status || (report.success ? 'executed' : 'failed')}${
+        report.awaitingConfirmation ? ' (awaiting confirmation)' : report.verified ? ' (verified)' : ''
+      }`;
+
+      setDeviceDiagnostics((prev) => ({
+        ...prev,
+        executionPath: path,
+        lastActionRequested: safeLabel,
+        lastActionResult: sanitizeDiagnosticMessage(resultSummary),
+        lastFailureReason: failureCode === 'None' ? 'None' : sanitizeDiagnosticMessage(failureCode),
+        updatedAtIso: new Date().toISOString(),
+      }));
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (isSettingsModalOpen) {
+      refreshDeviceDiagnostics();
+    }
+  }, [isSettingsModalOpen, refreshDeviceDiagnostics]);
 
   // Stop only microphone audio capture while keeping the shared Gemini Live WebSocket session open
   const stopVoiceCapture = useCallback((preserveErrorState = false) => {
@@ -484,14 +723,34 @@ export default function App() {
       const bridge = getNativeAndroidBridge();
       const lang = activeLanguageRef.current;
 
-      // 1. Communication Tools requiring explicit user review & approval (WhatsApp, SMS, Call)
+      // 1. Communication Tools requiring explicit user review & approval (WhatsApp, SMS, Call, Supported App Chats)
       if (
         req.actionType === 'prepare_whatsapp_message' ||
         req.actionType === 'prepare_sms' ||
-        req.actionType === 'call_contact'
+        req.actionType === 'call_contact' ||
+        req.actionType === 'prepare_app_chat_message'
       ) {
         const recipient = String(req.arguments.recipient || '').trim();
         const messageText = String(req.arguments.message || '').trim();
+        const rawAppName = String(req.arguments.app_name || '').trim();
+
+        if (req.actionType === 'prepare_app_chat_message') {
+          const normalizedApp = rawAppName.toLowerCase();
+          if (!SUPPORTED_GENERIC_CHAT_APPS.has(normalizedApp)) {
+            return {
+              actionId: req.actionId,
+              actionType: req.actionType,
+              success: false,
+              verified: true,
+              status: 'unsupported_chat_app',
+              message:
+                lang === 'bn-BD'
+                  ? `"${rawAppName || 'এই অ্যাপ'}"-এর জন্য যাচাইকৃত অটোমেটেড চ্যাট অ্যাডাপ্টার নেই। বর্তমানে WhatsApp, SMS, Telegram, Instagram ও Messenger সাপোর্টেড।`
+                  : `Automated chat messaging is not supported for "${rawAppName || 'this app'}". Currently supported apps: WhatsApp, SMS, Telegram, Instagram, and Messenger.`,
+              data: { failureReason: 'unsupported_chat_app', appName: rawAppName },
+            };
+          }
+        }
 
         if (bridge?.executeTypedActionJson) {
           const nativeReport = executeTypedActionViaNativeBridge(
@@ -504,6 +763,10 @@ export default function App() {
               setPendingActionDraft({
                 pendingActionId: nativeReport.pendingActionId,
                 actionType: req.actionType,
+                appName:
+                  req.actionType === 'prepare_app_chat_message'
+                    ? String(nativeReport.data?.appName || rawAppName || 'Telegram')
+                    : undefined,
                 recipientName: String(nativeReport.data?.contactName || recipient),
                 phoneNumber: String(nativeReport.data?.phoneNumber || ''),
                 messageText: String(nativeReport.data?.message || messageText),
@@ -526,18 +789,31 @@ export default function App() {
         const pendingId = `web_pending_${Date.now()}`;
         const digitsOnly = recipient.replace(/[^\d+]/g, '');
         const isNumeric = digitsOnly.length >= 7;
+        const displayAppName =
+          req.actionType === 'prepare_app_chat_message'
+            ? rawAppName.charAt(0).toUpperCase() + rawAppName.slice(1).toLowerCase()
+            : undefined;
         setPendingActionDraft({
           pendingActionId: pendingId,
           actionType: req.actionType,
+          appName: displayAppName,
           recipientName: recipient,
           phoneNumber: isNumeric ? digitsOnly : '',
           messageText,
           isNativePending: false,
           statusNote:
             req.actionType === 'prepare_whatsapp_message'
+              ? messageText
+                ? lang === 'bn-BD'
+                  ? 'মেসেজটি রিভিউ বা এডিট করে অনুমোদন দিন — অনুমোদনের আগে WhatsApp-এ পাঠানো হবে না।'
+                  : 'Review or edit the draft before approving — nothing is sent until you explicitly approve.'
+                : lang === 'bn-BD'
+                ? 'কী মেসেজ লিখতে চান তা নিচের বক্সে লিখে অনুমোদন দিন — অনুমোদনের আগে পাঠানো হবে না।'
+                : 'Type the message you want to send below, then approve — nothing is sent before approval.'
+              : req.actionType === 'prepare_app_chat_message'
               ? lang === 'bn-BD'
-                ? 'মেসেজটি রিভিউ বা এডিট করে অনুমোদন দিন — অনুমোদনের আগে WhatsApp-এ পাঠানো হবে না।'
-                : 'Review or edit the draft before approving — nothing is sent until you explicitly approve.'
+                ? `${displayAppName}-এ পাঠানোর আগে প্রাপক ও মেসেজ যাচাই করে অনুমোদন দিন।`
+                : `Review recipient and message before approving ${displayAppName} automation.`
               : req.actionType === 'call_contact'
               ? lang === 'bn-BD'
                 ? 'কল করার আগে নম্বর ও নাম যাচাই করে অনুমতি দিন।'
@@ -549,9 +825,21 @@ export default function App() {
 
         const stagedMessage =
           req.actionType === 'prepare_whatsapp_message'
-            ? lang === 'bn-BD'
-              ? `${recipient}-এর জন্য WhatsApp মেসেজ ড্রাফট প্রস্তুত করা হয়েছে${messageText ? `: "${messageText}"` : ''}। অনুগ্রহ করে নিচের কার্ডে রিভিউ করে অনুমোদন দিন বা বলুন "এখন পাঠানোর অনুমতি দিলাম"।`
-              : `Prepared WhatsApp draft for ${recipient}${messageText ? `: "${messageText}"` : ''}. Please review, edit, cancel, or approve below before opening WhatsApp.`
+            ? messageText
+              ? lang === 'bn-BD'
+                ? `${recipient}-এর জন্য WhatsApp মেসেজ ড্রাফট প্রস্তুত করা হয়েছে: "${messageText}"। অনুগ্রহ করে নিচের কার্ডে রিভিউ করে অনুমোদন দিন বা বলুন "এখন পাঠানোর অনুমতি দিলাম"।`
+                : `Prepared WhatsApp draft for ${recipient}: "${messageText}". Please review, edit, cancel, or approve below before sending.`
+              : lang === 'bn-BD'
+              ? `${recipient}-এর জন্য WhatsApp ড্রাফট খোলা হয়েছে। কী মেসেজ লিখতে চান তা নিচের কার্ডে লিখে অনুমোদন দিন।`
+              : `Prepared WhatsApp draft for ${recipient}. What message would you like to send? Enter it in the confirmation card below and approve.`
+            : req.actionType === 'prepare_app_chat_message'
+            ? messageText
+              ? lang === 'bn-BD'
+                ? `${displayAppName}-এ ${recipient}-এর জন্য মেসেজ ড্রাফট প্রস্তুত করা হয়েছে: "${messageText}"। পাঠানোর আগে নিচের কার্ডে রিভিউ করে অনুমোদন দিন।`
+                : `Prepared ${displayAppName} chat draft for ${recipient}: "${messageText}". Please review and approve below before sending.`
+              : lang === 'bn-BD'
+              ? `${displayAppName}-এ ${recipient}-এর জন্য ড্রাফট প্রস্তুত। কী মেসেজ লিখতে চান তা নিচের কার্ডে লিখে অনুমোদন দিন।`
+              : `Prepared ${displayAppName} draft for ${recipient}. Enter the message text below and approve to send.`
             : req.actionType === 'call_contact'
             ? lang === 'bn-BD'
               ? `${recipient}-কে কল করার আগে অনুগ্রহ করে নিচের কার্ডে নিশ্চিত করুন।`
@@ -569,7 +857,11 @@ export default function App() {
           pendingActionId: pendingId,
           status: 'awaiting_confirmation',
           message: stagedMessage,
-          data: { recipient, message: messageText },
+          data: {
+            recipient,
+            ...(displayAppName ? { appName: displayAppName } : {}),
+            hasMessageText: Boolean(messageText),
+          },
         };
       }
 
@@ -1092,6 +1384,23 @@ export default function App() {
                 ? `${name}, ${options.recipientName}-এর জন্য SMS কম্পোজার খোলা হয়েছে। পাঠাতে অনুগ্রহ করে SMS অ্যাপে Send চাপুন।`
                 : `Opened SMS composer for ${options.recipientName}. Please review and tap Send.`,
           };
+        } else if (currentDraft.actionType === 'prepare_app_chat_message') {
+          const targetApp = currentDraft.appName || 'App';
+          report = {
+            actionId: options.pendingActionId,
+            actionType: 'prepare_app_chat_message',
+            success: true,
+            verified: true,
+            status: 'opened_app_chat_draft_ready_to_send',
+            message:
+              lang === 'bn-BD'
+                ? `${name}, ${targetApp}-এ ${options.recipientName}-এর মেসেজ অনুমোদিত হয়েছে। সম্পূর্ণ ইন-অ্যাপ অটোমেশন Android APK-তে Accessibility চালু থাকলে চলে।`
+                : `${targetApp} message approved for ${options.recipientName}. Full verified in-app automation runs inside the Android APK with Accessibility enabled.`,
+            data: {
+              appName: targetApp,
+              contactName: options.recipientName,
+            },
+          };
         } else {
           if (cleanPhone) {
             executeAssistantActionDirectly({
@@ -1117,6 +1426,13 @@ export default function App() {
         }
       }
 
+      recordActionDiagnostic(
+        currentDraft.isNativePending ? 'deterministic_native' : 'deterministic_native',
+        currentDraft.actionType,
+        currentDraft.appName ? { app_name: currentDraft.appName } : {},
+        report
+      );
+
       const honestReply = formatLocalizedActionOutcome(report, lang, name);
       setMessages((prev) => [
         ...prev,
@@ -1131,7 +1447,7 @@ export default function App() {
       setLatestTranscript(honestReply);
       setAssistantState('idle');
     },
-    []
+    [recordActionDiagnostic]
   );
 
   // Explicit User Cancellation Handler for Pending Drafts
@@ -1252,11 +1568,13 @@ export default function App() {
         if (serverToolCalls.length > 0) {
           const toolResults: ToolExecutionReport[] = [];
           for (const call of serverToolCalls) {
+            recentActionDeduplicatorRef.current.markExecuted(call.actionType, call.arguments);
             const result = await executeValidatedAssistantTool(
               call.actionType,
               call.arguments,
               call.actionId
             );
+            recordActionDiagnostic('http_chat', call.actionType, call.arguments, result);
             toolResults.push(result);
           }
 
@@ -1372,7 +1690,7 @@ export default function App() {
         });
       }
     },
-    [clearTurnTimeout, executeValidatedAssistantTool]
+    [clearTurnTimeout, executeValidatedAssistantTool, recordActionDiagnostic]
   );
 
   // Connect or reuse the single shared Gemini Live WebSocket session, resolving ONLY after server 'connected' handshake
@@ -1482,12 +1800,20 @@ export default function App() {
 
               if (msg.type === 'connected') {
                 isSessionReadyRef.current = true;
+                liveToolsReadyRef.current = msg.liveToolCallingSupported !== false;
                 reconnectAttemptRef.current = 0;
                 liveNonRetryableErrorRef.current = null;
                 setWsStatus('connected');
                 setConnectionError(null);
                 const wasResumed = Boolean(msg.resumed);
                 setSessionResumed(wasResumed);
+                setDeviceDiagnostics((prev) => ({
+                  ...prev,
+                  geminiToolCallingAvailable: true,
+                  declaredToolsCount:
+                    Number(msg.declaredToolsCount) || ASSISTANT_TOOL_SPECS.length,
+                  updatedAtIso: new Date().toISOString(),
+                }));
                 settlePendingHandshake();
 
                 if (
@@ -1523,6 +1849,91 @@ export default function App() {
                 return;
               }
 
+              // Bidirectional Gemini Live Native Tool Call Relay (Root Cause 1 & 2)
+              if (msg.type === 'native_tool_call' && msg.toolCallId && msg.actionType) {
+                clearTurnTimeout();
+                liveToolExecutedInTurnRef.current = true;
+                if (pendingChatFallbackRef.current) {
+                  pendingChatFallbackRef.current.answered = true;
+                }
+                const toolCallId = String(msg.toolCallId);
+                const actionType = String(msg.actionType);
+                const rawArgs =
+                  msg.arguments && typeof msg.arguments === 'object'
+                    ? (msg.arguments as Record<string, unknown>)
+                    : {};
+
+                recentActionDeduplicatorRef.current.markExecuted(actionType, rawArgs);
+
+                void executeValidatedAssistantTool(actionType, rawArgs, toolCallId)
+                  .then((report) => {
+                    recordActionDiagnostic('live_ws', actionType, rawArgs, report);
+                    if (ws.readyState === WebSocket.OPEN) {
+                      ws.send(
+                        JSON.stringify({
+                          type: 'native_tool_result',
+                          toolCallId,
+                          actionType,
+                          result: {
+                            success: report.success,
+                            verified: report.verified,
+                            awaitingConfirmation: Boolean(report.awaitingConfirmation),
+                            status: report.status,
+                            message: report.message,
+                            failureReason:
+                              !report.success
+                                ? String(
+                                    (report.data as Record<string, unknown> | undefined)
+                                      ?.failureReason || report.status
+                                  )
+                                : undefined,
+                            requiredPermissions: report.requiredPermissions,
+                            data: report.data,
+                          },
+                        })
+                      );
+                    }
+                    if (report.awaitingConfirmation || !report.success) {
+                      const localized = formatLocalizedActionOutcome(
+                        report,
+                        activeLanguageRef.current,
+                        selectedAffectionNameRef.current
+                      );
+                      setLatestTranscript(localized);
+                    }
+                  })
+                  .catch((err) => {
+                    const failReport: ToolExecutionReport = {
+                      actionId: toolCallId,
+                      actionType,
+                      success: false,
+                      verified: false,
+                      status: 'failed',
+                      message:
+                        err?.message || 'Native action execution threw an unexpected error.',
+                      data: { failureReason: 'client_execution_exception' },
+                    };
+                    recordActionDiagnostic('live_ws', actionType, rawArgs, failReport);
+                    if (ws.readyState === WebSocket.OPEN) {
+                      ws.send(
+                        JSON.stringify({
+                          type: 'native_tool_result',
+                          toolCallId,
+                          actionType,
+                          result: {
+                            success: false,
+                            verified: false,
+                            status: 'failed',
+                            failureReason: 'client_execution_exception',
+                            message: failReport.message,
+                          },
+                        })
+                      );
+                    }
+                  });
+                return;
+              }
+
               if (msg.type === 'flashlight') {
                 const turnOn = Boolean(msg.enable);
                 toggleFlashlight(turnOn);
@@ -1544,6 +1955,15 @@ export default function App() {
                     ? msg.turnId
                     : userSpeechTurnIdRef.current;
 
+                const incomingChunk = String(msg.text || '').trim();
+                if (incomingChunk) {
+                  const prevUtterance = currentSpeechTranscriptRef.current;
+                  currentSpeechTranscriptRef.current =
+                    !prevUtterance || incomingChunk.startsWith(prevUtterance)
+                      ? incomingChunk
+                      : `${prevUtterance} ${incomingChunk}`.trim();
+                }
+
                 setMessages((prev) =>
                   upsertUserSpeechTurnMessage(
                     prev,
@@ -1553,20 +1973,112 @@ export default function App() {
                   )
                 );
 
+                // Debounced deterministic native action execution for spoken voice transcripts
+                // (fires ONLY if Gemini Live has not already executed a native_tool_call for this utterance)
+                if (voiceTranscriptDebounceRef.current) {
+                  clearTimeout(voiceTranscriptDebounceRef.current);
+                }
+                const utteranceSnapshot = currentSpeechTranscriptRef.current;
+                voiceTranscriptDebounceRef.current = setTimeout(() => {
+                  if (isUnmountedRef.current || liveToolExecutedInTurnRef.current) return;
+                  const cleanSpoken = utteranceSnapshot.trim();
+                  if (!cleanSpoken) return;
+
+                  const plan = buildStructuredTaskPlan(cleanSpoken);
+                  if (plan.blockedReason) {
+                    setLatestTranscript(plan.blockedReason);
+                    return;
+                  }
+                  if (plan.steps.length === 0) return;
+
+                  // Voice approval of pending draft
+                  if (plan.steps.length === 1 && plan.steps[0].tool === 'approve_pending_action') {
+                    const draft = pendingActionDraftRef.current;
+                    if (
+                      draft &&
+                      recentActionDeduplicatorRef.current.shouldExecute('approve_pending_action', {
+                        id: draft.pendingActionId,
+                      })
+                    ) {
+                      handleApprovePendingAction({
+                        pendingActionId: draft.pendingActionId,
+                        recipientName: draft.recipientName,
+                        phoneNumber: draft.phoneNumber,
+                        messageText: draft.messageText,
+                        useNotificationReply: Boolean(
+                          draft.canReplyViaNotification && draft.notificationKey
+                        ),
+                      });
+                    }
+                    return;
+                  }
+
+                  void (async () => {
+                    const outcomes: string[] = [];
+                    for (const step of plan.steps) {
+                      const mapped = mapTaskStepToAssistantTool(step, cleanSpoken);
+                      if (!mapped) continue;
+                      if (
+                        !recentActionDeduplicatorRef.current.shouldExecute(
+                          mapped.name,
+                          mapped.args
+                        )
+                      ) {
+                        continue;
+                      }
+                      const report = await executeValidatedAssistantTool(mapped.name, mapped.args);
+                      recordActionDiagnostic('deterministic_native', mapped.name, mapped.args, report);
+                      outcomes.push(
+                        formatLocalizedActionOutcome(
+                          report,
+                          activeLanguageRef.current,
+                          selectedAffectionNameRef.current
+                        )
+                      );
+                    }
+                    if (outcomes.length > 0) {
+                      const combined = outcomes.join(' ');
+                      setLatestTranscript(combined);
+                      setMessages((prev) => [
+                        ...prev,
+                        {
+                          id: `voice-act-${Date.now()}`,
+                          role: 'assistant',
+                          text: combined,
+                          timestamp: new Date(),
+                          lang: activeLanguageRef.current,
+                        },
+                      ]);
+                    }
+                  })();
+                }, 900);
+
                 if (isFlashlightOnCommand(msg.text)) {
-                  toggleFlashlight(true);
-                  const feedback =
-                    activeLanguageRef.current === 'bn-BD'
-                      ? 'টর্চ লাইট জ্বালানো হয়েছে।'
-                      : 'Flashlight turned on.';
-                  setLatestTranscript(feedback);
+                  if (
+                    recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
+                      enable: true,
+                    })
+                  ) {
+                    toggleFlashlight(true);
+                    const feedback =
+                      activeLanguageRef.current === 'bn-BD'
+                        ? 'টর্চ লাইট জ্বালানো হয়েছে।'
+                        : 'Flashlight turned on.';
+                    setLatestTranscript(feedback);
+                  }
                 } else if (isFlashlightOffCommand(msg.text)) {
-                  toggleFlashlight(false);
-                  const feedback =
-                    activeLanguageRef.current === 'bn-BD'
-                      ? 'টর্চ লাইট বন্ধ করা হয়েছে।'
-                      : 'Flashlight turned off.';
-                  setLatestTranscript(feedback);
+                  if (
+                    recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
+                      enable: false,
+                    })
+                  ) {
+                    toggleFlashlight(false);
+                    const feedback =
+                      activeLanguageRef.current === 'bn-BD'
+                        ? 'টর্চ লাইট বন্ধ করা হয়েছে।'
+                        : 'Flashlight turned off.';
+                    setLatestTranscript(feedback);
+                  }
                 }
                 return;
               }
@@ -1652,6 +2164,8 @@ export default function App() {
                 currentTurnIdRef.current = completedTurnId + 1;
                 userSpeechTurnIdRef.current += 1;
                 receivedAudioInTurnRef.current = false;
+                liveToolExecutedInTurnRef.current = false;
+                currentSpeechTranscriptRef.current = '';
                 pendingChatFallbackRef.current = null;
 
                 setVitals((prev) => ({
@@ -1781,6 +2295,9 @@ export default function App() {
     },
     [
       clearTurnTimeout,
+      executeValidatedAssistantTool,
+      handleApprovePendingAction,
+      recordActionDiagnostic,
       sendViaHttpChatFallback,
       settlePendingHandshake,
       stopAllSpeechPlayback,
@@ -2407,98 +2924,6 @@ export default function App() {
           setAssistantState('idle');
         };
 
-        const mapTaskStepToTool = (
-          step: TaskStep
-        ): { name: string; args: Record<string, unknown> } | null => {
-          switch (step.tool) {
-            case 'sim_call':
-              return {
-                name: 'call_contact',
-                args: {
-                  recipient: String(step.args.contactQuery || step.args.phoneNumber || step.args.target || ''),
-                },
-              };
-            case 'whatsapp_prepare':
-              return {
-                name: 'prepare_whatsapp_message',
-                args: {
-                  recipient: String(step.args.contactQuery || step.args.phoneNumber || ''),
-                  message: String(step.args.message || ''),
-                },
-              };
-            case 'sms_compose':
-              return {
-                name: 'prepare_sms',
-                args: {
-                  recipient: String(step.args.phoneNumber || ''),
-                  message: String(step.args.message || ''),
-                },
-              };
-            case 'open_app':
-              return {
-                name: 'open_app',
-                args: { app_name: String(step.args.appQuery || '') },
-              };
-            case 'app_search_workflow':
-              return {
-                name: 'open_app',
-                args: {
-                  app_name: String(step.args.appQuery || 'YouTube'),
-                  search_query: String(step.args.searchQuery || ''),
-                },
-              };
-            case 'list_installed_apps':
-              return { name: 'list_installed_apps', args: {} };
-            case 'open_settings':
-              return {
-                name: 'open_system_settings',
-                args: { target: String(step.args.target || 'main') },
-              };
-            case 'screen_analyze':
-              return {
-                name: 'read_visible_screen',
-                args: { question: String(step.args.question || cleanText) },
-              };
-            case 'notification_read':
-              return {
-                name: 'read_notifications',
-                args: { whatsapp_only: Boolean(step.args.whatsappOnly) },
-              };
-            case 'accessibility_action': {
-              const cmd = String(step.args.command || '');
-              if (cmd === 'scroll_down') return { name: 'scroll_screen', args: { direction: 'down' } };
-              if (cmd === 'scroll_up') return { name: 'scroll_screen', args: { direction: 'up' } };
-              if (cmd === 'back') return { name: 'go_back', args: {} };
-              if (cmd === 'home') return { name: 'go_home', args: {} };
-              if (cmd.startsWith('tap:')) {
-                return { name: 'tap_visible_element', args: { element_text: cmd.slice(4).trim() } };
-              }
-              return null;
-            }
-            case 'camera_open':
-              return { name: 'camera_open', args: {} };
-            case 'volume_control':
-              return {
-                name: 'volume_control',
-                args: { action: String(step.args.action || 'status') },
-              };
-            case 'flashlight':
-              return { name: 'flashlight_control', args: { enable: Boolean(step.args.enable) } };
-            case 'battery_status':
-              return { name: 'battery_status', args: {} };
-            case 'contact_lookup':
-              return { name: 'contact_search', args: { query: String(step.args.query || '') } };
-            case 'reminder':
-              return { name: 'create_reminder', args: { note: String(step.args.note || '') } };
-            case 'web_search':
-              return { name: 'search_web', args: { query: String(step.args.query || '') } };
-            case 'cancel_current_task':
-              return { name: 'cancel_current_task', args: {} };
-            default:
-              return null;
-          }
-        };
-
         // Handle explicit pending-draft review or approval commands first
         const singleTool = taskPlan.steps.length === 1 ? taskPlan.steps[0].tool : null;
         if (singleTool === 'approve_pending_action') {
@@ -2553,9 +2978,11 @@ export default function App() {
 
         const outcomes: string[] = [];
         for (const step of taskPlan.steps) {
-          const mapped = mapTaskStepToTool(step);
+          const mapped = mapTaskStepToAssistantTool(step, cleanText);
           if (mapped) {
+            recentActionDeduplicatorRef.current.markExecuted(mapped.name, mapped.args);
             const report = await executeValidatedAssistantTool(mapped.name, mapped.args);
+            recordActionDiagnostic('deterministic_native', mapped.name, mapped.args, report);
             outcomes.push(
               formatLocalizedActionOutcome(report, activeLanguage, selectedAffectionName)
             );
@@ -2683,8 +3110,18 @@ export default function App() {
         fallbackStarted: false,
       };
 
-      // 4. Route via /api/chat immediately when Live WS is unavailable/error; otherwise send over Live WS with automatic /api/chat fallback
+      // 4. Explicit Action-Intent Routing Policy (Root Cause 4):
+      // Separate device-action intents from ordinary chat & route immediately to HTTP /api/chat function calling
+      // whenever Live WS is unavailable or lacks declared tools — never silently falling back to ordinary conversation.
+      const liveWsOpenAndReady =
+        wsRef.current?.readyState === WebSocket.OPEN && isSessionReadyRef.current;
+      const intentRoute = decideIntentExecutionRoute(cleanText, {
+        liveWsReadyWithTools: Boolean(liveWsOpenAndReady && liveToolsReadyRef.current),
+        isDateTimeQuery: Boolean(detectDateTimeQuery(cleanText)),
+      });
+
       const useFallbackImmediately =
+        intentRoute === 'http_function_calling' ||
         Boolean(liveNonRetryableErrorRef.current) ||
         shouldUseHttpChatFallback(
           wsRef.current?.readyState,
@@ -2727,6 +3164,7 @@ export default function App() {
       clearTurnTimeout,
       executeValidatedAssistantTool,
       handleApprovePendingAction,
+      recordActionDiagnostic,
     ]
   );
 
@@ -2982,7 +3420,7 @@ export default function App() {
         selectedAffectionName={selectedAffectionName}
       />
 
-      {/* Clean Zoni Jarvis Settings Modal (Soul Core, Personality Matrix, Voice Modulator, Telemetry) */}
+      {/* Clean Zoni Jarvis Settings Modal (Soul Core, Personality Matrix, Voice Modulator, Telemetry, Device Action Diagnostics) */}
       <ZoniSettingsModal
         isOpen={isSettingsModalOpen}
         onClose={() => setIsSettingsModalOpen(false)}
@@ -2991,11 +3429,22 @@ export default function App() {
         isLiveActive={isLiveActive}
         wsStatus={wsStatus}
         backendHealth={backendHealth}
+        deviceDiagnostics={deviceDiagnostics}
         onSelectMode={handleSelectMode}
         onUpdateAffectionName={handleUpdateAffectionName}
         onSelectVoice={handleSelectVoice}
         onToggleSoundFx={handleToggleSoundFx}
         onReconnectLive={handleManualReconnectLive}
+        onRefreshDiagnostics={refreshDeviceDiagnostics}
+        onOpenAccessibilitySettings={() => {
+          const bridge = getNativeAndroidBridge();
+          if (bridge?.openSystemSettings) {
+            bridge.openSystemSettings('accessibility');
+          } else {
+            setIsSettingsModalOpen(false);
+            setIsPermissionsModalOpen(true);
+          }
+        }}
         onOpenBackendSetup={() => {
           setIsSettingsModalOpen(false);
           setIsPermissionsModalOpen(true);

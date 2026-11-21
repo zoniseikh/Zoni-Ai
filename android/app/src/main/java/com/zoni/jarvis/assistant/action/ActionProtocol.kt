@@ -34,6 +34,7 @@ enum class AllowedActionType(
     READ_NOTIFICATIONS("read_notifications", listOf("NOTIFICATION_LISTENER"), false, 3000L),
     PREPARE_WHATSAPP_MESSAGE("prepare_whatsapp_message", listOf("READ_CONTACTS"), true, 6000L),
     PREPARE_SMS("prepare_sms", listOf("READ_CONTACTS"), true, 6000L),
+    PREPARE_APP_CHAT_MESSAGE("prepare_app_chat_message", listOf("ACCESSIBILITY_SERVICE"), true, 6000L),
     REQUEST_PERMISSION("request_permission", emptyList(), false, 5000L),
     FLASHLIGHT_CONTROL("flashlight_control", listOf("CAMERA"), false, 3000L),
     VOLUME_CONTROL("volume_control", emptyList(), false, 3000L),
@@ -51,6 +52,7 @@ enum class AllowedActionType(
         fun fromToolName(name: String?): AllowedActionType? {
             val clean = name?.trim()?.lowercase() ?: return null
             if (clean == "search_contacts") return CONTACT_SEARCH
+            if (clean == "set_flashlight") return FLASHLIGHT_CONTROL
             return entries.firstOrNull { it.toolName == clean }
         }
     }
@@ -71,6 +73,8 @@ data class PendingConfirmationDraft(
     val recipientName: String,
     val phoneNumber: String,
     val messageText: String = "",
+    val targetAppName: String = "",
+    val targetPackageName: String = "",
     val notificationKey: String? = null,
     val canReplyViaNotification: Boolean = false,
     val createdAtMs: Long = System.currentTimeMillis()

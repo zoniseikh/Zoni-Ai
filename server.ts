@@ -22,6 +22,7 @@ import {
   validateGeminiToolCall,
   ValidatedActionRequest,
 } from './src/utils/assistantActionRegistry.ts';
+import { LiveToolRelayManager } from './src/utils/liveToolRelay.ts';
 
 const ZONI_ASSISTANT_TOOLS: FunctionDeclaration[] = ASSISTANT_TOOL_SPECS.map((spec) => {
   const properties: Record<string, any> = {};
@@ -314,13 +315,13 @@ CORE PERSONALITY:
     - "Jarvis protocol engaged: No one touches my ${nickname}'s peace of mind today!"
 
 MOBILE ASSISTANT POWERS & STRICT FUNCTION CALLING PROTOCOL:
-You have 20 allowlisted native Android personal assistant functions declared via Gemini Function Calling (open_app, list_installed_apps, open_system_settings, go_home, go_back, scroll_screen, tap_visible_element, enter_text_in_visible_field, read_visible_screen, read_notifications, prepare_whatsapp_message, prepare_sms, request_permission, flashlight_control, volume_control, battery_status, camera_open, contact_search, call_contact, create_reminder).
+You have ${ZONI_ASSISTANT_TOOLS.length} allowlisted native Android personal assistant functions declared via Gemini Function Calling (${ASSISTANT_TOOL_SPECS.map((s) => s.name).join(', ')}).
 CRITICAL TOOL RULES:
-1. Call a declared function ONLY when the user explicitly requests a concrete Android phone/app/hardware/communication action in Bengali, English, or Hindi (e.g., "WhatsApp খোলো", "আমার মাকে ফোন করো", "ইউটিউবে গান খুঁজে দাও", "ফোনের সেটিংস খোলো", "নিচে স্ক্রল করো", "এই স্ক্রিনে কী আছে পড়ে শোনাও", "রাহুলকে WhatsApp-এ মেসেজ পাঠাও: আমি আজ আসতে পারব না").
-2. NEVER invoke any tool for ordinary conversation, greetings, emotional support, jokes, stories, or general knowledge questions (e.g., "তুমি কেমন আছো?", "আজকের দিনটা কেমন?", "What is photosynthesis?"). Respond naturally in text instead.
-3. NEVER fabricate or hallucinate that an action succeeded, an app opened, or a WhatsApp/SMS message was sent before real execution results are returned.
-4. For WhatsApp messages, SMS, and phone calls, ALWAYS call prepare_whatsapp_message / prepare_sms / call_contact so the user can review, edit, and explicitly approve first. NEVER claim a message was automatically sent unless verified.
-5. For hardware flashlight voice control during Gemini Live audio sessions, invoke set_flashlight immediately with enable=true or enable=false.
+1. Call a declared function IMMEDIATELY in both HTTP chat AND Gemini Live voice sessions whenever the user explicitly requests a concrete Android phone/app/hardware/communication action in Bengali, English, or Hindi (e.g., "WhatsApp খোলো", "আমার ফোনে থাকা Chrome চালু করো", "ফেসবুকটা খুলে দাও", "Open Instagram for me", "আমার মাকে ফোন করো", "ইউটিউবে গান খুঁজে দাও", "ফোনের সেটিংস খোলো", "নিচে স্ক্রল করো", "এই স্ক্রিনে কী আছে পড়ে শোনাও", "রাহুলকে WhatsApp-এ মেসেজ পাঠাও: আমি আজ আসতে পারব না", "টেলিগ্রামে রাহুলকে মেসেজ পাঠাও: আমি আসছি").
+2. NEVER invoke any tool for ordinary conversation, greetings, emotional support, jokes, stories, or general knowledge questions (e.g., "তুমি কেমন আছো?", "আজকের দিনটা কেমন?", "What is photosynthesis?"). Respond naturally in text/voice instead.
+3. NEVER fabricate or hallucinate that an action succeeded, an app opened, or a WhatsApp/SMS/chat message was sent before the real device tool response returns success=true.
+4. For WhatsApp messages, SMS, supported app chat messages (Telegram/Instagram/Messenger), and phone calls, ALWAYS call prepare_whatsapp_message / prepare_sms / prepare_app_chat_message / call_contact so the user can review, edit, and explicitly approve first. If no message body was provided, ask the user what message to write. NEVER claim a message was automatically sent unless verified.
+5. For flashlight control in either chat or Live voice sessions, call flashlight_control with enable=true or enable=false and wait for the real device result.
 
 - Current Active Mode: ${mode.toUpperCase()}
   * ROMANTIC: Overflowing love, affectionate concern, sweet girlfriend compliments, soft tone.
@@ -365,8 +366,10 @@ app.get('/api/status', (req: Request, res: Response) => {
     chatEndpoint: '/api/chat',
     liveWsPath: '/live',
     geminiLiveSupported: geminiConfigured,
+    liveToolCallingSupported: geminiConfigured,
     functionCallingSupported: geminiConfigured,
     assistantToolsCount: ZONI_ASSISTANT_TOOLS.length,
+    liveToolsCount: ZONI_ASSISTANT_TOOLS.length,
     simCallingSupported: true,
     screenAwarenessSupported: geminiConfigured,
     notificationSmartReplySupported: geminiConfigured,
@@ -939,6 +942,19 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
     }
   };
 
+  const toolRelay = new LiveToolRelayManager({
+    sendToClient,
+    isClientConnected: () => isAlive && clientWs.readyState === WebSocket.OPEN,
+    sendToolResponseToGemini: (functionResponses) => {
+      if (!isAlive || !liveSession || typeof liveSession.sendToolResponse !== 'function') return;
+      try {
+        liveSession.sendToolResponse({ functionResponses });
+      } catch (toolErr) {
+        console.warn('[ZONI-LIVE] Error sending tool response to Gemini Live:', sanitizeErrorMessage(toolErr));
+      }
+    },
+  });
+
   // Handle client-level WebSocket errors gracefully
   clientWs.on('error', (err: any) => {
     console.warn('[ZONI-LIVE] Client WebSocket notice:', sanitizeErrorMessage(err));
@@ -954,6 +970,7 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
   clientWs.on('close', () => {
     clearInterval(pingInterval);
     isAlive = false;
+    toolRelay.dispose('client_disconnected');
     pendingClientMessages.length = 0;
     if (liveSession && typeof liveSession.close === 'function') {
       try {
@@ -985,6 +1002,25 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
     try {
       const parsed = JSON.parse(rawStr);
       if (!parsed || typeof parsed !== 'object') return;
+
+      // 0. Native Android / Client Tool Execution Result Relay back to Gemini Live
+      if (parsed.type === 'native_tool_result' && typeof parsed.toolCallId === 'string') {
+        const matched = toolRelay.handleClientToolResult({
+          type: 'native_tool_result',
+          toolCallId: parsed.toolCallId,
+          actionType: typeof parsed.actionType === 'string' ? parsed.actionType : undefined,
+          result: parsed.result || {
+            success: false,
+            verified: false,
+            status: 'failed',
+            message: 'Empty tool execution result received from client.',
+          },
+        });
+        console.log(
+          `[ZONI-LIVE] native_tool_result received: id=${parsed.toolCallId} matched=${matched} status=${String(parsed.result?.status || 'unknown')}`
+        );
+        return;
+      }
 
       // 1. Interrupt current model response
       if (parsed.type === 'interrupt') {
@@ -1144,22 +1180,6 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
     const ai = getGeminiClient();
     const systemInstruction = buildSystemInstruction(mode, nickname, undefined, lang);
 
-    const flashlightTool: FunctionDeclaration = {
-      name: 'set_flashlight',
-      description:
-        'Control phone torch/flashlight. Call this immediately when user asks to turn the flashlight/torch ON or OFF in Bengali or English (e.g. "টর্চ লাইট জ্বালাও", "torch on", "টর্চ জ্বালিয়ে দাও", "ফ্ল্যাশলাইট অন করো", "টর্চ বন্ধ করো", "torch off", "টর্চ বন্ধ করে দাও", "ফ্ল্যাশলাইট অফ করো", "লাইট অন করো", "লাইট অফ করো").',
-      parameters: {
-        type: Type.OBJECT,
-        properties: {
-          enable: {
-            type: Type.BOOLEAN,
-            description: 'True to turn ON flashlight/torch, False to turn OFF flashlight/torch.',
-          },
-        },
-        required: ['enable'],
-      },
-    };
-
     const connectWithHandle = async (handleToUse?: string) => {
       return await ai.live.connect({
         model: 'gemini-3.8-live',
@@ -1171,7 +1191,7 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
             },
           },
           systemInstruction,
-          tools: [{ functionDeclarations: [flashlightTool] }],
+          tools: [{ functionDeclarations: ZONI_ASSISTANT_TOOLS }],
           inputAudioTranscription: {},
           outputAudioTranscription: {},
           sessionResumption: handleToUse ? { handle: handleToUse } : {},
@@ -1196,40 +1216,22 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
               });
             }
 
-            // 1. Tool Call: Gemini Live executes set_flashlight
-            if (message.toolCall?.functionCalls) {
-              for (const call of message.toolCall.functionCalls) {
-                if (call.name === 'set_flashlight') {
-                  const enable = Boolean(call.args?.enable);
-                  console.log(`[Gemini Live] Invoking flashlight hardware tool: enable=${enable}`);
-                  sendToClient({ type: 'flashlight', enable });
-
-                  try {
-                    liveSession?.sendToolResponse({
-                      functionResponses: [
-                        {
-                          id: call.id,
-                          name: call.name,
-                          response: {
-                            output: {
-                              success: true,
-                              enabled: enable,
-                              status: enable ? 'torch_on' : 'torch_off',
-                              message: enable
-                                ? 'টর্চ লাইট জ্বালানো হয়েছে।'
-                                : 'টর্চ লাইট বন্ধ করা হয়েছে।',
-                            },
-                          },
-                        },
-                      ],
-                    });
-                  } catch (toolErr) {
-                    console.warn(
-                      'Error sending tool response to liveSession:',
-                      sanitizeErrorMessage(toolErr)
-                    );
-                  }
-                }
+            // 1. Full Gemini Live Function Calling Relay (all validated assistant tools)
+            if (Array.isArray(message.toolCall?.functionCalls) && message.toolCall.functionCalls.length > 0) {
+              const relayOutcome = toolRelay.handleModelToolCalls(message.toolCall.functionCalls);
+              if (relayOutcome.relayed.length > 0) {
+                console.log(
+                  `[ZONI-LIVE] Relayed ${relayOutcome.relayed.length} validated tool call(s): ${relayOutcome.relayed
+                    .map((r) => r.actionType)
+                    .join(', ')}`
+                );
+              }
+              if (relayOutcome.blocked.length > 0) {
+                console.warn(
+                  `[ZONI-LIVE] Blocked ${relayOutcome.blocked.length} disallowed tool call(s): ${relayOutcome.blocked
+                    .map((b) => b.name)
+                    .join(', ')}`
+                );
               }
             }
 
@@ -1361,9 +1363,11 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
     sendToClient({
       type: 'connected',
       resumed: sessionResumed,
+      liveToolCallingSupported: true,
+      declaredToolsCount: ZONI_ASSISTANT_TOOLS.length,
       message: sessionResumed
         ? 'Zoni Live Link resumed with existing session handle.'
-        : 'Zoni Live Link established.',
+        : 'Zoni Live Link established with full native tool calling.',
     });
     console.log(`[ZONI-LIVE] Gemini Live handshake succeeded (resumed=${sessionResumed})`);
 

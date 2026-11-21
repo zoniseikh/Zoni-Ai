@@ -15,6 +15,7 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.provider.MediaStore
 import android.provider.Settings
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.zoni.jarvis.assistant.R
@@ -27,6 +28,7 @@ import com.zoni.jarvis.assistant.device.FlashlightController
 import com.zoni.jarvis.assistant.device.FlashlightResult
 import com.zoni.jarvis.assistant.domain.NumberNormalizer
 import com.zoni.jarvis.assistant.domain.NumberNormalizerResult
+import com.zoni.jarvis.assistant.service.AppChatAdapterRegistry
 import com.zoni.jarvis.assistant.service.ZoniAccessibilityService
 import com.zoni.jarvis.assistant.service.ZoniNotificationListenerService
 import org.json.JSONArray
@@ -105,20 +107,65 @@ class DeviceActionExecutor(private val context: Context) {
      * Sensitive communication actions (WhatsApp, SMS, Call) return `awaitingConfirmation = true`
      * with a `pendingActionId` so the user can review, edit, cancel, or explicitly approve first.
      */
+    @Volatile
+    private var lastActionRequested: String = "none"
+    @Volatile
+    private var lastActionResult: String = "idle"
+    @Volatile
+    private var lastFailureReason: String = ""
+
     fun executeTypedActionJson(requestJson: String): String {
         val (request, validationError) = ActionProtocolValidator.parseJsonRequest(requestJson)
         if (validationError != null || request == null) {
-            return (validationError ?: TypedActionResult(
+            val errResult = validationError ?: TypedActionResult(
                 actionId = "act_err",
                 actionType = "unknown",
                 success = false,
                 status = "invalid_request",
                 message = "Invalid action request.",
                 failureReason = "validation_failed"
-            )).toJson()
+            )
+            recordDiagnostic(errResult.actionType, errResult.status, errResult.failureReason)
+            return errResult.toJson()
         }
 
-        return executeTypedAction(request).toJson()
+        val result = executeTypedAction(request)
+        recordDiagnostic(request.actionType.toolName, result.status, result.failureReason)
+        return result.toJson()
+    }
+
+    private fun recordDiagnostic(actionType: String, status: String, failureReason: String?) {
+        lastActionRequested = actionType
+        lastActionResult = status
+        lastFailureReason = failureReason.orEmpty()
+        Log.d("ZoniActionExecutor", "action=$actionType status=$status failure=${lastFailureReason.ifBlank { "none" }}")
+    }
+
+    fun getRuntimeDiagnosticsJson(): String {
+        val installedCount = try {
+            appLauncher.listInstalledApps().size
+        } catch (_: Exception) {
+            -1
+        }
+        val recordAudioGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val postNotifGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+        return JSONObject()
+            .put("accessibilityConnected", ZoniAccessibilityService.isConnected())
+            .put("readContactsGranted", contactCallManager.hasContactPermission())
+            .put("callPhoneGranted", contactCallManager.hasCallPhonePermission())
+            .put("recordAudioGranted", recordAudioGranted)
+            .put("postNotificationsGranted", postNotifGranted)
+            .put("notificationListenerEnabled", isNotificationListenerEnabled())
+            .put("installedAppsCount", installedCount)
+            .put("packageVisibilityOk", installedCount > 0)
+            .put("lastActionRequested", lastActionRequested)
+            .put("lastActionResult", lastActionResult)
+            .put("lastFailureReason", lastFailureReason)
+            .toString()
     }
 
     fun executeTypedAction(request: TypedActionRequest): TypedActionResult {
@@ -250,6 +297,13 @@ class DeviceActionExecutor(private val context: Context) {
                 recipientQuery = args["recipient"] ?: args["contact_name"] ?: args["phone_number"] ?: "",
                 messageText = args["message"] ?: "",
                 actionType = AllowedActionType.PREPARE_SMS
+            )
+
+            AllowedActionType.PREPARE_APP_CHAT_MESSAGE -> prepareGenericAppChatDraft(
+                request = request,
+                appNameQuery = args["app_name"] ?: "",
+                recipientQuery = args["recipient"] ?: "",
+                messageText = args["message"] ?: ""
             )
 
             AllowedActionType.CALL_CONTACT -> prepareCommunicationDraft(
@@ -518,6 +572,83 @@ class DeviceActionExecutor(private val context: Context) {
                 )
             }
         }
+    }
+
+    private fun prepareGenericAppChatDraft(
+        request: TypedActionRequest,
+        appNameQuery: String,
+        recipientQuery: String,
+        messageText: String
+    ): TypedActionResult {
+        val adapter = AppChatAdapterRegistry.findAdapter(appNameQuery)
+            ?: return TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = false,
+                verified = false,
+                status = "unsupported_chat_app",
+                message = "Controlled chat messaging is currently supported for WhatsApp, SMS, Telegram, Instagram, and Messenger. \"$appNameQuery\" does not have a verified chat adapter.",
+                failureReason = "unsupported_chat_app"
+            )
+
+        if (!ZoniAccessibilityService.isConnected()) {
+            return TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = false,
+                verified = false,
+                status = "permission_missing",
+                message = "Enable Zoni Accessibility Service in Android Settings to use controlled ${adapter.appName} chat workflows.",
+                failureReason = "accessibility_service_disabled",
+                requiredPermissions = listOf("ACCESSIBILITY_SERVICE")
+            )
+        }
+
+        val cleanRecipient = recipientQuery.trim()
+        val cleanMsg = messageText.trim()
+        if (cleanRecipient.isEmpty()) {
+            return TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = false,
+                status = "missing_recipient",
+                message = "Please specify who you want to message on ${adapter.appName}.",
+                failureReason = "missing_recipient"
+            )
+        }
+
+        val pendingId = "pend_${UUID.randomUUID().toString().take(10)}"
+        val primaryPkg = adapter.packageNames.first()
+        val draft = PendingConfirmationDraft(
+            pendingActionId = pendingId,
+            actionType = AllowedActionType.PREPARE_APP_CHAT_MESSAGE,
+            recipientName = cleanRecipient,
+            phoneNumber = "",
+            messageText = cleanMsg,
+            targetAppName = adapter.appName,
+            targetPackageName = primaryPkg
+        )
+        pendingDrafts[pendingId] = draft
+
+        val data = JSONObject()
+            .put("pendingActionId", pendingId)
+            .put("actionType", AllowedActionType.PREPARE_APP_CHAT_MESSAGE.toolName)
+            .put("appName", adapter.appName)
+            .put("packageName", primaryPkg)
+            .put("contactName", cleanRecipient)
+            .put("messageText", cleanMsg)
+
+        return TypedActionResult(
+            actionId = request.actionId,
+            actionType = request.actionType.toolName,
+            success = true,
+            verified = false,
+            awaitingConfirmation = true,
+            pendingActionId = pendingId,
+            status = "awaiting_confirmation",
+            message = "${adapter.appName} message draft prepared for $cleanRecipient. Review and explicitly approve before opening ${adapter.appName}.",
+            data = data
+        )
     }
 
     private fun prepareCommunicationDraft(
@@ -821,6 +952,68 @@ class DeviceActionExecutor(private val context: Context) {
                         "Could not start phone call to ${draft.recipientName}."
                     },
                     failureReason = if (started) null else "call_intent_failed"
+                ).toJson()
+            }
+
+            AllowedActionType.PREPARE_APP_CHAT_MESSAGE -> {
+                val appLabel = draft.targetAppName.ifBlank { "Chat App" }
+                val launchRes = appLauncher.launchAppByVoiceQuery(appLabel)
+                if (launchRes !is AppLaunchResult.Success) {
+                    return TypedActionResult(
+                        actionId = draft.pendingActionId,
+                        actionType = draft.actionType.toolName,
+                        success = false,
+                        verified = false,
+                        status = "failed",
+                        message = "Could not open $appLabel on this device.",
+                        failureReason = "app_not_installed_or_launch_failed"
+                    ).toJson()
+                }
+
+                if (ZoniAccessibilityService.isConnected() && finalMessage.isNotBlank()) {
+                    val outcome = ZoniAccessibilityService.sendApprovedAppChatMessage(
+                        appName = appLabel,
+                        expectedRecipient = draft.recipientName,
+                        expectedMessage = finalMessage,
+                        pendingActionId = draft.pendingActionId
+                    )
+                    if (outcome.success && outcome.verified) {
+                        return TypedActionResult(
+                            actionId = draft.pendingActionId,
+                            actionType = draft.actionType.toolName,
+                            success = true,
+                            verified = true,
+                            status = "app_chat_sent_verified",
+                            message = outcome.message,
+                            data = (outcome.data ?: JSONObject())
+                                .put("appName", appLabel)
+                                .put("contactName", draft.recipientName)
+                        ).toJson()
+                    }
+                    return TypedActionResult(
+                        actionId = draft.pendingActionId,
+                        actionType = draft.actionType.toolName,
+                        success = true,
+                        verified = true,
+                        status = "opened_app_chat_draft_ready_to_send",
+                        message = outcome.message,
+                        failureReason = outcome.failureReason,
+                        data = JSONObject()
+                            .put("appName", appLabel)
+                            .put("contactName", draft.recipientName)
+                    ).toJson()
+                }
+
+                TypedActionResult(
+                    actionId = draft.pendingActionId,
+                    actionType = draft.actionType.toolName,
+                    success = true,
+                    verified = true,
+                    status = "opened_app_chat_draft_ready_to_send",
+                    message = "Opened $appLabel for ${draft.recipientName}. Please review and send manually.",
+                    data = JSONObject()
+                        .put("appName", appLabel)
+                        .put("contactName", draft.recipientName)
                 ).toJson()
             }
 

@@ -26,6 +26,7 @@ export type AllowedTaskTool =
   | 'sim_call'
   | 'whatsapp_prepare'
   | 'sms_compose'
+  | 'app_chat_prepare'
   | 'review_pending_draft'
   | 'approve_pending_action'
   | 'flashlight'
@@ -50,6 +51,7 @@ export const ALLOWED_TASK_TOOLS: ReadonlySet<AllowedTaskTool> = new Set([
   'sim_call',
   'whatsapp_prepare',
   'sms_compose',
+  'app_chat_prepare',
   'review_pending_draft',
   'approve_pending_action',
   'flashlight',
@@ -169,9 +171,34 @@ function stripTrailingPunctuation(text: string): string {
 function normalizeRelationName(raw: string): string {
   return raw
     .trim()
-    .replace(/^(?:আমার|my|मेरे|मेरी|मेरा)\s+/i, '')
+    .replace(/^(?:আমার|একটু|দয়া\s*করে|দয়া\s*করে|প্লিজ|my|please|मेरे|मेरी|मेरा)\s+/i, '')
     .replace(/^(?:কে|কো)\s+/i, '')
+    .replace(/(?:-?কে|কে)$/i, '')
     .trim();
+}
+
+function normalizeAppQueryTarget(raw: string): string {
+  let clean = raw
+    .trim()
+    .replace(/^(?:আমার\s+ফোনে\s+থাকা|আমার\s+মোবাইলে\s+থাকা|ফোনে\s+থাকা|মোবাইলে\s+থাকা|আমার|একটু|প্লিজ|দয়া\s*করে|দয়া\s*করে)\s+/i, '')
+    .replace(/^(?:mere\s+phone\s+mein|mere\s+phone\s+ka|मेरे\s+फ़ोन\s+में|मेरे\s+फोन\s+में|मेरा|मेरी|प्लीज|ज़रा)\s+/i, '')
+    .replace(/^(?:please\s+|can\s+you\s+|could\s+you\s+)?(?:the\s+|my\s+)?/i, '')
+    .replace(/\s+(?:for\s+me|please|app|application|অ্যাপটা|অ্যাপটি|অ্যাপ|ऐप)$/i, '')
+    .trim();
+
+  // Strip Bengali definite clitics on app names: "ফেসবুকটা" -> "ফেসবুক", "ইউটিউবটা" -> "ইউটিউব", "ক্রোমটা" -> "ক্রোম"
+  if (/(?:টা|টি)$/.test(clean) && clean.length > 3) {
+    clean = clean.replace(/(?:টা|টি)$/, '').trim();
+  }
+  return clean;
+}
+
+function normalizeSupportedChatAppName(raw: string): string | null {
+  const lower = raw.trim().toLowerCase();
+  if (/^(?:telegram|টেলিগ্রাম|টেলিগ্রামে|टेलीग्राम)$/.test(lower)) return 'Telegram';
+  if (/^(?:instagram|ইনস্টাগ্রাম|ইন্সটাগ্রাম|ইনস্টাগ্রামে|इंस्टाग्राम|insta)$/.test(lower)) return 'Instagram';
+  if (/^(?:messenger|মেসেঞ্জার|মেসেঞ্জারে|मैसेंजर)$/.test(lower)) return 'Messenger';
+  return null;
 }
 
 function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep | null {
@@ -490,7 +517,97 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     };
   }
 
+  // 7a. Controlled Generic App Chat Workflow (Telegram, Instagram, Messenger — ALWAYS requires explicit confirmation!)
+  const genericAppChatBn = segment.match(
+    /^(?:টেলিগ্রামে|টেলিগ্রাম-এ|টেলিগ্রাম|telegram(?:-?এ|\s*এ)?|ইনস্টাগ্রামে|ইনস্টাগ্রাম-এ|ইনস্টাগ্রাম|instagram(?:-?এ|\s*এ)?|মেসেঞ্জারে|মেসেঞ্জার-এ|মেসেঞ্জার|messenger(?:-?এ|\s*এ)?)\s+(.+?)(?:কে|-\s*কে)\s*(?:একটা\s+|একটি\s+)?(?:মেসেজ\s*)?(?:পাঠাও|পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|করো|দাও|বলো|লিখে\s*দাও|লেখো)(?:\s*[:,-]?\s*(.+))?$/i
+  );
+  if (genericAppChatBn && genericAppChatBn[1]) {
+    const appToken = segment.split(/\s+/)[0].replace(/-?এ$/i, '');
+    const appName = normalizeSupportedChatAppName(appToken);
+    if (appName) {
+      const recipient = normalizeRelationName(genericAppChatBn[1]);
+      return {
+        stepId,
+        tool: 'app_chat_prepare',
+        args: {
+          appName,
+          contactQuery: recipient,
+          message: stripTrailingPunctuation(genericAppChatBn[2] || ''),
+        },
+        requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+        requiresUserConfirmation: true,
+        honestOutcomeNote: `Prepares a ${appName} chat draft for user review and approval. Never sends silently.`,
+      };
+    }
+  }
+
+  const genericAppChatEn = segment.match(
+    /^(?:please\s+)?send\s+(?:a\s+)?(telegram|instagram|messenger)\s+(?:dm\s+|chat\s+|message\s+)?to\s+([^:]+?)(?:\s+(?:saying|that|message)\s+(.+)|:\s*(.+))?$/i
+  );
+  if (genericAppChatEn && genericAppChatEn[1] && genericAppChatEn[2]) {
+    const appName = normalizeSupportedChatAppName(genericAppChatEn[1]);
+    if (appName) {
+      const recipient = normalizeRelationName(genericAppChatEn[2]);
+      return {
+        stepId,
+        tool: 'app_chat_prepare',
+        args: {
+          appName,
+          contactQuery: recipient,
+          message: stripTrailingPunctuation(genericAppChatEn[3] || genericAppChatEn[4] || ''),
+        },
+        requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+        requiresUserConfirmation: true,
+        honestOutcomeNote: `Prepares a ${appName} chat draft for user review and approval. Never sends silently.`,
+      };
+    }
+  }
+
+  // English: "Message Riya on Instagram saying hello" / "Send a message to Rahul on Messenger saying call me"
+  const genericAppChatOnEn = segment.match(
+    /^(?:please\s+)?(?:message|dm|text|send\s+(?:a\s+)?(?:dm|chat|message)\s+to)\s+(.+?)\s+(?:on|in|via)\s+(telegram|instagram|messenger)(?:\s+(?:saying|that|message)\s+(.+)|\s*[:,-]\s*(.+))?$/i
+  );
+  if (genericAppChatOnEn && genericAppChatOnEn[1] && genericAppChatOnEn[2]) {
+    const appName = normalizeSupportedChatAppName(genericAppChatOnEn[2]);
+    if (appName) {
+      const recipient = normalizeRelationName(genericAppChatOnEn[1]);
+      return {
+        stepId,
+        tool: 'app_chat_prepare',
+        args: {
+          appName,
+          contactQuery: recipient,
+          message: stripTrailingPunctuation(genericAppChatOnEn[3] || genericAppChatOnEn[4] || ''),
+        },
+        requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+        requiresUserConfirmation: true,
+        honestOutcomeNote: `Prepares a ${appName} chat draft for user review and approval. Never sends silently.`,
+      };
+    }
+  }
+
   // 7. Contact-based WhatsApp & Message Drafting (ALWAYS requires user confirmation before sending!)
+  // English: "Message Rahul on WhatsApp saying I am coming" / "Send a message to Rahul on WhatsApp: hello"
+  const waMessageOnEn = segment.match(
+    /^(?:please\s+)?(?:message|text|send\s+(?:a\s+)?message\s+to)\s+(.+?)\s+(?:on|in|via)\s+whats\s*app(?:\s+(?:saying|that|message)\s+(.+)|\s*[:,-]\s*(.+))?$/i
+  );
+  if (waMessageOnEn && waMessageOnEn[1]) {
+    const recipient = normalizeRelationName(waMessageOnEn[1]);
+    return {
+      stepId,
+      tool: 'whatsapp_prepare',
+      args: {
+        contactQuery: recipient,
+        phoneNumber: recipient,
+        message: stripTrailingPunctuation(waMessageOnEn[2] || waMessageOnEn[3] || ''),
+      },
+      requiredPermissions: ['READ_CONTACTS'],
+      requiresUserConfirmation: true,
+      honestOutcomeNote:
+        'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+    };
+  }
+
   // English: "Send Rahul a WhatsApp message saying I will arrive in 10 minutes"
   const waSendRecipientFirst = segment.match(
     /^(?:please\s+)?send\s+([a-zA-Z0-9\s.'-]{2,40}?)\s+(?:a\s+)?whats\s*app\s*(?:message\s*)?(?:saying|that|with\s+message)?\s*[:,-]?\s*(.+)?$/i
@@ -533,9 +650,32 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     };
   }
 
-  // Bengali: "রাহুলকে WhatsApp-এ মেসেজ পাঠাও: আমি আজ আসতে পারব না" / "মাকে WhatsApp-এ বলো আমি বাড়ি ফিরছি"
+  // Bengali WhatsApp-first phrasing:
+  // "WhatsApp-এ রাহুলকে একটা মেসেজ পাঠিয়ে দাও" / "হোয়াটসঅ্যাপে রাহুলকে মেসেজ পাঠাও: আমি আসছি" / "WhatsApp-এ মাকে বলো আমি বাড়ি ফিরছি"
+  const waAppFirstBn = segment.match(
+    /^(?:হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|whatsapp)(?:-?এ|\s*এ)?\s+(.+?)(?:কে|-\s*কে)\s*(?:একটা\s+|একটি\s+)?(?:মেসেজ\s*)?(?:পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|পাঠাও|করে\s*দাও|করো|দাও|বলো|লিখে\s*দাও|লেখো)(?:\s*[:,-]?\s*(.+))?$/i
+  );
+  if (waAppFirstBn && waAppFirstBn[1]) {
+    const recipient = normalizeRelationName(waAppFirstBn[1]);
+    return {
+      stepId,
+      tool: 'whatsapp_prepare',
+      args: {
+        contactQuery: recipient,
+        phoneNumber: recipient,
+        message: stripTrailingPunctuation(waAppFirstBn[2] || ''),
+      },
+      requiredPermissions: ['READ_CONTACTS'],
+      requiresUserConfirmation: true,
+      honestOutcomeNote:
+        'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+    };
+  }
+
+  // Bengali Recipient-first WhatsApp phrasing:
+  // "রাহুলকে WhatsApp মেসেজ পাঠাও: আমি আসছি।" / "রাহুলকে WhatsApp-এ মেসেজ পাঠাও: আমি আজ আসতে পারব না" / "মাকে WhatsApp-এ বলো আমি বাড়ি ফিরছি"
   const waNamedBn = segment.match(
-    /^(.+?)(?:কে|-\s*কে)\s*(?:হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|whatsapp)(?:-?এ|\s*এ)?\s*(?:একটা\s*)?(?:মেসেজ\s*)?(?:পাঠাও|করো|দাও|বলো|লিখে\s*দাও|লেখো)(?:\s*[:,-]?\s*(.+))?$/i
+    /^(.+?)(?:কে|-\s*কে)\s*(?:হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|whatsapp)(?:-?এ|\s*এ)?\s*(?:একটা\s+|একটি\s+)?(?:মেসেজ\s*)?(?:পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|পাঠাও|করে\s*দাও|করো|দাও|বলো|লিখে\s*দাও|লেখো)(?:\s*[:,-]?\s*(.+))?$/i
   );
   if (waNamedBn && waNamedBn[1]) {
     const recipient = normalizeRelationName(waNamedBn[1]);
@@ -554,9 +694,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     };
   }
 
-  // Bengali general message draft: "রাহুলকে একটা মেসেজ লিখে দাও" / "পাপাকে মেসেজ করো আমি পরে ফোন করব"
+  // Bengali general message draft: "রাহুলকে একটা মেসেজ লিখে দাও" / "মাকে একটা মেসেজ লিখে দাও।" / "পাপাকে মেসেজ করো আমি পরে ফোন করব"
   const msgDraftBn = segment.match(
-    /^(.+?)(?:কে|-\s*কে)\s*(?:একটা\s+|একটি\s+)?মেসেজ\s*(?:লিখে\s*দাও|লেখো|পাঠাও|করো|দাও)(?:\s*[:,-]?\s*(.+))?$/i
+    /^(.+?)(?:কে|-\s*কে)\s*(?:একটা\s+|একটি\s+)?মেসেজ\s*(?:লিখে\s*দাও|লেখো|পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|পাঠাও|করে\s*দাও|করো|দাও)(?:\s*[:,-]?\s*(.+))?$/i
   );
   if (msgDraftBn && msgDraftBn[1]) {
     const recipient = normalizeRelationName(msgDraftBn[1]);
@@ -575,19 +715,40 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     };
   }
 
-  // Hindi WhatsApp: "राहुल को व्हाट्सएप मैसेज भेजो मैं आज नहीं आ पाऊंगा"
-  const waNamedHi = segment.match(
-    /^(.+?)\s*को\s*(?:व्हाट्सएप|whatsapp)\s*(?:पर\s*)?(?:मैसेज\s*)?(?:भेजो|लिखो|करो|बोलो)(?:\s*[:,-]?\s*(.+))?$/i
+  // Hindi WhatsApp: "राहुल को व्हाट्सएप मैसेज भेजो मैं आज नहीं आ पाऊंगा" / "व्हाट्सएप पर राहुल को मैसेज भेजो"
+  const waAppFirstHi = segment.match(
+    /^(?:व्हाट्सएप|whatsapp)\s*(?:पर|में)\s+(.+?)\s*को\s*(?:एक\s*)?(?:मैसेज\s*)?(?:भेज\s*दो|भेजो|लिख\s*दो|लिखो|करो|बोलो)(?:\s*[:,-]?\s*(.+))?$/i
   );
-  if (waNamedHi && waNamedHi[1]) {
-    const recipient = normalizeRelationName(waNamedHi[1]);
+  if (waAppFirstHi && waAppFirstHi[1]) {
+    const recipient = normalizeRelationName(waAppFirstHi[1]);
     return {
       stepId,
       tool: 'whatsapp_prepare',
       args: {
         contactQuery: recipient,
         phoneNumber: recipient,
-        message: stripTrailingPunctuation(waNamedHi[2] || ''),
+        message: stripTrailingPunctuation(waAppFirstHi[2] || ''),
+      },
+      requiredPermissions: ['READ_CONTACTS'],
+      requiresUserConfirmation: true,
+      honestOutcomeNote:
+        'Prepares a WhatsApp draft for user review and approval. The message is NEVER sent silently.',
+    };
+  }
+
+  const waNamedHi = segment.match(
+    /^(.+?)\s*को\s*(?:व्हाट्सएप|whatsapp)\s*(?:पर\s*)?(?:एक\s*)?(?:मैसेज\s*)?(?:भेज\s*दो|भेजो|लिख\s*दो|लिखो|करो|बोलो)(?:\s*(?:कि\s+|[:,-]\s*)?(.+))?$/i
+  );
+  if (waNamedHi && waNamedHi[1]) {
+    const recipient = normalizeRelationName(waNamedHi[1]);
+    const rawHiBody = (waNamedHi[2] || '').replace(/^कि\s+/i, '');
+    return {
+      stepId,
+      tool: 'whatsapp_prepare',
+      args: {
+        contactQuery: recipient,
+        phoneNumber: recipient,
+        message: stripTrailingPunctuation(rawHiBody),
       },
       requiredPermissions: ['READ_CONTACTS'],
       requiresUserConfirmation: true,
@@ -637,24 +798,37 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     };
   }
 
-  // 10b. Explicit App Launch ("WhatsApp খোলো", "Open WhatsApp", "ইউটিউব খোলো", "व्हाट्सएप खोलो")
-  const openAppEn = segment.match(/^(?:please\s+)?(?:open|launch|start)\s+(?:the\s+)?([^\s]+(?:\s+[^\s]+)?)(?:\s+app)?$/i);
-  if (
-    openAppEn &&
-    openAppEn[1] &&
-    !/(?:settings|camera|flashlight|torch)/i.test(openAppEn[1])
-  ) {
-    return {
-      stepId,
-      tool: 'open_app',
-      args: { appQuery: openAppEn[1].trim() },
-      requiredPermissions: [],
-      requiresUserConfirmation: false,
-      honestOutcomeNote: 'Launches the requested installed Android app.',
-    };
+  // 10b. Explicit App Launch — Expanded Natural Bengali, English, Hindi & Mixed-Language Variations
+  // Examples:
+  // - "Open Instagram for me", "Please launch Chrome", "Start Calculator app"
+  // - "WhatsApp খোলো", "WhatsApp খুলে দাও", "WhatsApp ওপেন করো", "আমার WhatsApp চালু করো",
+  //   "জনি YouTube খুলে দাও", "ফেসবুকটা খুলে দাও", "আমার ফোনে থাকা Chrome চালু করো"
+  // - "व्हाट्सएप खोलो", "यूट्यूब खोल दो", "कैलकुलेटर चालू करो"
+  const openAppEn = segment.match(
+    /^(?:(?:please|can\s+you|could\s+you)\s+)?(?:open|launch|start|run)\s+(?:up\s+)?(?:the\s+|my\s+)?(.+?)(?:\s+app)?(?:\s+for\s+me|\s+please|\s+now)?$/i
+  );
+  if (openAppEn && openAppEn[1]) {
+    const appTarget = normalizeAppQueryTarget(openAppEn[1]);
+    if (
+      appTarget &&
+      appTarget.split(/\s+/).length <= 4 &&
+      !/^(?:it|it\s+later|this|that|them|me|him|her)$/i.test(appTarget) &&
+      !/(?:settings|camera|flashlight|torch|door|window|eyes|heart)/i.test(appTarget)
+    ) {
+      return {
+        stepId,
+        tool: 'open_app',
+        args: { appQuery: appTarget },
+        requiredPermissions: [],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: 'Launches the requested installed Android app.',
+      };
+    }
   }
 
-  const openAppBn = segment.match(/^([^\s]+(?:\s+[^\s]+)?)\s*(?:খোলো|ওপেন\s*করো|চালু\s*করো)$/i);
+  const openAppBn = segment.match(
+    /^(.+?)\s*(?:খুলে\s*দাও|খোলো|খুলো|ওপেন\s*করে\s*দাও|ওপেন\s*করো|চালু\s*করে\s*দাও|চালু\s*করো|অন\s*করে\s*দাও)$/i
+  );
   if (
     openAppBn &&
     openAppBn[1] &&
@@ -662,34 +836,45 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     !lower.includes('ক্যামেরা') &&
     !lower.includes('টর্চ') &&
     !lower.includes('ফ্ল্যাশলাইট') &&
-    !lower.includes('লাইট')
+    !lower.includes('লাইট') &&
+    !lower.includes('দরজা') &&
+    !lower.includes('জানালা')
   ) {
-    return {
-      stepId,
-      tool: 'open_app',
-      args: { appQuery: openAppBn[1].trim() },
-      requiredPermissions: [],
-      requiresUserConfirmation: false,
-      honestOutcomeNote: 'Launches the requested installed Android app.',
-    };
+    const appTarget = normalizeAppQueryTarget(openAppBn[1]);
+    if (appTarget && appTarget.split(/\s+/).length <= 4) {
+      return {
+        stepId,
+        tool: 'open_app',
+        args: { appQuery: appTarget },
+        requiredPermissions: [],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: 'Launches the requested installed Android app.',
+      };
+    }
   }
 
-  const openAppHi = segment.match(/^([^\s]+(?:\s+[^\s]+)?)\s*खोलो$/i);
+  const openAppHi = segment.match(
+    /^(.+?)\s*(?:खोल\s*दो|खोलो|ओपन\s*करो|ओपन\s*कर\s*दो|चालू\s*करो|चालू\s*कर\s*दो)$/i
+  );
   if (
     openAppHi &&
     openAppHi[1] &&
     !lower.includes('सेटिंग्स') &&
     !lower.includes('कैमरा') &&
-    !lower.includes('टॉर्च')
+    !lower.includes('टॉर्च') &&
+    !lower.includes('लाइट')
   ) {
-    return {
-      stepId,
-      tool: 'open_app',
-      args: { appQuery: openAppHi[1].trim() },
-      requiredPermissions: [],
-      requiresUserConfirmation: false,
-      honestOutcomeNote: 'Launches the requested installed Android app.',
-    };
+    const appTarget = normalizeAppQueryTarget(openAppHi[1]);
+    if (appTarget && appTarget.split(/\s+/).length <= 4) {
+      return {
+        stepId,
+        tool: 'open_app',
+        args: { appQuery: appTarget },
+        requiredPermissions: [],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: 'Launches the requested installed Android app.',
+      };
+    }
   }
 
   // 11. Reuse deterministic mobileAssistant intent parser (numbers, flashlight, vibrate, battery, apps, settings)

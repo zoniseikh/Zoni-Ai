@@ -25,6 +25,7 @@ export type AssistantToolName =
   | 'read_notifications'
   | 'prepare_whatsapp_message'
   | 'prepare_sms'
+  | 'prepare_app_chat_message'
   | 'request_permission'
   | 'flashlight_control'
   | 'volume_control'
@@ -297,6 +298,30 @@ export const ASSISTANT_TOOL_SPECS: readonly AssistantToolSpec[] = [
     },
   },
   {
+    name: 'prepare_app_chat_message',
+    description: 'Prepare a chat message draft for a supported accessible messaging app (Telegram, Instagram, Messenger) so the user can review, edit, and explicitly approve before sending. NEVER sends silently.',
+    requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+    requiresConfirmation: true,
+    timeoutMs: 6000,
+    parameters: {
+      properties: {
+        app_name: {
+          type: 'STRING',
+          description: 'Supported messaging app name (Telegram, Instagram, or Messenger).',
+        },
+        recipient: {
+          type: 'STRING',
+          description: 'Target chat recipient name or username.',
+        },
+        message: {
+          type: 'STRING',
+          description: 'Exact message text to review and approve before sending.',
+        },
+      },
+      required: ['app_name', 'recipient'],
+    },
+  },
+  {
     name: 'request_permission',
     description: 'Prompt the user or open the Android permission setup screen for a specific missing permission.',
     requiredPermissions: [],
@@ -505,7 +530,12 @@ export function validateGeminiToolCall(
   providedId?: string
 ): ToolValidationResult {
   const rawClean = String(rawName || '').trim().toLowerCase();
-  const cleanName = rawClean === 'search_contacts' ? 'contact_search' : rawClean;
+  const cleanName =
+    rawClean === 'search_contacts'
+      ? 'contact_search'
+      : rawClean === 'set_flashlight'
+      ? 'flashlight_control'
+      : rawClean;
   if (!isAllowlistedAssistantTool(cleanName)) {
     return {
       valid: false,
@@ -629,6 +659,29 @@ export function formatLocalizedActionOutcome(
       return `${name}, ${recipient ? `${recipient} के लिए ` : ''}WhatsApp में आपका मैसेज ड्राफ्ट खोल दिया गया है। यह अपने आप नहीं भेजा गया है — कृपया WhatsApp में Send दबाएं।`;
     }
     return `${name}, I opened your WhatsApp draft${recipient ? ` for ${recipient}` : ''}. It has NOT been auto-sent — please review and tap Send in WhatsApp.`;
+  }
+
+  if (report.status === 'app_chat_sent_verified') {
+    const appLabel = report.data?.appName || 'app';
+    const recipient = report.data?.contactName || report.data?.recipient || '';
+    if (lang === 'bn-BD') {
+      return `${name}, আপনার অনুমোদনের পর ${appLabel}-এ ${recipient ? `${recipient}-কে ` : ''}মেসেজ পাঠানোর Send বাটন চাপানো ও যাচাই করা হয়েছে।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, आपकी अनुमति के बाद ${appLabel} में ${recipient ? `${recipient} को ` : ''}मैसेज का Send बटन दबाया और सत्यापित किया गया है।`;
+    }
+    return `${name}, after your approval, Send was clicked and verified in ${appLabel}${recipient ? ` for ${recipient}` : ''}.`;
+  }
+
+  if (report.status === 'opened_app_chat_draft_ready_to_send') {
+    const appLabel = report.data?.appName || 'the app';
+    if (lang === 'bn-BD') {
+      return `${name}, ${appLabel} খোলা হয়েছে, তবে স্বয়ংক্রিয় Send সম্পন্ন হয়নি। অনুগ্রহ করে ${appLabel}-এ মেসেজটি যাচাই করে Send চাপুন।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, ${appLabel} खोला गया है, लेकिन अपने आप Send नहीं हुआ। कृपया ${appLabel} में मैसेज जांचकर Send दबाएं।`;
+    }
+    return `${name}, ${appLabel} was opened, but automated Send could not be verified — please review and tap Send manually.`;
   }
 
   if (report.status === 'replied_via_notification_remote_input') {

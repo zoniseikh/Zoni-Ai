@@ -7,8 +7,8 @@ import {
   formatLocalizedActionOutcome,
 } from './assistantActionRegistry.ts';
 
-test('Category A & C: Registry declares all 24 allowlisted Android personal assistant tools', () => {
-  assert.equal(ASSISTANT_TOOL_SPECS.length, 24);
+test('Category A & C & E: Registry declares all 25 allowlisted Android personal assistant tools', () => {
+  assert.equal(ASSISTANT_TOOL_SPECS.length, 25);
   const expectedTools = [
     'list_installed_apps',
     'open_app',
@@ -22,6 +22,7 @@ test('Category A & C: Registry declares all 24 allowlisted Android personal assi
     'read_notifications',
     'prepare_whatsapp_message',
     'prepare_sms',
+    'prepare_app_chat_message',
     'request_permission',
     'flashlight_control',
     'volume_control',
@@ -39,10 +40,15 @@ test('Category A & C: Registry declares all 24 allowlisted Android personal assi
     assert.equal(isAllowlistedAssistantTool(name), true, `Expected ${name} to be allowlisted`);
   }
 
-  // Alias support: search_contacts resolves cleanly to contact_search
+  // Alias support: search_contacts -> contact_search, set_flashlight -> flashlight_control
   const aliasRes = validateGeminiToolCall('search_contacts', { query: 'Rahul' });
   assert.equal(aliasRes.valid, true);
   assert.equal(aliasRes.request?.actionType, 'contact_search');
+
+  const flashAlias = validateGeminiToolCall('set_flashlight', { enable: true });
+  assert.equal(flashAlias.valid, true);
+  assert.equal(flashAlias.request?.actionType, 'flashlight_control');
+  assert.equal(flashAlias.request?.arguments.enable, true);
 });
 
 test('Category E: Security policy strictly blocks disallowed tools, shell commands, JS eval, and arbitrary file operations', () => {
@@ -87,6 +93,15 @@ test('Category C: Communication tools (WhatsApp, SMS, Call) ALWAYS enforce requi
   const call = validateGeminiToolCall('call_contact', { recipient: 'মা' });
   assert.equal(call.valid, true);
   assert.equal(call.request?.requiresConfirmation, true);
+
+  const appChat = validateGeminiToolCall('prepare_app_chat_message', {
+    app_name: 'Telegram',
+    recipient: 'রাহুল',
+    message: 'আমি আসছি',
+  });
+  assert.equal(appChat.valid, true);
+  assert.equal(appChat.request?.requiresConfirmation, true);
+  assert.equal(appChat.request?.arguments.app_name, 'Telegram');
 });
 
 test('Category A & B & E: Validation enforces required arguments and strict enum constraints', () => {
@@ -201,4 +216,20 @@ test('Category C, D & E: formatLocalizedActionOutcome enforces honest reporting 
     'Boss'
   );
   assert.ok(cancelledOutcome.includes('বাতিল'));
+
+  const appChatSent = formatLocalizedActionOutcome(
+    {
+      actionId: 'a6',
+      actionType: 'prepare_app_chat_message',
+      success: true,
+      verified: true,
+      status: 'app_chat_sent_verified',
+      message: 'Sent via Telegram',
+      data: { appName: 'Telegram', contactName: 'রাহুল' },
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(appChatSent.includes('Telegram'));
+  assert.ok(appChatSent.includes('Send'));
 });

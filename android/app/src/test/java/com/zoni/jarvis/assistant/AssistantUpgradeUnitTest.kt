@@ -8,6 +8,7 @@ import com.zoni.jarvis.assistant.device.InstalledAppInfo
 import com.zoni.jarvis.assistant.domain.CommandDispatcher
 import com.zoni.jarvis.assistant.domain.VoiceCommand
 import com.zoni.jarvis.assistant.service.AccessibilityGuard
+import com.zoni.jarvis.assistant.service.AppChatAdapterRegistry
 import com.zoni.jarvis.assistant.service.WhatsAppAutomationValidator
 import com.zoni.jarvis.assistant.service.WhatsAppSendDeduplicator
 import org.junit.Assert.assertEquals
@@ -33,6 +34,7 @@ class AssistantUpgradeUnitTest {
         InstalledAppInfo("WhatsApp", "com.whatsapp"),
         InstalledAppInfo("YouTube", "com.google.android.youtube"),
         InstalledAppInfo("Chrome", "com.android.chrome"),
+        InstalledAppInfo("Facebook", "com.facebook.katana"),
         InstalledAppInfo("Instagram", "com.instagram.android"),
         InstalledAppInfo("Settings", "com.android.settings"),
         InstalledAppInfo("Calculator", "com.google.android.calculator"),
@@ -57,6 +59,15 @@ class AssistantUpgradeUnitTest {
         val calcBn = AppNameResolver.resolveMatchingApps("ক্যালকুলেটর", sampleInstalledApps)
         assertTrue(calcBn is AppLaunchResult.Success)
         assertEquals("com.google.android.calculator", (calcBn as AppLaunchResult.Success).packageName)
+
+        // Bengali clitics & conversational phrasing
+        val fbClitic = AppNameResolver.resolveMatchingApps("ফেসবুকটা", sampleInstalledApps)
+        assertTrue(fbClitic is AppLaunchResult.Success)
+        assertEquals("com.facebook.katana", (fbClitic as AppLaunchResult.Success).packageName)
+
+        val chromePhrase = AppNameResolver.resolveMatchingApps("আমার ফোনে থাকা Chrome", sampleInstalledApps)
+        assertTrue(chromePhrase is AppLaunchResult.Success)
+        assertEquals("com.android.chrome", (chromePhrase as AppLaunchResult.Success).packageName)
     }
 
     @Test
@@ -111,8 +122,10 @@ class AssistantUpgradeUnitTest {
 
     @Test
     fun categoryCD_actionProtocolAllowlistAndConfirmationEnforcement() {
-        assertEquals(24, AllowedActionType.entries.size)
+        assertEquals(25, AllowedActionType.entries.size)
         assertEquals(AllowedActionType.CONTACT_SEARCH, AllowedActionType.fromToolName("search_contacts"))
+        assertEquals(AllowedActionType.FLASHLIGHT_CONTROL, AllowedActionType.fromToolName("set_flashlight"))
+        assertEquals(AllowedActionType.PREPARE_APP_CHAT_MESSAGE, AllowedActionType.fromToolName("prepare_app_chat_message"))
         assertEquals(AllowedActionType.SEARCH_YOUTUBE, AllowedActionType.fromToolName("search_youtube"))
         assertEquals(AllowedActionType.CANCEL_CURRENT_TASK, AllowedActionType.fromToolName("cancel_current_task"))
 
@@ -138,6 +151,14 @@ class AssistantUpgradeUnitTest {
         )
         assertNull(smsErr)
         assertTrue(smsReq!!.requiresConfirmation)
+
+        val (appChatReq, appChatErr) = ActionProtocolValidator.validate(
+            "prepare_app_chat_message",
+            mapOf("app_name" to "Telegram", "recipient" to "Rahul", "message" to "On my way")
+        )
+        assertNull(appChatErr)
+        assertNotNull(appChatReq)
+        assertTrue(appChatReq!!.requiresConfirmation)
 
         // Disallowed tools & shell/JS injection payloads strictly blocked
         val (shellReq, shellErr) = ActionProtocolValidator.validate("exec_shell", mapOf("cmd" to "ls"))
@@ -264,10 +285,53 @@ class AssistantUpgradeUnitTest {
             )
         )
 
+        // Composer strict match validation before Send
+        assertTrue(
+            WhatsAppAutomationValidator.composerMatchesApprovedMessage(
+                "আমি আজ আসতে পারব না",
+                "আমি আজ আসতে পারব না"
+            )
+        )
+        assertFalse(
+            WhatsAppAutomationValidator.composerMatchesApprovedMessage(
+                "wrong text",
+                "আমি আজ আসতে পারব না"
+            )
+        )
+        assertFalse(
+            WhatsAppAutomationValidator.composerMatchesApprovedMessage(
+                "",
+                "আমি আজ আসতে পারব না"
+            )
+        )
+
         // Duplicate send prevention via idempotency token
         assertTrue(WhatsAppSendDeduplicator.tryAcquire("pend_wa_001"))
         assertFalse(WhatsAppSendDeduplicator.tryAcquire("pend_wa_001"))
         WhatsAppSendDeduplicator.release("pend_wa_001")
         assertTrue(WhatsAppSendDeduplicator.tryAcquire("pend_wa_001"))
+    }
+
+    @Test
+    fun categoryE_genericAppChatAdapterRegistrySupportsOnlyVerifiedApps() {
+        val tg = AppChatAdapterRegistry.findByAppName("Telegram")
+        assertNotNull(tg)
+        assertEquals("org.telegram.messenger", tg!!.packageName)
+
+        val tgBn = AppChatAdapterRegistry.findByAppName("টেলিগ্রাম")
+        assertNotNull(tgBn)
+        assertEquals("Telegram", tgBn!!.displayName)
+
+        val ig = AppChatAdapterRegistry.findByAppName("Instagram")
+        assertNotNull(ig)
+        assertEquals("com.instagram.android", ig!!.packageName)
+
+        val msg = AppChatAdapterRegistry.findByAppName("Messenger")
+        assertNotNull(msg)
+        assertEquals("com.facebook.orca", msg!!.packageName)
+
+        // Untested or sensitive apps must NOT have a generic chat adapter
+        assertNull(AppChatAdapterRegistry.findByAppName("RandomUntestedChatApp"))
+        assertNull(AppChatAdapterRegistry.findByAppName("bKash"))
     }
 }
