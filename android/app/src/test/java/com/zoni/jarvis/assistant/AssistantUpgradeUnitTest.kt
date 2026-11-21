@@ -314,24 +314,30 @@ class AssistantUpgradeUnitTest {
 
     @Test
     fun categoryE_genericAppChatAdapterRegistrySupportsOnlyVerifiedApps() {
-        val tg = AppChatAdapterRegistry.findByAppName("Telegram")
+        val tg = AppChatAdapterRegistry.findAdapter("Telegram")
         assertNotNull(tg)
-        assertEquals("org.telegram.messenger", tg!!.packageName)
+        assertEquals("Telegram", tg!!.appName)
+        assertTrue(tg.packageNames.contains("org.telegram.messenger"))
+        assertTrue(tg.matchesPackage("org.telegram.messenger"))
 
-        val tgBn = AppChatAdapterRegistry.findByAppName("টেলিগ্রাম")
+        val tgBn = AppChatAdapterRegistry.findAdapter("টেলিগ্রাম")
         assertNotNull(tgBn)
-        assertEquals("Telegram", tgBn!!.displayName)
+        assertEquals("Telegram", tgBn!!.appName)
 
-        val ig = AppChatAdapterRegistry.findByAppName("Instagram")
+        val ig = AppChatAdapterRegistry.findAdapter("Instagram")
         assertNotNull(ig)
-        assertEquals("com.instagram.android", ig!!.packageName)
+        assertEquals("Instagram", ig!!.appName)
+        assertTrue(ig.packageNames.contains("com.instagram.android"))
+        assertTrue(ig.matchesPackage("com.instagram.android"))
 
-        val msg = AppChatAdapterRegistry.findByAppName("Messenger")
+        val msg = AppChatAdapterRegistry.findAdapter("Messenger")
         assertNotNull(msg)
-        assertEquals("com.facebook.orca", msg!!.packageName)
+        assertEquals("Messenger", msg!!.appName)
+        assertTrue(msg.packageNames.contains("com.facebook.orca"))
+        assertTrue(msg.matchesPackage("com.facebook.orca"))
 
         // Untested or sensitive apps must NOT have a generic chat adapter
-        assertNull(AppChatAdapterRegistry.findByAppName("RandomUntestedChatApp"))
-        assertNull(AppChatAdapterRegistry.findByAppName("bKash"))
+        assertNull(AppChatAdapterRegistry.findAdapter("RandomUntestedChatApp"))
+        assertNull(AppChatAdapterRegistry.findAdapter("bKash"))
     }
 }
