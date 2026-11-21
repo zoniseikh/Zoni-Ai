@@ -8,6 +8,7 @@ import { ApkExportModal } from './components/ApkExportModal';
 import { PermissionsSetupModal } from './components/PermissionsSetupModal';
 import { ZoniSettingsModal, BackendHealthSnapshot } from './components/ZoniSettingsModal';
 import { SimCallingModal } from './components/SimCallingModal';
+import { ActionConfirmationCard, PendingActionDraftState } from './components/ActionConfirmationCard';
 import { AlertTriangle, RefreshCw, Settings2, X } from 'lucide-react';
 import { OfflineIndicator } from './components/PWAInstallButton';
 import {
@@ -21,7 +22,6 @@ import {
   detectAssistantIntent,
   detectLanguageSwitchCommand,
   executeAssistantActionDirectly,
-  AssistantAction,
   sendSystemNotification,
   toggleFlashlight,
   isFlashlightOnCommand,
@@ -46,16 +46,29 @@ import {
   getDisplayBackendUrl,
 } from './utils/apiConfig';
 import {
-  callContactViaNativeBridge,
-  prepareWhatsAppContactViaNativeBridge,
+  getNativeAndroidBridge,
+  executeTypedActionViaNativeBridge,
+  confirmPendingActionViaNativeBridge,
+  cancelPendingActionViaNativeBridge,
+  listInstalledAppsViaNativeBridge,
+  executeVerifiedWorkflowViaNativeBridge,
+  requestDefaultDigitalAssistantViaNativeBridge,
   launchAppDetailedViaNativeBridge,
   captureNativeScreenSnapshot,
   getRecentNativeNotifications,
   adjustNativeVolume,
   openNativeCamera,
-  performNativeAccessibilityCommand,
+  performNativeAccessibilityDetailed,
+  resolveAndroidPackageForQuery,
+  buildAndroidIntentUrl,
 } from './utils/androidBridge';
-import { buildStructuredTaskPlan } from './utils/taskExecutionEngine';
+import { buildStructuredTaskPlan, TaskStep } from './utils/taskExecutionEngine';
+import {
+  validateGeminiToolCall,
+  formatLocalizedActionOutcome,
+  ToolExecutionReport,
+  ValidatedActionRequest,
+} from './utils/assistantActionRegistry';
 import {
   WsConnectionStatus,
   buildClientTextPayload,
@@ -128,6 +141,11 @@ export default function App() {
   const [isCallingModalOpen, setIsCallingModalOpen] = useState(false);
   const [isPermissionsModalOpen, setIsPermissionsModalOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [pendingActionDraft, setPendingActionDraft] = useState<PendingActionDraftState | null>(null);
+  const pendingActionDraftRef = useRef<PendingActionDraftState | null>(null);
+  useEffect(() => {
+    pendingActionDraftRef.current = pendingActionDraft;
+  }, [pendingActionDraft]);
   const [permissionsReport, setPermissionsReport] = useState<ChromePermissionsReport>({
     microphone: 'prompt',
     geolocation: 'prompt',
@@ -443,7 +461,715 @@ export default function App() {
     }
   }, []);
 
-  // Reliable HTTP /api/chat fallback whenever Gemini Live WebSocket is unavailable, disconnected, or times out
+  // Unified Allowlisted Android Personal Assistant Tool Executor (20 Tools, Strict Verification & Confirmation)
+  const executeValidatedAssistantTool = useCallback(
+    async (
+      rawToolName: string,
+      rawArgs: Record<string, unknown>,
+      providedActionId?: string
+    ): Promise<ToolExecutionReport> => {
+      const validation = validateGeminiToolCall(rawToolName, rawArgs, providedActionId);
+      if (!validation.valid || !validation.request) {
+        return {
+          actionId: providedActionId || `blocked_${Date.now()}`,
+          actionType: rawToolName,
+          success: false,
+          verified: false,
+          status: 'blocked',
+          message: validation.blockedReason || 'Blocked by Zoni AI allowlist security policy.',
+        };
+      }
+
+      const req = validation.request;
+      const bridge = getNativeAndroidBridge();
+      const lang = activeLanguageRef.current;
+
+      // 1. Communication Tools requiring explicit user review & approval (WhatsApp, SMS, Call)
+      if (
+        req.actionType === 'prepare_whatsapp_message' ||
+        req.actionType === 'prepare_sms' ||
+        req.actionType === 'call_contact'
+      ) {
+        const recipient = String(req.arguments.recipient || '').trim();
+        const messageText = String(req.arguments.message || '').trim();
+
+        if (bridge?.executeTypedActionJson) {
+          const nativeReport = executeTypedActionViaNativeBridge(
+            req.actionType,
+            req.arguments,
+            req.actionId
+          );
+          if (nativeReport) {
+            if (nativeReport.awaitingConfirmation && nativeReport.pendingActionId) {
+              setPendingActionDraft({
+                pendingActionId: nativeReport.pendingActionId,
+                actionType: req.actionType,
+                recipientName: String(nativeReport.data?.contactName || recipient),
+                phoneNumber: String(nativeReport.data?.phoneNumber || ''),
+                messageText: String(nativeReport.data?.message || messageText),
+                candidates: Array.isArray(nativeReport.data?.candidates)
+                  ? nativeReport.data.candidates
+                  : undefined,
+                canReplyViaNotification: Boolean(nativeReport.data?.canReplyViaNotification),
+                notificationKey: nativeReport.data?.notificationKey
+                  ? String(nativeReport.data.notificationKey)
+                  : undefined,
+                isNativePending: true,
+                statusNote: nativeReport.message,
+              });
+            }
+            return nativeReport;
+          }
+        }
+
+        // Web preview / PWA confirmation staging (NEVER auto-send or auto-dial)
+        const pendingId = `web_pending_${Date.now()}`;
+        const digitsOnly = recipient.replace(/[^\d+]/g, '');
+        const isNumeric = digitsOnly.length >= 7;
+        setPendingActionDraft({
+          pendingActionId: pendingId,
+          actionType: req.actionType,
+          recipientName: recipient,
+          phoneNumber: isNumeric ? digitsOnly : '',
+          messageText,
+          isNativePending: false,
+          statusNote:
+            req.actionType === 'prepare_whatsapp_message'
+              ? lang === 'bn-BD'
+                ? 'মেসেজটি রিভিউ বা এডিট করে অনুমোদন দিন — অনুমোদনের আগে WhatsApp-এ পাঠানো হবে না।'
+                : 'Review or edit the draft before approving — nothing is sent until you explicitly approve.'
+              : req.actionType === 'call_contact'
+              ? lang === 'bn-BD'
+                ? 'কল করার আগে নম্বর ও নাম যাচাই করে অনুমতি দিন।'
+                : 'Verify recipient details and approve before placing the call.'
+              : lang === 'bn-BD'
+              ? 'SMS কম্পোজার খোলার আগে মেসেজটি যাচাই করুন।'
+              : 'Review this SMS draft before opening your SMS composer.',
+        });
+
+        const stagedMessage =
+          req.actionType === 'prepare_whatsapp_message'
+            ? lang === 'bn-BD'
+              ? `${recipient}-এর জন্য WhatsApp মেসেজ ড্রাফট প্রস্তুত করা হয়েছে${messageText ? `: "${messageText}"` : ''}। অনুগ্রহ করে নিচের কার্ডে রিভিউ করে অনুমোদন দিন বা বলুন "এখন পাঠানোর অনুমতি দিলাম"।`
+              : `Prepared WhatsApp draft for ${recipient}${messageText ? `: "${messageText}"` : ''}. Please review, edit, cancel, or approve below before opening WhatsApp.`
+            : req.actionType === 'call_contact'
+            ? lang === 'bn-BD'
+              ? `${recipient}-কে কল করার আগে অনুগ্রহ করে নিচের কার্ডে নিশ্চিত করুন।`
+              : `Please confirm below before calling ${recipient}.`
+            : lang === 'bn-BD'
+            ? `${recipient}-এর জন্য SMS ড্রাফট প্রস্তুত করা হয়েছে। নিচের কার্ডে রিভিউ করে অনুমোদন দিন।`
+            : `Prepared SMS draft for ${recipient}. Please review and approve below.`;
+
+        return {
+          actionId: req.actionId,
+          actionType: req.actionType,
+          success: true,
+          verified: true,
+          awaitingConfirmation: true,
+          pendingActionId: pendingId,
+          status: 'awaiting_confirmation',
+          message: stagedMessage,
+          data: { recipient, message: messageText },
+        };
+      }
+
+      // 2. Open App (with optional verified Accessibility search workflow e.g., YouTube search)
+      if (req.actionType === 'open_app') {
+        const appName = String(req.arguments.app_name || '').trim();
+        const searchQuery = String(req.arguments.search_query || '').trim();
+
+        if (bridge) {
+          const launchRes = launchAppDetailedViaNativeBridge(appName);
+          if (!launchRes || (launchRes.status !== 'launched' && !launchRes.success)) {
+            return {
+              actionId: req.actionId,
+              actionType: 'open_app',
+              success: false,
+              verified: true,
+              status: launchRes?.status || 'app_not_found',
+              message:
+                launchRes?.message ||
+                (lang === 'bn-BD'
+                  ? `"${appName}" অ্যাপটি আপনার ফোনে ইনস্টল করা নেই বা খোলা যায়নি।`
+                  : `"${appName}" is not installed or could not be opened on this device.`),
+            };
+          }
+
+          if (searchQuery) {
+            const pkg = launchRes.packageName || '';
+            const workflowReport = executeVerifiedWorkflowViaNativeBridge([
+              { action: 'wait', durationMs: 900, expectedPackage: pkg },
+              { action: 'tap', target: 'Search', expectedPackage: pkg },
+              { action: 'wait', durationMs: 450, expectedPackage: pkg },
+              { action: 'enter_text', target: 'Search', text: searchQuery, expectedPackage: pkg },
+            ]);
+            if (workflowReport) {
+              return workflowReport;
+            }
+          }
+
+          return {
+            actionId: req.actionId,
+            actionType: 'open_app',
+            success: true,
+            verified: true,
+            status: 'launched',
+            message: launchRes.message || `${appName} opened.`,
+            data: { appLabel: launchRes.appLabel, packageName: launchRes.packageName },
+          };
+        }
+
+        // Web preview honest behavior for open_app
+        const lowerApp = appName.toLowerCase();
+        if (searchQuery && (lowerApp.includes('youtube') || lowerApp.includes('ইউটিউব'))) {
+          return {
+            actionId: req.actionId,
+            actionType: 'open_app',
+            success: true,
+            verified: true,
+            status: 'web_workflow_info',
+            message:
+              lang === 'bn-BD'
+                ? `YouTube-এ "${searchQuery}" খোঁজার ওয়ার্কফ্লো প্রস্তুত। সম্পূর্ণ ইন-অ্যাপ সার্চ অ্যাক্সেসিবিলিটি ওয়ার্কফ্লো ইনস্টল করা Android APK-তে কাজ করে (যেখানে YouTube খুলে Search বাটনে ট্যাপ করে "${searchQuery}" লেখা যাচাই করা হয়)।`
+                : `YouTube search workflow for "${searchQuery}" is ready. Full verified in-app search runs inside the installed Android APK with Accessibility Service enabled.`,
+          };
+        }
+        const pkg = resolveAndroidPackageForQuery(appName);
+        return {
+          actionId: req.actionId,
+          actionType: 'open_app',
+          success: Boolean(pkg),
+          verified: false,
+          status: pkg ? 'web_preview_limited' : 'app_not_found',
+          message: pkg
+            ? lang === 'bn-BD'
+              ? `"${appName}" (${pkg}) শনাক্ত করা হয়েছে। সরাসরি অ্যাপ চালু করতে Zoni AI Android APK-তে চালান।`
+              : `Resolved "${appName}" (${pkg}). Direct native app launching works inside the installed Android APK.`
+            : lang === 'bn-BD'
+            ? `"${appName}" অ্যাপটি ওয়েব প্রিভিউতে খুঁজে পাওয়া যায়নি — Android APK-তে ইনস্টলড অ্যাপ স্ক্যান করে চালু করা যায়।`
+            : `Could not verify "${appName}" in web preview — installed app detection runs via Android PackageManager in the APK.`,
+          data: pkg ? { packageName: pkg, intentUrl: buildAndroidIntentUrl(pkg) } : undefined,
+        };
+      }
+
+      // 3. List Installed Apps
+      if (req.actionType === 'list_installed_apps') {
+        const apps = listInstalledAppsViaNativeBridge();
+        if (apps) {
+          const sample = apps
+            .slice(0, 12)
+            .map((a) => a.label)
+            .join(', ');
+          return {
+            actionId: req.actionId,
+            actionType: 'list_installed_apps',
+            success: true,
+            verified: true,
+            status: 'listed',
+            message:
+              lang === 'bn-BD'
+                ? `আপনার ফোনে ${apps.length}টি অ্যাপ পাওয়া গেছে। কিছু অ্যাপ: ${sample}${apps.length > 12 ? '...' : ''}।`
+                : `Found ${apps.length} installed launchable apps on your device, including: ${sample}${apps.length > 12 ? '...' : ''}.`,
+            data: { count: apps.length, apps: apps.slice(0, 30) },
+          };
+        }
+        return {
+          actionId: req.actionId,
+          actionType: 'list_installed_apps',
+          success: false,
+          verified: true,
+          status: 'native_android_required',
+          message:
+            lang === 'bn-BD'
+              ? 'ইনস্টলড অ্যাপ তালিকা Android PackageManager থেকে শুধুমাত্র Android APK-তে পাওয়া যায়।'
+              : 'Installed app discovery uses Android PackageManager inside the native Android APK.',
+        };
+      }
+
+      // 4. Read Visible Screen (with multimodal Gemini screen analysis when available)
+      if (req.actionType === 'read_visible_screen') {
+        const snap = captureNativeScreenSnapshot();
+        const visibleText =
+          snap.visibleText ||
+          (typeof document !== 'undefined' ? document.body?.innerText?.slice(0, 1800) || '' : '');
+        const question = String(req.arguments.question || '').trim();
+        try {
+          const res = await fetch(`${getApiBaseUrl()}/api/screen/analyze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              imageBase64: snap.imageBase64,
+              visibleText,
+              question,
+              lang,
+              affectionName: selectedAffectionNameRef.current,
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data.explanation) {
+            return {
+              actionId: req.actionId,
+              actionType: 'read_visible_screen',
+              success: true,
+              verified: true,
+              status: 'screen_read',
+              message: data.explanation,
+            };
+          }
+          return {
+            actionId: req.actionId,
+            actionType: 'read_visible_screen',
+            success: false,
+            verified: true,
+            status: 'failed',
+            message: data.error || 'Could not analyze the current screen.',
+          };
+        } catch {
+          return {
+            actionId: req.actionId,
+            actionType: 'read_visible_screen',
+            success: false,
+            verified: false,
+            status: 'failed',
+            message: 'Network error while analyzing screen text.',
+          };
+        }
+      }
+
+      // 5. All other native Android tools — delegate first to typed native bridge
+      if (bridge?.executeTypedActionJson) {
+        const nativeRes = executeTypedActionViaNativeBridge(
+          req.actionType,
+          req.arguments,
+          req.actionId
+        );
+        if (nativeRes) {
+          return nativeRes;
+        }
+      }
+
+      // 6. Specific Web/PWA fallbacks for remaining allowlisted tools
+      switch (req.actionType) {
+        case 'flashlight_control': {
+          const enable = Boolean(req.arguments.enable);
+          toggleFlashlight(enable);
+          return {
+            actionId: req.actionId,
+            actionType: 'flashlight_control',
+            success: true,
+            verified: true,
+            status: enable ? 'torch_on' : 'torch_off',
+            message:
+              lang === 'bn-BD'
+                ? enable
+                  ? 'টর্চ লাইট জ্বালানো হয়েছে।'
+                  : 'টর্চ লাইট বন্ধ করা হয়েছে।'
+                : enable
+                ? 'Flashlight turned on.'
+                : 'Flashlight turned off.',
+          };
+        }
+        case 'read_notifications': {
+          const list = getRecentNativeNotifications();
+          const waOnly = Boolean(req.arguments.whatsapp_only);
+          const filtered = waOnly ? list.filter((n) => n.isWhatsApp) : list;
+          return {
+            actionId: req.actionId,
+            actionType: 'read_notifications',
+            success: filtered.length > 0,
+            verified: true,
+            status: filtered.length > 0 ? 'read' : 'permission_missing',
+            requiredPermissions: ['NOTIFICATION_LISTENER'],
+            message:
+              filtered.length === 0
+                ? lang === 'bn-BD'
+                  ? 'কোনো নতুন নোটিফিকেশন পাওয়া যায়নি বা Android Notification Access চালু করা নেই।'
+                  : 'No recent notifications available or Android Notification Access is not enabled.'
+                : filtered
+                    .slice(0, 4)
+                    .map((n) => `${n.appName} (${n.title}): ${n.text}`)
+                    .join(' | '),
+          };
+        }
+        case 'scroll_screen':
+        case 'go_home':
+        case 'go_back':
+        case 'tap_visible_element':
+        case 'enter_text_in_visible_field': {
+          const cmd =
+            req.actionType === 'scroll_screen'
+              ? req.arguments.direction === 'up'
+                ? 'scroll_up'
+                : 'scroll_down'
+              : req.actionType === 'go_home'
+              ? 'home'
+              : req.actionType === 'go_back'
+              ? 'back'
+              : req.actionType === 'tap_visible_element'
+              ? `tap:${req.arguments.element_text}`
+              : `enter:${req.arguments.field_hint || ''}:${req.arguments.text}`;
+          const detailed = performNativeAccessibilityDetailed(cmd);
+          if (detailed) return detailed;
+          return {
+            actionId: req.actionId,
+            actionType: req.actionType,
+            success: false,
+            verified: true,
+            status: 'permission_missing',
+            requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+            message:
+              lang === 'bn-BD'
+                ? 'স্ক্রিন কন্ট্রোল ও স্ক্রল করার জন্য Android APK-তে Zoni Accessibility Service চালু করতে হবে।'
+                : 'Enable Zoni Accessibility Service in the Android APK to perform screen touch, scroll, or navigation actions.',
+          };
+        }
+        case 'open_system_settings': {
+          const target = String(req.arguments.target || 'main');
+          if (target === 'default_assistant') {
+            requestDefaultDigitalAssistantViaNativeBridge();
+          }
+          return {
+            actionId: req.actionId,
+            actionType: 'open_system_settings',
+            success: false,
+            verified: true,
+            status: 'native_android_required',
+            message:
+              lang === 'bn-BD'
+                ? `ফোনের "${target}" সেটিংস সরাসরি খুলতে Android APK-তে Zoni AI ব্যবহার করুন।`
+                : `Opening Android "${target}" settings directly works inside the installed Android APK.`,
+          };
+        }
+        case 'request_permission': {
+          setIsPermissionsModalOpen(true);
+          return {
+            actionId: req.actionId,
+            actionType: 'request_permission',
+            success: true,
+            verified: true,
+            status: 'opened_setup',
+            message:
+              lang === 'bn-BD'
+                ? 'পারমিশন সেটআপ উইজার্ড খুলে দেওয়া হয়েছে।'
+                : 'Opened the Zoni AI Permissions Setup wizard.',
+          };
+        }
+        case 'camera_open': {
+          const ok = openNativeCamera();
+          return {
+            actionId: req.actionId,
+            actionType: 'camera_open',
+            success: ok,
+            verified: true,
+            status: ok ? 'camera_opened' : 'native_android_required',
+            message: ok
+              ? lang === 'bn-BD'
+                ? 'ক্যামেরা চালু করা হয়েছে।'
+                : 'Opened your Android camera.'
+              : 'Camera launch requires the native Android APK.',
+          };
+        }
+        case 'volume_control': {
+          const volRes = adjustNativeVolume(String(req.arguments.action || 'status') as any);
+          return {
+            actionId: req.actionId,
+            actionType: 'volume_control',
+            success: volRes.success,
+            verified: true,
+            status: volRes.success ? 'volume_updated' : 'native_android_required',
+            message: volRes.message,
+          };
+        }
+        case 'battery_status': {
+          executeAssistantActionDirectly({ type: 'battery', label: 'Check Battery' });
+          return {
+            actionId: req.actionId,
+            actionType: 'battery_status',
+            success: true,
+            verified: true,
+            status: 'battery_checked',
+            message:
+              lang === 'bn-BD'
+                ? 'ডিভাইসের ব্যাটারি স্ট্যাটাস চেক করা হয়েছে।'
+                : 'Checked device battery status.',
+          };
+        }
+        case 'create_reminder': {
+          const note = String(req.arguments.note || '').trim();
+          sendSystemNotification('Zoni AI Reminder', note);
+          return {
+            actionId: req.actionId,
+            actionType: 'create_reminder',
+            success: true,
+            verified: true,
+            status: 'reminder_created',
+            message:
+              lang === 'bn-BD'
+                ? `রিমাইন্ডার সেট করা হয়েছে: "${note}"`
+                : `Reminder created: "${note}"`,
+          };
+        }
+        case 'search_web': {
+          const q = String(req.arguments.query || '').trim();
+          return {
+            actionId: req.actionId,
+            actionType: 'search_web',
+            success: Boolean(q),
+            verified: true,
+            status: q ? 'executed' : 'missing_argument',
+            message:
+              lang === 'bn-BD'
+                ? `"${q}" ওয়েব সার্চের জন্য প্রস্তুত।`
+                : `Web search ready for "${q}".`,
+            data: { query: q },
+          };
+        }
+        case 'search_youtube': {
+          const q = String(req.arguments.query || '').trim();
+          return {
+            actionId: req.actionId,
+            actionType: 'search_youtube',
+            success: Boolean(q),
+            verified: true,
+            status: q ? 'executed' : 'missing_argument',
+            message:
+              lang === 'bn-BD'
+                ? `ইউটিউবে "${q}" খোঁজার অনুরোধ প্রস্তুত। পূর্ণ অটোমেশন Android APK-তে চলে।`
+                : `YouTube search prepared for "${q}". Full app launch runs inside the Android APK.`,
+            data: { query: q },
+          };
+        }
+        case 'search_installed_app': {
+          const appName = String(req.arguments.app_name || '').trim();
+          const apps = listInstalledAppsViaNativeBridge();
+          if (apps) {
+            const matched = apps.filter(
+              (a) =>
+                a.label.toLowerCase().includes(appName.toLowerCase()) ||
+                a.packageName.toLowerCase().includes(appName.toLowerCase())
+            );
+            return {
+              actionId: req.actionId,
+              actionType: 'search_installed_app',
+              success: matched.length > 0,
+              verified: true,
+              status: matched.length > 0 ? 'found' : 'app_not_found',
+              message:
+                matched.length > 0
+                  ? lang === 'bn-BD'
+                    ? `"${appName}" মিলেছে: ${matched.map((m) => m.label).join(', ')}।`
+                    : `Found installed app(s): ${matched.map((m) => m.label).join(', ')}.`
+                  : lang === 'bn-BD'
+                  ? `আপনার ফোনে "${appName}" অ্যাপটি ইনস্টল করা পাওয়া যায়নি।`
+                  : `Could not find "${appName}" installed on this device.`,
+              data: { matches: matched },
+            };
+          }
+          return {
+            actionId: req.actionId,
+            actionType: 'search_installed_app',
+            success: false,
+            verified: true,
+            status: 'native_android_required',
+            message:
+              lang === 'bn-BD'
+                ? 'ইনস্টলড অ্যাপ যাচাইকরণ Android APK-তে PackageManager দিয়ে কাজ করে।'
+                : 'Installed app lookup requires the native Android APK.',
+          };
+        }
+        case 'cancel_current_task': {
+          const currentDraft = pendingActionDraftRef.current;
+          if (currentDraft) {
+            if (currentDraft.isNativePending) {
+              cancelPendingActionViaNativeBridge(currentDraft.pendingActionId);
+            }
+            setPendingActionDraft(null);
+          }
+          stopAllSpeechPlayback();
+          setAssistantState('idle');
+          return {
+            actionId: req.actionId,
+            actionType: 'cancel_current_task',
+            success: true,
+            verified: true,
+            status: 'cancelled',
+            message:
+              lang === 'bn-BD'
+                ? 'বর্তমান কাজ ও অপেক্ষমাণ ড্রাফট বাতিল করা হয়েছে।'
+                : 'Cancelled the current task and any pending draft.',
+          };
+        }
+        default:
+          return {
+            actionId: req.actionId,
+            actionType: req.actionType,
+            success: false,
+            verified: true,
+            status: 'native_android_required',
+            message:
+              lang === 'bn-BD'
+                ? `এই ফিচারটি (${req.actionType}) সম্পূর্ণভাবে Android APK-তে কাজ করে।`
+                : `This action (${req.actionType}) requires the installed Android APK.`,
+          };
+      }
+    },
+    []
+  );
+
+  // Explicit User Approval Handler for Pending WhatsApp / SMS / Call Drafts
+  const handleApprovePendingAction = useCallback(
+    (options: {
+      pendingActionId: string;
+      recipientName: string;
+      phoneNumber: string;
+      messageText: string;
+      useNotificationReply: boolean;
+    }) => {
+      const currentDraft = pendingActionDraftRef.current;
+      if (!currentDraft) return;
+      const lang = activeLanguageRef.current;
+      const name = selectedAffectionNameRef.current;
+
+      setPendingActionDraft(null);
+      let report: ToolExecutionReport;
+
+      if (currentDraft.isNativePending) {
+        const nativeReport = confirmPendingActionViaNativeBridge(
+          options.pendingActionId,
+          options.messageText,
+          options.useNotificationReply
+        );
+        report = nativeReport || {
+          actionId: options.pendingActionId,
+          actionType: currentDraft.actionType,
+          success: false,
+          verified: false,
+          status: 'failed',
+          message: 'Could not confirm pending native action.',
+        };
+      } else {
+        // Web preview approval: open honest draft link (never claim auto-sent!)
+        const cleanPhone = options.phoneNumber.replace(/[^\d+]/g, '');
+        if (currentDraft.actionType === 'prepare_whatsapp_message') {
+          if (cleanPhone) {
+            executeAssistantActionDirectly({
+              type: 'whatsapp',
+              target: cleanPhone,
+              payload: options.messageText,
+              label: `WhatsApp ${options.recipientName}`,
+            });
+          }
+          report = {
+            actionId: options.pendingActionId,
+            actionType: 'prepare_whatsapp_message',
+            success: true,
+            verified: true,
+            status: 'opened_whatsapp_draft_ready_to_send',
+            message: 'WhatsApp draft opened after user approval.',
+            data: {
+              contactName: options.recipientName,
+              phoneNumber: cleanPhone,
+              message: options.messageText,
+            },
+          };
+        } else if (currentDraft.actionType === 'prepare_sms') {
+          if (cleanPhone) {
+            executeAssistantActionDirectly({
+              type: 'sms',
+              target: cleanPhone,
+              payload: options.messageText,
+              label: `SMS ${options.recipientName}`,
+            });
+          }
+          report = {
+            actionId: options.pendingActionId,
+            actionType: 'prepare_sms',
+            success: true,
+            verified: true,
+            status: 'opened_sms_composer',
+            message:
+              lang === 'bn-BD'
+                ? `${name}, ${options.recipientName}-এর জন্য SMS কম্পোজার খোলা হয়েছে। পাঠাতে অনুগ্রহ করে SMS অ্যাপে Send চাপুন।`
+                : `Opened SMS composer for ${options.recipientName}. Please review and tap Send.`,
+          };
+        } else {
+          if (cleanPhone) {
+            executeAssistantActionDirectly({
+              type: 'call',
+              target: cleanPhone,
+              label: `Call ${options.recipientName}`,
+            });
+          }
+          report = {
+            actionId: options.pendingActionId,
+            actionType: 'call_contact',
+            success: Boolean(cleanPhone),
+            verified: true,
+            status: cleanPhone ? 'dialer_opened' : 'missing_phone',
+            message: cleanPhone
+              ? lang === 'bn-BD'
+                ? `${name}, আপনার অনুমোদনের পর ${options.recipientName} (${cleanPhone})-এ কল শুরু করা হয়েছে।`
+                : `Call initiated for ${options.recipientName} (${cleanPhone}) after your approval.`
+              : lang === 'bn-BD'
+              ? `${name}, কল করার জন্য সঠিক ফোন নম্বর দিন বা Android APK-তে Contacts পারমিশন চালু করুন।`
+              : `Please enter a phone number or grant Android Contacts permission in the APK to call ${options.recipientName}.`,
+          };
+        }
+      }
+
+      const honestReply = formatLocalizedActionOutcome(report, lang, name);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `confirm-res-${Date.now()}`,
+          role: 'assistant',
+          text: honestReply,
+          timestamp: new Date(),
+          lang,
+        },
+      ]);
+      setLatestTranscript(honestReply);
+      setAssistantState('idle');
+    },
+    []
+  );
+
+  // Explicit User Cancellation Handler for Pending Drafts
+  const handleCancelPendingAction = useCallback((pendingActionId: string) => {
+    const currentDraft = pendingActionDraftRef.current;
+    if (currentDraft?.isNativePending) {
+      cancelPendingActionViaNativeBridge(pendingActionId);
+    }
+    setPendingActionDraft(null);
+    const lang = activeLanguageRef.current;
+    const name = selectedAffectionNameRef.current;
+    const cancelReply = formatLocalizedActionOutcome(
+      {
+        actionId: pendingActionId,
+        actionType: currentDraft?.actionType || 'pending_action',
+        success: true,
+        verified: true,
+        status: 'cancelled',
+        message: 'Cancelled by user.',
+      },
+      lang,
+      name
+    );
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `cancel-res-${Date.now()}`,
+        role: 'assistant',
+        text: cancelReply,
+        timestamp: new Date(),
+        lang,
+      },
+    ]);
+    setLatestTranscript(cancelReply);
+    setAssistantState('idle');
+  }, []);
+
+  // Reliable HTTP /api/chat fallback (with Real Gemini Function Calling & /api/chat/tool-result round-trip)
   const sendViaHttpChatFallback = useCallback(
     async (
       cleanText: string,
@@ -517,16 +1243,85 @@ export default function App() {
           return;
         }
 
-        const rawReply = typeof data.reply === 'string' ? data.reply.trim() : '';
-        if (!rawReply) {
-          throw new Error('Empty response returned by /api/chat.');
-        }
+        // Execute any validated Gemini Function Calls returned by /api/chat
+        const serverToolCalls: ValidatedActionRequest[] = Array.isArray(data.toolCalls)
+          ? data.toolCalls
+          : [];
+        let finalReply = typeof data.reply === 'string' ? data.reply.trim() : '';
 
-        const { cleanText: replyClean, action } = extractActionTagFromText(rawReply);
-        if (action) {
-          executeAssistantActionDirectly(action);
+        if (serverToolCalls.length > 0) {
+          const toolResults: ToolExecutionReport[] = [];
+          for (const call of serverToolCalls) {
+            const result = await executeValidatedAssistantTool(
+              call.actionType,
+              call.arguments,
+              call.actionId
+            );
+            toolResults.push(result);
+          }
+
+          const hasPendingConfirmation = toolResults.some((r) => r.awaitingConfirmation);
+          if (hasPendingConfirmation) {
+            finalReply = toolResults
+              .map((r) =>
+                formatLocalizedActionOutcome(
+                  r,
+                  activeLanguageRef.current,
+                  selectedAffectionNameRef.current
+                )
+              )
+              .join(' ');
+          } else {
+            // Send real verified execution results back to Gemini for an accurate localized reply
+            try {
+              const feedbackRes = await fetch(`${base}/api/chat/tool-result`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  originalMessage: cleanText,
+                  toolResults,
+                  mode: activeModeRef.current,
+                  nickname: selectedAffectionNameRef.current,
+                  selectedAffectionName: selectedAffectionNameRef.current,
+                  lang: activeLanguageRef.current,
+                }),
+              });
+              const feedbackData = await feedbackRes.json().catch(() => ({}));
+              if (feedbackRes.ok && typeof feedbackData.reply === 'string' && feedbackData.reply.trim()) {
+                finalReply = feedbackData.reply.trim();
+              } else {
+                finalReply = toolResults
+                  .map((r) =>
+                    formatLocalizedActionOutcome(
+                      r,
+                      activeLanguageRef.current,
+                      selectedAffectionNameRef.current
+                    )
+                  )
+                  .join(' ');
+              }
+            } catch {
+              finalReply = toolResults
+                .map((r) =>
+                  formatLocalizedActionOutcome(
+                    r,
+                    activeLanguageRef.current,
+                    selectedAffectionNameRef.current
+                  )
+                )
+                .join(' ');
+            }
+          }
+        } else {
+          if (!finalReply) {
+            throw new Error('Empty response returned by /api/chat.');
+          }
+          const { cleanText: replyClean, action } = extractActionTagFromText(finalReply);
+          if (action) {
+            executeAssistantActionDirectly(action);
+          }
+          finalReply = replyClean || finalReply;
         }
-        const finalReply = replyClean || rawReply;
 
         if (pendingChatFallbackRef.current?.clientMsgId === clientMsgId) {
           pendingChatFallbackRef.current.answered = true;
@@ -577,7 +1372,7 @@ export default function App() {
         });
       }
     },
-    [clearTurnTimeout]
+    [clearTurnTimeout, executeValidatedAssistantTool]
   );
 
   // Connect or reuse the single shared Gemini Live WebSocket session, resolving ONLY after server 'connected' handshake
@@ -1601,8 +2396,7 @@ export default function App() {
         return;
       }
 
-      if (taskPlan.steps.length === 1) {
-        const step = taskPlan.steps[0];
+      if (taskPlan.steps.length > 0) {
         const appendDirectTurn = (replyText: string) => {
           setMessages((prev) => [
             ...prev,
@@ -1613,120 +2407,194 @@ export default function App() {
           setAssistantState('idle');
         };
 
-        if (step.tool === 'sim_call') {
-          const target = String(step.args.contactQuery || step.args.phoneNumber || step.args.target || '').trim();
-          const nativeRes = callContactViaNativeBridge(target);
-          if (nativeRes) {
-            appendDirectTurn(nativeRes.message);
+        const mapTaskStepToTool = (
+          step: TaskStep
+        ): { name: string; args: Record<string, unknown> } | null => {
+          switch (step.tool) {
+            case 'sim_call':
+              return {
+                name: 'call_contact',
+                args: {
+                  recipient: String(step.args.contactQuery || step.args.phoneNumber || step.args.target || ''),
+                },
+              };
+            case 'whatsapp_prepare':
+              return {
+                name: 'prepare_whatsapp_message',
+                args: {
+                  recipient: String(step.args.contactQuery || step.args.phoneNumber || ''),
+                  message: String(step.args.message || ''),
+                },
+              };
+            case 'sms_compose':
+              return {
+                name: 'prepare_sms',
+                args: {
+                  recipient: String(step.args.phoneNumber || ''),
+                  message: String(step.args.message || ''),
+                },
+              };
+            case 'open_app':
+              return {
+                name: 'open_app',
+                args: { app_name: String(step.args.appQuery || '') },
+              };
+            case 'app_search_workflow':
+              return {
+                name: 'open_app',
+                args: {
+                  app_name: String(step.args.appQuery || 'YouTube'),
+                  search_query: String(step.args.searchQuery || ''),
+                },
+              };
+            case 'list_installed_apps':
+              return { name: 'list_installed_apps', args: {} };
+            case 'open_settings':
+              return {
+                name: 'open_system_settings',
+                args: { target: String(step.args.target || 'main') },
+              };
+            case 'screen_analyze':
+              return {
+                name: 'read_visible_screen',
+                args: { question: String(step.args.question || cleanText) },
+              };
+            case 'notification_read':
+              return {
+                name: 'read_notifications',
+                args: { whatsapp_only: Boolean(step.args.whatsappOnly) },
+              };
+            case 'accessibility_action': {
+              const cmd = String(step.args.command || '');
+              if (cmd === 'scroll_down') return { name: 'scroll_screen', args: { direction: 'down' } };
+              if (cmd === 'scroll_up') return { name: 'scroll_screen', args: { direction: 'up' } };
+              if (cmd === 'back') return { name: 'go_back', args: {} };
+              if (cmd === 'home') return { name: 'go_home', args: {} };
+              if (cmd.startsWith('tap:')) {
+                return { name: 'tap_visible_element', args: { element_text: cmd.slice(4).trim() } };
+              }
+              return null;
+            }
+            case 'camera_open':
+              return { name: 'camera_open', args: {} };
+            case 'volume_control':
+              return {
+                name: 'volume_control',
+                args: { action: String(step.args.action || 'status') },
+              };
+            case 'flashlight':
+              return { name: 'flashlight_control', args: { enable: Boolean(step.args.enable) } };
+            case 'battery_status':
+              return { name: 'battery_status', args: {} };
+            case 'contact_lookup':
+              return { name: 'contact_search', args: { query: String(step.args.query || '') } };
+            case 'reminder':
+              return { name: 'create_reminder', args: { note: String(step.args.note || '') } };
+            case 'web_search':
+              return { name: 'search_web', args: { query: String(step.args.query || '') } };
+            case 'cancel_current_task':
+              return { name: 'cancel_current_task', args: {} };
+            default:
+              return null;
+          }
+        };
+
+        // Handle explicit pending-draft review or approval commands first
+        const singleTool = taskPlan.steps.length === 1 ? taskPlan.steps[0].tool : null;
+        if (singleTool === 'approve_pending_action') {
+          const currentDraft = pendingActionDraftRef.current;
+          if (!currentDraft) {
+            appendDirectTurn(
+              activeLanguage === 'bn-BD'
+                ? `${selectedAffectionName}, এখন কোনো অপেক্ষমাণ মেসেজ বা কল ড্রাফট নেই।`
+                : `There is no pending message or call draft to approve right now, ${selectedAffectionName}.`
+            );
             return;
           }
-        } else if (step.tool === 'whatsapp_prepare') {
-          const contact = String(step.args.contactQuery || step.args.phoneNumber || '').trim();
-          const msgBody = String(step.args.message || '').trim();
-          const nativeRes = prepareWhatsAppContactViaNativeBridge(contact, msgBody);
-          if (nativeRes) {
-            appendDirectTurn(nativeRes.message);
-            return;
-          }
-        } else if (step.tool === 'open_app') {
-          const appQuery = String(step.args.appQuery || '').trim();
-          const nativeRes = launchAppDetailedViaNativeBridge(appQuery);
-          if (nativeRes) {
-            appendDirectTurn(nativeRes.message);
-            return;
-          }
-        } else if (step.tool === 'screen_analyze') {
           setMessages((prev) => [
             ...prev,
             { id: clientMsgId, role: 'user', text: cleanText, timestamp: new Date(), lang: activeLanguage },
           ]);
-          setAssistantState('thinking');
-          try {
-            const snap = captureNativeScreenSnapshot();
-            const visibleText =
-              snap.visibleText ||
-              (typeof document !== 'undefined' ? document.body?.innerText?.slice(0, 2000) || '' : '');
-            const res = await fetch(`${getApiBaseUrl()}/api/screen/analyze`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                imageBase64: snap.imageBase64,
-                visibleText,
-                question: cleanText,
-                lang: activeLanguage,
-                affectionName: selectedAffectionName,
-              }),
-            });
-            const data = await res.json();
-            const replyText = res.ok
-              ? data.explanation
-              : data.error || 'Could not analyze the current screen.';
-            setMessages((prev) => [
-              ...prev,
-              { id: `${clientMsgId}-screen`, role: 'assistant', text: replyText, timestamp: new Date(), lang: activeLanguage },
-            ]);
-            setLatestTranscript(replyText);
-          } catch {
-            setLatestTranscript('Network error while analyzing the screen.');
-          } finally {
-            setAssistantState('idle');
+          handleApprovePendingAction({
+            pendingActionId: currentDraft.pendingActionId,
+            recipientName: currentDraft.recipientName,
+            phoneNumber: currentDraft.phoneNumber,
+            messageText: currentDraft.messageText,
+            useNotificationReply: Boolean(
+              currentDraft.canReplyViaNotification && currentDraft.notificationKey
+            ),
+          });
+          return;
+        }
+
+        if (singleTool === 'review_pending_draft') {
+          const currentDraft = pendingActionDraftRef.current;
+          if (!currentDraft) {
+            appendDirectTurn(
+              activeLanguage === 'bn-BD'
+                ? `${selectedAffectionName}, এখন কোনো মেসেজ ড্রাফট তৈরি করা নেই। বলুন কাকে কী মেসেজ লিখতে চান।`
+                : `No draft is queued yet, ${selectedAffectionName}. Tell me who you want to message and what to write.`
+            );
+            return;
           }
-          return;
-        } else if (step.tool === 'notification_read') {
-          const list = getRecentNativeNotifications();
-          const filtered = step.args.whatsappOnly ? list.filter((n) => n.isWhatsApp) : list;
-          const summaryText =
-            filtered.length === 0
-              ? activeLanguage === 'bn-BD'
-                ? `${selectedAffectionName}, এখন কোনো নতুন নোটিফিকেশন নেই অথবা অ্যান্ড্রয়েড Notification Access চালু করা নেই।`
-                : `No recent notifications found, ${selectedAffectionName}. Make sure Notification Access is enabled in Android settings.`
-              : filtered
-                  .slice(0, 4)
-                  .map((n) => `${n.appName} (${n.title}): ${n.text}`)
-                  .join(' | ');
-          appendDirectTurn(summaryText);
-          return;
-        } else if (step.tool === 'accessibility_action') {
-          const cmd = String(step.args.command || '');
-          const ok = performNativeAccessibilityCommand(cmd);
           appendDirectTurn(
-            ok
-              ? `Accessibility action "${cmd}" completed.`
-              : `Please enable Zoni Accessibility Service in Android settings to perform "${cmd}".`
+            activeLanguage === 'bn-BD'
+              ? `${selectedAffectionName}, আপনার ড্রাফট — প্রাপক: ${currentDraft.recipientName}${currentDraft.phoneNumber ? ` (${currentDraft.phoneNumber})` : ''}, মেসেজ: "${currentDraft.messageText || '(খালি)'}"। নিচের কার্ড থেকে এডিট, বাতিল বা অনুমোদন করতে পারবেন।`
+              : `Pending draft for ${currentDraft.recipientName}${currentDraft.phoneNumber ? ` (${currentDraft.phoneNumber})` : ''}: "${currentDraft.messageText || '(empty)'}". Review, edit, cancel, or approve in the card below.`
           );
           return;
-        } else if (step.tool === 'camera_open') {
-          const ok = openNativeCamera();
-          appendDirectTurn(
-            ok
-              ? activeLanguage === 'bn-BD'
-                ? `${selectedAffectionName}, ক্যামেরা চালু করা হয়েছে।`
-                : `Opened your Android camera, ${selectedAffectionName}.`
-              : 'Camera launch requires the native Android APK.'
-          );
-          return;
-        } else if (step.tool === 'volume_control') {
-          const volRes = adjustNativeVolume(String(step.args.action || 'status') as any);
-          appendDirectTurn(volRes.message);
+        }
+
+        setMessages((prev) => [
+          ...prev,
+          { id: clientMsgId, role: 'user', text: cleanText, timestamp: new Date(), lang: activeLanguage },
+        ]);
+        setAssistantState('thinking');
+
+        const outcomes: string[] = [];
+        for (const step of taskPlan.steps) {
+          const mapped = mapTaskStepToTool(step);
+          if (mapped) {
+            const report = await executeValidatedAssistantTool(mapped.name, mapped.args);
+            outcomes.push(
+              formatLocalizedActionOutcome(report, activeLanguage, selectedAffectionName)
+            );
+          } else if (step.tool === 'vibrate') {
+            executeAssistantActionDirectly({ type: 'vibrate', label: 'Vibrate' });
+            outcomes.push(activeLanguage === 'bn-BD' ? 'ভাইব্রেশন চালানো হয়েছে।' : 'Vibration triggered.');
+          } else if (step.tool === 'web_search') {
+            const q = String(step.args.query || '').trim();
+            outcomes.push(
+              activeLanguage === 'bn-BD'
+                ? `"${q}" সার্চ করার জন্য প্রস্তুত।`
+                : `Ready to search for "${q}".`
+            );
+          }
+        }
+
+        if (outcomes.length > 0) {
+          const combined = outcomes.join(' ');
+          setMessages((prev) => [
+            ...prev,
+            { id: `${clientMsgId}-reply`, role: 'assistant', text: combined, timestamp: new Date(), lang: activeLanguage },
+          ]);
+          setLatestTranscript(combined);
+          setAssistantState('idle');
           return;
         }
       }
 
-      // Direct execution fallback for web/PWA hardware intents (flashlight, numeric dial, wa.me, battery, settings)
+      // Direct hardware flashlight deduplication fallback
       const detectedIntent = detectAssistantIntent(cleanText);
-      if (detectedIntent) {
-        if (detectedIntent.type === 'flashlight') {
-          const now = Date.now();
-          const statePayload = detectedIntent.payload || 'on';
-          if (
-            !lastFlashlightActionRef.current ||
-            lastFlashlightActionRef.current.payload !== statePayload ||
-            now - lastFlashlightActionRef.current.time >= 1500
-          ) {
-            lastFlashlightActionRef.current = { payload: statePayload, time: now };
-            executeAssistantActionDirectly(detectedIntent);
-          }
-        } else {
+      if (detectedIntent && detectedIntent.type === 'flashlight') {
+        const now = Date.now();
+        const statePayload = detectedIntent.payload || 'on';
+        if (
+          !lastFlashlightActionRef.current ||
+          lastFlashlightActionRef.current.payload !== statePayload ||
+          now - lastFlashlightActionRef.current.time >= 1500
+        ) {
+          lastFlashlightActionRef.current = { payload: statePayload, time: now };
           executeAssistantActionDirectly(detectedIntent);
         }
       }
@@ -1857,6 +2725,8 @@ export default function App() {
       sendOverSharedWs,
       sendViaHttpChatFallback,
       clearTurnTimeout,
+      executeValidatedAssistantTool,
+      handleApprovePendingAction,
     ]
   );
 
@@ -1899,10 +2769,11 @@ export default function App() {
         }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data?.audioBase64) {
+      const audioBase64 = data?.audio || data?.audioBase64;
+      if (!res.ok || !audioBase64) {
         throw new Error(data?.error || `Audio replay unavailable (HTTP ${res.status})`);
       }
-      liveAudioPlayerRef.current?.playPcmChunk(data.audioBase64, 24000);
+      liveAudioPlayerRef.current?.playPcmChunk(audioBase64, 24000);
       setTimeout(() => {
         setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
       }, 1200);
@@ -2017,6 +2888,14 @@ export default function App() {
             onReactorClick={handleReactorClick}
           />
         </div>
+
+        {/* Interactive Review / Edit / Cancel / Approve Card for WhatsApp, SMS & Calls */}
+        <ActionConfirmationCard
+          draft={pendingActionDraft}
+          activeLanguage={activeLanguage}
+          onApprove={handleApprovePendingAction}
+          onCancel={handleCancelPendingAction}
+        />
 
         {/* Authoritative Connection / Backend Configuration Error Banner */}
         {connectionError && (

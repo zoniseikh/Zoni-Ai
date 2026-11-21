@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">Zoni AI</string>
     <string name="accessibility_service_label">Zoni AI Assistant Screen Actions</string>
-    <string name="accessibility_service_description">Enables Zoni AI to assist with explicitly requested on-screen UI actions. Data is never collected, stored, or sent to external servers.</string>
+    <string name="accessibility_service_description">Allows Zoni AI to perform only explicitly user-requested actions such as tapping visible buttons, scrolling, going Back or Home, entering text into non-password fields, and reading non-sensitive visible labels. Password fields, OTPs, and banking or payment screens are strictly blocked, and background screen scraping is never performed.</string>
     <string name="foreground_service_channel_name">Zoni AI Assistant Service</string>
     <string name="foreground_service_channel_desc">Active status notification while Zoni AI is available.</string>
 </resources>

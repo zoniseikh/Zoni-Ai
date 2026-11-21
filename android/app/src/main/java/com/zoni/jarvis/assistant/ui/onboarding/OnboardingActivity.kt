@@ -68,6 +68,12 @@ class OnboardingActivity : ComponentActivity() {
         permissionsState = app.hardwareController.getPermissionsSnapshot()
     }
 
+    private val requestDefaultAssistantLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        permissionsState = app.hardwareController.getPermissionsSnapshot()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         app = application as ZoniApplication
@@ -104,7 +110,15 @@ class OnboardingActivity : ComponentActivity() {
                         requestPermissionsLauncher.launch(buildAllRuntimePermissions())
                     },
                     onOpenSystemScreen = { target ->
-                        app.hardwareController.openSystemSettings(target)
+                        if (target == "default_assistant") {
+                            try {
+                                requestDefaultAssistantLauncher.launch(app.hardwareController.createDefaultAssistantRoleIntent())
+                            } catch (_: Exception) {
+                                app.hardwareController.openSystemSettings(target)
+                            }
+                        } else {
+                            app.hardwareController.openSystemSettings(target)
+                        }
                     },
                     onFinish = {
                         lifecycleScope.launch {
@@ -344,8 +358,8 @@ private fun OnboardingScreen(
 
                     PermissionRow(
                         "Default assistant",
-                        "Long-press power button or corner swipe to summon Zoni AI.",
-                        false
+                        "Long-press power button or corner swipe to summon Zoni AI (requires Android system selection).",
+                        permissions.defaultAssistant
                     ) { onOpenSystemScreen("default_assistant") }
 
                     Row(

@@ -10,6 +10,8 @@ import {
 import {
   getNativeAndroidBridge,
   getNativePermissionsSnapshot,
+  isDefaultDigitalAssistantViaNativeBridge,
+  requestDefaultDigitalAssistantViaNativeBridge,
 } from '../utils/androidBridge';
 import { playProceduralSfx } from '../utils/audio';
 import {
@@ -178,6 +180,14 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
       setNotificationAccess(snap.notificationListenerEnabled);
       setAccessibilityService(snap.accessibilityEnabled);
       setScreenCaptureEnabled(Boolean(snap.screenCaptureActive));
+      const nativeDefaultAssistant =
+        typeof snap.defaultAssistant === 'boolean'
+          ? snap.defaultAssistant
+          : isDefaultDigitalAssistantViaNativeBridge();
+      if (typeof nativeDefaultAssistant === 'boolean') {
+        setDefaultAssistant(nativeDefaultAssistant);
+        localStorage.setItem('zoni_default_assistant_enabled', String(nativeDefaultAssistant));
+      }
     };
     syncNative();
     const handleScreenEvent = (e: Event) => {
@@ -185,12 +195,24 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
       setScreenCaptureEnabled(active);
       localStorage.setItem('zoni_screen_capture_enabled', String(active));
     };
+    const handleDefaultAssistantEvent = (e: Event) => {
+      const active = Boolean((e as CustomEvent)?.detail?.active);
+      setDefaultAssistant(active);
+      localStorage.setItem('zoni_default_assistant_enabled', String(active));
+      showToast(
+        active
+          ? 'Confirmed: Zoni AI is now your Android Default Digital Assistant!'
+          : 'Zoni AI is not currently set as Default Digital Assistant.'
+      );
+    };
     window.addEventListener('zoni:native-permissions-updated', syncNative);
     window.addEventListener('zoni:screen-capture-changed', handleScreenEvent);
+    window.addEventListener('zoni:default-assistant-changed', handleDefaultAssistantEvent);
     window.addEventListener('focus', syncNative);
     return () => {
       window.removeEventListener('zoni:native-permissions-updated', syncNative);
       window.removeEventListener('zoni:screen-capture-changed', handleScreenEvent);
+      window.removeEventListener('zoni:default-assistant-changed', handleDefaultAssistantEvent);
       window.removeEventListener('focus', syncNative);
     };
   }, [isOpen]);
@@ -536,15 +558,18 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
   const handleToggleDefaultAssistant = () => {
     if (soundFxEnabled) playProceduralSfx('click');
     const bridge = getNativeAndroidBridge();
-    if (bridge?.openSystemSettings) {
-      bridge.openSystemSettings('default_assistant');
-      showToast('Opening Android Default Digital Assistant settings.');
+    if (bridge) {
+      const alreadyDefault = isDefaultDigitalAssistantViaNativeBridge();
+      if (alreadyDefault) {
+        setDefaultAssistant(true);
+        showToast('Zoni AI is already confirmed as your Android Default Digital Assistant.');
+        return;
+      }
+      requestDefaultDigitalAssistantViaNativeBridge();
+      showToast('Opening Android Default Digital Assistant selector (RoleManager / Voice Input settings).');
       return;
     }
-    const nextVal = !defaultAssistant;
-    setDefaultAssistant(nextVal);
-    localStorage.setItem('zoni_default_assistant_enabled', String(nextVal));
-    showToast(`Default assistant ${nextVal ? 'assigned to Zoni Ai' : 'disabled'}`);
+    showToast('Default Digital Assistant role is available inside the installed Android APK.');
   };
 
   const handleToggleScreenCapture = () => {
@@ -1301,7 +1326,7 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                     </div>
                     <div className="min-w-0">
                       <span className="font-hud font-bold text-sm text-cyan-100 block">Notification access</span>
-                      <p className="text-xs text-slate-400 mt-0.5">To read WhatsApp messages and know who is calling. Turn on &quot;Zoni Ai&quot; in the list.</p>
+                      <p className="text-xs text-slate-400 mt-0.5">Reads non-sensitive incoming notifications locally &amp; enables user-approved replies. OTPs and banking alerts are automatically blocked/redacted.</p>
                     </div>
                   </div>
                   <div className="shrink-0">
@@ -1334,7 +1359,7 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                     </div>
                     <div className="min-w-0">
                       <span className="font-hud font-bold text-sm text-cyan-100 block">Accessibility service</span>
-                      <p className="text-xs text-slate-400 mt-0.5">So she can open apps, tap, and read the screen for you. Turn on &quot;Zoni Ai&quot; in the list.</p>
+                      <p className="text-xs text-slate-400 mt-0.5">Runs ONLY when you ask to tap, scroll, search apps, or read screen labels. Never reads passwords, OTPs, banking, or payment screens.</p>
                     </div>
                   </div>
                   <div className="shrink-0">
@@ -1366,19 +1391,19 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                       <Zap className="w-4 h-4" />
                     </div>
                     <div className="min-w-0">
-                      <span className="font-hud font-bold text-sm text-cyan-100 block">Default assistant</span>
-                      <p className="text-xs text-slate-400 mt-0.5">Long-press the power button or swipe from a corner to call her, even on the lock screen. Pick &quot;Zoni Ai&quot;.</p>
+                      <span className="font-hud font-bold text-sm text-cyan-100 block">Default Digital Assistant</span>
+                      <p className="text-xs text-slate-400 mt-0.5">Launch Zoni via power button long-press or corner swipe (Android ROLE_ASSISTANT / Voice Input settings). Real-time status verified.</p>
                     </div>
                   </div>
                   <div className="shrink-0">
                     {defaultAssistant ? (
                       <span className="inline-flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-hud font-bold bg-emerald-950/80 border border-emerald-500/50 text-emerald-300">
                         <Check className="w-3.5 h-3.5 text-emerald-400" />
-                        ALLOWED
+                        ENABLED
                       </span>
                     ) : (
                       <span className="inline-flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-hud font-bold bg-slate-800 border border-slate-700 text-slate-400">
-                        PENDING
+                        NOT SET
                       </span>
                     )}
                   </div>

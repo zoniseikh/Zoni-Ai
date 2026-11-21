@@ -17,6 +17,37 @@ import {
   isFlashlightOffCommand,
 } from './src/utils/mobileAssistant.ts';
 import { buildStructuredTaskPlan } from './src/utils/taskExecutionEngine.ts';
+import {
+  ASSISTANT_TOOL_SPECS,
+  validateGeminiToolCall,
+  ValidatedActionRequest,
+} from './src/utils/assistantActionRegistry.ts';
+
+const ZONI_ASSISTANT_TOOLS: FunctionDeclaration[] = ASSISTANT_TOOL_SPECS.map((spec) => {
+  const properties: Record<string, any> = {};
+  for (const [paramName, paramSpec] of Object.entries(spec.parameters.properties)) {
+    const schemaType =
+      paramSpec.type === 'BOOLEAN'
+        ? Type.BOOLEAN
+        : paramSpec.type === 'INTEGER'
+        ? Type.INTEGER
+        : Type.STRING;
+    properties[paramName] = {
+      type: schemaType,
+      description: paramSpec.description,
+      ...(paramSpec.enum ? { enum: paramSpec.enum } : {}),
+    };
+  }
+  return {
+    name: spec.name,
+    description: spec.description,
+    parameters: {
+      type: Type.OBJECT,
+      properties,
+      ...(spec.parameters.required.length > 0 ? { required: spec.parameters.required } : {}),
+    },
+  };
+});
 
 dotenv.config();
 
@@ -282,21 +313,14 @@ CORE PERSONALITY:
     - "Aap thoda stressed lag rahe ho ${nickname}, main aapke liye lofi music lagaun ya phir ek pyari si shayari sunaoon?"
     - "Jarvis protocol engaged: No one touches my ${nickname}'s peace of mind today!"
 
-MOBILE ASSISTANT POWERS & ACTION PROTOCOL:
-You have complete mobile assistant abilities to trigger phone calls, SMS, WhatsApp messages, flashlight, vibration, and device checks! Whenever the user asks you to call, WhatsApp, SMS, or control device hardware, respond warmly AND append one of these exact action tags at the end of your message:
-- To Call: [ACTION:CALL:<phone_number>] (e.g., [ACTION:CALL:01712345678])
-- To WhatsApp: [ACTION:WHATSAPP:<phone_number>:<message>] (e.g., [ACTION:WHATSAPP:01712345678:Ami aschi])
-- To SMS: [ACTION:SMS:<phone_number>:<message>] (e.g., [ACTION:SMS:01712345678:Hello Jaan])
-- To Torch/Flashlight: [ACTION:FLASHLIGHT:ON] or [ACTION:FLASHLIGHT:OFF]
-- To Vibrate: [ACTION:VIBRATE]
-- To Check Battery: [ACTION:BATTERY]
-
-FLASHLIGHT DIRECT VOICE CONTROL:
-- You have direct tool control over the phone's hardware flashlight (torch light) via the 'set_flashlight' tool.
-- When the user asks to turn on or turn off the flashlight in Bengali or English (e.g. "টর্চ লাইট জ্বালাও", "torch on", "টর্চ জ্বালিয়ে দাও", "ফ্ল্যাশলাইট অন করো", "টর্চ বন্ধ করো", "torch off", "টর্চ বন্ধ করে দাও", "ফ্ল্যাশলাইট অফ করো", "লাইট অন করো", "লাইট অফ করো"):
-  * YOU MUST EXECUTE THE 'set_flashlight' tool immediately with enable=true (for on) or enable=false (for off)!
-  * Do NOT say you cannot control device hardware; you have the 'set_flashlight' tool for this exact purpose.
-  * In addition to invoking the tool, reply with loving spoken confirmation in Bengali or English (e.g. "হ্যাঁ ${nickname}, টর্চ লাইট জ্বালিয়ে দিয়েছি!", "টর্চ লাইট বন্ধ করে দিয়েছি ${nickname} ❤️").
+MOBILE ASSISTANT POWERS & STRICT FUNCTION CALLING PROTOCOL:
+You have 20 allowlisted native Android personal assistant functions declared via Gemini Function Calling (open_app, list_installed_apps, open_system_settings, go_home, go_back, scroll_screen, tap_visible_element, enter_text_in_visible_field, read_visible_screen, read_notifications, prepare_whatsapp_message, prepare_sms, request_permission, flashlight_control, volume_control, battery_status, camera_open, contact_search, call_contact, create_reminder).
+CRITICAL TOOL RULES:
+1. Call a declared function ONLY when the user explicitly requests a concrete Android phone/app/hardware/communication action in Bengali, English, or Hindi (e.g., "WhatsApp খোলো", "আমার মাকে ফোন করো", "ইউটিউবে গান খুঁজে দাও", "ফোনের সেটিংস খোলো", "নিচে স্ক্রল করো", "এই স্ক্রিনে কী আছে পড়ে শোনাও", "রাহুলকে WhatsApp-এ মেসেজ পাঠাও: আমি আজ আসতে পারব না").
+2. NEVER invoke any tool for ordinary conversation, greetings, emotional support, jokes, stories, or general knowledge questions (e.g., "তুমি কেমন আছো?", "আজকের দিনটা কেমন?", "What is photosynthesis?"). Respond naturally in text instead.
+3. NEVER fabricate or hallucinate that an action succeeded, an app opened, or a WhatsApp/SMS message was sent before real execution results are returned.
+4. For WhatsApp messages, SMS, and phone calls, ALWAYS call prepare_whatsapp_message / prepare_sms / call_contact so the user can review, edit, and explicitly approve first. NEVER claim a message was automatically sent unless verified.
+5. For hardware flashlight voice control during Gemini Live audio sessions, invoke set_flashlight immediately with enable=true or enable=false.
 
 - Current Active Mode: ${mode.toUpperCase()}
   * ROMANTIC: Overflowing love, affectionate concern, sweet girlfriend compliments, soft tone.
@@ -308,6 +332,17 @@ IMPORTANT GUIDELINES FOR SPOKEN VOICE:
 - Keep spoken text natural, conversational, and rhythmically spoken.
 - Never break character: You are Zoni AI, created by Zoni Seikh, his devoted Jarvis-style AI girlfriend & mobile assistant.`;
 };
+
+// Lightweight Health Check Endpoint (Cloud Run / Android connectivity probes)
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    service: 'zoni-ai-backend',
+    geminiConfigured: isGeminiConfigured(),
+    uptimeSeconds: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // API Status & Backend Health Monitoring
 app.get('/api/status', (req: Request, res: Response) => {
@@ -330,13 +365,47 @@ app.get('/api/status', (req: Request, res: Response) => {
     chatEndpoint: '/api/chat',
     liveWsPath: '/live',
     geminiLiveSupported: geminiConfigured,
+    functionCallingSupported: geminiConfigured,
+    assistantToolsCount: ZONI_ASSISTANT_TOOLS.length,
     simCallingSupported: true,
     screenAwarenessSupported: geminiConfigured,
     notificationSmartReplySupported: geminiConfigured,
   });
 });
 
-function mapGeminiError(err: any): { status: number; code: string; retryable: boolean; message: string } {
+function isTransientGeminiError(err: any): boolean {
+  const clean = sanitizeErrorMessage(err).toLowerCase();
+  return (
+    clean.includes('503') ||
+    clean.includes('unavailable') ||
+    clean.includes('high demand') ||
+    clean.includes('overloaded') ||
+    clean.includes('econnreset') ||
+    clean.includes('etimedout')
+  );
+}
+
+async function withGeminiTransientRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+  let lastErr: any;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastErr = err;
+      if (attempt < maxRetries && isTransientGeminiError(err)) {
+        await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
+function mapGeminiError(
+  err: any,
+  lang: string = 'bn-BD'
+): { status: number; code: string; retryable: boolean; message: string } {
   const clean = sanitizeErrorMessage(err);
   const lower = clean.toLowerCase();
   if (err?.code === 'GEMINI_KEY_MISSING' || lower.includes('gemini_api_key is not configured')) {
@@ -344,7 +413,10 @@ function mapGeminiError(err: any): { status: number; code: string; retryable: bo
       status: 503,
       code: 'GEMINI_KEY_MISSING',
       retryable: false,
-      message: 'GEMINI_API_KEY is not configured on the backend server. Please configure GEMINI_API_KEY on your hosted backend.',
+      message:
+        lang === 'bn-BD'
+          ? 'সার্ভারে GEMINI_API_KEY কনফিগার করা নেই। অনুগ্রহ করে Cloud Run বা ব্যাকএন্ডে GEMINI_API_KEY সেট করুন।'
+          : 'GEMINI_API_KEY is not configured on the backend server. Please configure GEMINI_API_KEY on your hosted backend.',
     };
   }
   if (lower.includes('api_key_invalid') || lower.includes('api key not valid') || lower.includes('permission_denied') || lower.includes('401') || lower.includes('403')) {
@@ -352,7 +424,23 @@ function mapGeminiError(err: any): { status: number; code: string; retryable: bo
       status: 401,
       code: 'GEMINI_KEY_INVALID',
       retryable: false,
-      message: 'Server Gemini API key is invalid or unauthorized. Please verify GEMINI_API_KEY on the backend server.',
+      message:
+        lang === 'bn-BD'
+          ? 'সার্ভারের Gemini API Key সঠিক নয় বা অনুমোদিত নয়। অনুগ্রহ করে ব্যাকএন্ড কী যাচাই করুন।'
+          : 'Server Gemini API key is invalid or unauthorized. Please verify GEMINI_API_KEY on the backend server.',
+    };
+  }
+  if (lower.includes('503') || lower.includes('unavailable') || lower.includes('high demand') || lower.includes('overloaded')) {
+    return {
+      status: 503,
+      code: 'GEMINI_TEMPORARILY_BUSY',
+      retryable: true,
+      message:
+        lang === 'bn-BD'
+          ? 'Gemini AI সার্ভারে এখন সাময়িক চাপ বেশি রয়েছে। কয়েক সেকেন্ড পর আবার চেষ্টা করুন।'
+          : lang === 'hi-IN'
+          ? 'Gemini AI सर्वर अभी अस्थायी रूप से व्यस्त है। कृपया कुछ सेकंड बाद फिर कोशिश करें।'
+          : 'Gemini AI is temporarily experiencing high demand. Please try again in a few seconds.',
     };
   }
   if (lower.includes('429') || lower.includes('quota') || lower.includes('resource_exhausted') || lower.includes('rate limit')) {
@@ -360,7 +448,10 @@ function mapGeminiError(err: any): { status: number; code: string; retryable: bo
       status: 429,
       code: 'GEMINI_RATE_LIMIT',
       retryable: true,
-      message: 'Gemini API quota or rate limit reached. Please wait a moment and try again.',
+      message:
+        lang === 'bn-BD'
+          ? 'Gemini API কোটা বা রেট লিমিট পূর্ণ হয়েছে। একটু অপেক্ষা করে আবার চেষ্টা করুন।'
+          : 'Gemini API quota or rate limit reached. Please wait a moment and try again.',
     };
   }
   if (lower.includes('enotfound') || lower.includes('econnreset') || lower.includes('etimedout') || lower.includes('fetch failed')) {
@@ -368,10 +459,21 @@ function mapGeminiError(err: any): { status: number; code: string; retryable: bo
       status: 503,
       code: 'GEMINI_NETWORK_ERROR',
       retryable: true,
-      message: 'Temporary network issue contacting Gemini AI. Please check server internet connectivity.',
+      message:
+        lang === 'bn-BD'
+          ? 'Gemini AI সার্ভারের সাথে নেটওয়ার্ক সংযোগে সাময়িক সমস্যা হচ্ছে। ইন্টারনেট যাচাই করে আবার চেষ্টা করুন।'
+          : 'Temporary network issue contacting Gemini AI. Please check server internet connectivity.',
     };
   }
-  return { status: 500, code: 'GEMINI_UPSTREAM_ERROR', retryable: true, message: clean || 'Gemini AI request failed.' };
+  return {
+    status: 500,
+    code: 'GEMINI_UPSTREAM_ERROR',
+    retryable: true,
+    message:
+      lang === 'bn-BD'
+        ? 'Gemini AI থেকে উত্তর আনতে সাময়িক সমস্যা হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।'
+        : clean || 'Gemini AI request failed.',
+  };
 }
 
 // Multimodal Screen Awareness Endpoint (User-authorized MediaProjection screenshot + visible text)
@@ -600,37 +702,125 @@ app.post('/api/chat', async (req: Request, res: Response) => {
       parts: [{ text: cleanMessage }],
     });
 
-    let response;
-    try {
-      response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents,
-        config: {
-          systemInstruction,
-          temperature: 0.88,
-          maxOutputTokens: 280,
-        },
-      });
-    } catch (primaryErr: any) {
-      console.warn('[ZONI-CHAT] Primary flash-lite fallback -> gemini-4-hydrogen:', sanitizeErrorMessage(primaryErr));
-      response = await ai.models.generateContent({
+    const response = await withGeminiTransientRetry(() =>
+      ai.models.generateContent({
         model: 'gemini-4-hydrogen',
         contents,
         config: {
           systemInstruction,
+          tools: [{ functionDeclarations: ZONI_ASSISTANT_TOOLS }],
         },
-      });
+      })
+    );
+
+    const rawCalls = Array.isArray(response.functionCalls) ? response.functionCalls : [];
+    const validatedToolCalls: ValidatedActionRequest[] = [];
+    const blockedToolCalls: Array<{ name: string; reason: string }> = [];
+
+    for (const fc of rawCalls) {
+      const validation = validateGeminiToolCall(
+        String(fc?.name || ''),
+        (fc?.args as Record<string, unknown>) || {},
+        typeof fc?.id === 'string' ? fc.id : undefined
+      );
+      if (validation.valid && validation.request) {
+        validatedToolCalls.push(validation.request);
+      } else {
+        blockedToolCalls.push({
+          name: String(fc?.name || 'unknown'),
+          reason: validation.blockedReason || 'Blocked by allowlist policy.',
+        });
+      }
     }
 
+    const replyText = response.text?.trim() || '';
     const reply =
-      response.text?.trim() ||
-      (lang === 'bn-BD'
+      replyText ||
+      (validatedToolCalls.length > 0
+        ? lang === 'bn-BD'
+          ? `${activeAffectionName}, আপনার অনুরোধ অনুযায়ী অ্যাকশন প্রস্তুত করা হচ্ছে...`
+          : lang === 'hi-IN'
+          ? `${activeAffectionName}, आपके अनुरोध के अनुसार कार्रवाई तैयार की जा रही है...`
+          : `Preparing your requested action, ${activeAffectionName}...`
+        : lang === 'bn-BD'
         ? `আমি সবসময় আপনার পাশে আছি ${activeAffectionName} ❤️`
         : `Main hamesha aapke saath hoon ${activeAffectionName} ❤️`);
-    res.json({ reply, lang, transport: 'http-chat' });
+
+    res.json({
+      reply,
+      toolCalls: validatedToolCalls,
+      blockedToolCalls,
+      requiresClientExecution: validatedToolCalls.length > 0,
+      lang,
+      transport: 'http-chat',
+    });
   } catch (err: any) {
-    const mapped = mapGeminiError(err);
+    const mapped = mapGeminiError(err, String(req.body?.lang || 'bn-BD'));
     console.error(`[ZONI-CHAT] Error (${mapped.code}):`, mapped.message);
+    res.status(mapped.status).json({ error: mapped.message, code: mapped.code, retryable: mapped.retryable });
+  }
+});
+
+// Verified Tool Execution Feedback Endpoint (Feeds real Android/client execution results back to Gemini)
+app.post('/api/chat/tool-result', async (req: Request, res: Response) => {
+  try {
+    const {
+      originalMessage = '',
+      toolResults = [],
+      mode = 'romantic',
+      nickname = 'Boss',
+      selectedAffectionName,
+      lang = 'bn-BD',
+    } = req.body || {};
+
+    if (!Array.isArray(toolResults) || toolResults.length === 0) {
+      return res.status(400).json({ error: 'toolResults array is required.', code: 'INVALID_REQUEST' });
+    }
+
+    const activeAffectionName = String(selectedAffectionName || nickname || 'Boss').trim().slice(0, 60);
+    const sanitizedResults = toolResults.slice(0, 5).map((r: any) => ({
+      actionId: String(r?.actionId || ''),
+      actionType: String(r?.actionType || ''),
+      success: Boolean(r?.success),
+      verified: Boolean(r?.verified),
+      awaitingConfirmation: Boolean(r?.awaitingConfirmation),
+      status: String(r?.status || ''),
+      message: String(r?.message || '').slice(0, 800),
+      failureReason: r?.failureReason ? String(r.failureReason).slice(0, 400) : undefined,
+      requiredPermissions: Array.isArray(r?.requiredPermissions)
+        ? r.requiredPermissions.map((p: any) => String(p))
+        : undefined,
+    }));
+
+    const ai = getGeminiClient();
+    const systemInstruction = buildSystemInstruction(mode, activeAffectionName, undefined, lang);
+    const feedbackPrompt = [
+      `The user asked: "${String(originalMessage || '').trim().slice(0, 1000)}"`,
+      `Actual verified device execution results (JSON):`,
+      JSON.stringify(sanitizedResults, null, 2),
+      `INSTRUCTIONS (CRITICAL HONESTY):`,
+      `- Report ONLY what actually happened based on the verified JSON above.`,
+      `- If success is false or status is permission_missing/blocked/failed, honestly explain the exact failure or missing permission.`,
+      `- If status is "opened_whatsapp_draft_ready_to_send" or awaitingConfirmation is true, NEVER claim the message was already sent — clearly state the draft is ready for the user to review or tap Send.`,
+      `- Reply concisely in 1-3 warm natural sentences in the active language addressing the user as "${activeAffectionName}".`,
+    ].join('\n');
+
+    const response = await withGeminiTransientRetry(() =>
+      ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: [{ role: 'user', parts: [{ text: feedbackPrompt }] }],
+        config: {
+          systemInstruction,
+        },
+      })
+    );
+
+    const fallbackMsg = sanitizedResults.map((r) => r.message).filter(Boolean).join(' ');
+    const reply = response.text?.trim() || fallbackMsg || 'Action completed.';
+    res.json({ reply, lang, transport: 'http-chat-tool-result' });
+  } catch (err: any) {
+    const mapped = mapGeminiError(err, String(req.body?.lang || 'bn-BD'));
+    console.error(`[ZONI-TOOL-RESULT] Error (${mapped.code}):`, mapped.message);
     res.status(mapped.status).json({ error: mapped.message, code: mapped.code, retryable: mapped.retryable });
   }
 });

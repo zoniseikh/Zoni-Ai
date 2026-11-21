@@ -6,7 +6,20 @@
  * Capacitor native plugins, or installed Android WebAPK / Chrome intents.
  */
 
+import type { ToolExecutionReport } from './assistantActionRegistry';
+
 export interface NativeAndroidBridge {
+  // Typed 20-tool allowlisted action engine & confirmation workflow
+  executeTypedActionJson?: (requestJson: string) => string;
+  confirmPendingActionJson?: (
+    pendingActionId: string,
+    editedMessage: string,
+    useNotificationReply: boolean
+  ) => string;
+  cancelPendingActionJson?: (pendingActionId: string) => string;
+  listInstalledAppsJson?: () => string;
+
+  // Hardware, Calls, Contacts, SMS, WhatsApp
   setFlashlight?: (enable: boolean) => boolean;
   placeCall?: (phoneNumber: string) => boolean;
   callContactDetailedJson?: (queryOrNumber: string) => string;
@@ -23,16 +36,22 @@ export interface NativeAndroidBridge {
   launchApp?: (appQuery: string) => boolean;
   launchAppDetailedJson?: (appQuery: string) => string;
   openSystemSettings?: (target: string) => boolean;
+  isDefaultDigitalAssistant?: () => boolean;
+  requestDefaultDigitalAssistant?: () => boolean;
   requestRuntimePermission?: (permissionKey: string) => boolean;
   requestScreenCaptureConsent?: () => boolean;
   isScreenCaptureActive?: () => boolean;
   captureScreenFrameJson?: () => string;
   stopScreenCapture?: () => boolean;
   getVisibleScreenText?: () => string;
+  readVisibleScreenDetailedJson?: () => string;
   performAccessibilityAction?: (command: string) => boolean;
+  performAccessibilityActionDetailedJson?: (command: string) => string;
+  executeVerifiedWorkflowJson?: (stepsJson: string) => string;
   scrollScreen?: (direction: string) => boolean;
   enterAccessibleText?: (targetHint: string, text: string) => boolean;
   getRecentNotificationsJson?: () => string;
+  clearRecentNotifications?: () => boolean;
   replyToNotification?: (notificationKey: string, replyText: string) => boolean;
   getAutoReplyRulesJson?: () => string;
   saveAutoReplyRulesJson?: (rulesJson: string) => boolean;
@@ -77,6 +96,7 @@ export interface NativePermissionSnapshot {
   overlayAllowed: boolean;
   notificationListenerEnabled: boolean;
   accessibilityEnabled: boolean;
+  defaultAssistant?: boolean;
   screenCaptureActive?: boolean;
 }
 
@@ -91,9 +111,16 @@ export interface NativeNotificationItem {
   timestampMillis: number;
 }
 
+export interface InstalledAppEntry {
+  label: string;
+  packageName: string;
+}
+
 export interface NativeDetailedActionResponse {
   status: string;
   message: string;
+  success?: boolean;
+  verified?: boolean;
   contactName?: string;
   phoneNumber?: string;
   usedDirectCall?: boolean;
@@ -169,6 +196,7 @@ export const ANDROID_APP_PACKAGES: Record<string, string> = {
   यूट्यूब: 'com.google.android.youtube',
   whatsapp: 'com.whatsapp',
   হোয়াটসঅ্যাপ: 'com.whatsapp',
+  হোয়াটসঅ্যাপ: 'com.whatsapp',
   व्हाट्सएप: 'com.whatsapp',
   chrome: 'com.android.chrome',
   ক্রোম: 'com.android.chrome',
@@ -183,13 +211,18 @@ export const ANDROID_APP_PACKAGES: Record<string, string> = {
   ফেসবুক: 'com.facebook.katana',
   फेसबुक: 'com.facebook.katana',
   instagram: 'com.instagram.android',
+  ইনস্টাগ্রাম: 'com.instagram.android',
+  इंस्टाग्राम: 'com.instagram.android',
   telegram: 'org.telegram.messenger',
+  টেলিগ্রাম: 'org.telegram.messenger',
   spotify: 'com.spotify.music',
+  স্পটিফাই: 'com.spotify.music',
   camera: 'com.android.camera',
   ক্যামেরা: 'com.android.camera',
   कैमरा: 'com.android.camera',
   clock: 'com.google.android.deskclock',
   calculator: 'com.google.android.calculator',
+  ক্যালকুলেটর: 'com.google.android.calculator',
   settings: 'com.android.settings',
   সেটিংস: 'com.android.settings',
   सेटिंग्स: 'com.android.settings',
@@ -229,6 +262,104 @@ export function parseNativeBatteryJson(
     // ignore malformed bridge JSON
   }
   return null;
+}
+
+export function executeTypedActionViaNativeBridge(
+  actionType: string,
+  args: Record<string, string | boolean | number>,
+  actionId?: string
+): ToolExecutionReport | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.executeTypedActionJson) return null;
+  try {
+    const payload = JSON.stringify({
+      actionId: actionId || `act_${Date.now()}`,
+      actionType,
+      arguments: args,
+    });
+    const raw = bridge.executeTypedActionJson(payload);
+    return JSON.parse(raw) as ToolExecutionReport;
+  } catch {
+    return null;
+  }
+}
+
+export function confirmPendingActionViaNativeBridge(
+  pendingActionId: string,
+  editedMessage: string = '',
+  useNotificationReply: boolean = false
+): ToolExecutionReport | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.confirmPendingActionJson) return null;
+  try {
+    return JSON.parse(
+      bridge.confirmPendingActionJson(pendingActionId, editedMessage, useNotificationReply)
+    ) as ToolExecutionReport;
+  } catch {
+    return null;
+  }
+}
+
+export function cancelPendingActionViaNativeBridge(pendingActionId: string): ToolExecutionReport | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.cancelPendingActionJson) return null;
+  try {
+    return JSON.parse(bridge.cancelPendingActionJson(pendingActionId)) as ToolExecutionReport;
+  } catch {
+    return null;
+  }
+}
+
+export function listInstalledAppsViaNativeBridge(): InstalledAppEntry[] | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.listInstalledAppsJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.listInstalledAppsJson());
+    return Array.isArray(parsed?.apps) ? (parsed.apps as InstalledAppEntry[]) : [];
+  } catch {
+    return null;
+  }
+}
+
+export function executeVerifiedWorkflowViaNativeBridge(
+  steps: Array<Record<string, string | number>>
+): ToolExecutionReport | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.executeVerifiedWorkflowJson) return null;
+  try {
+    return JSON.parse(bridge.executeVerifiedWorkflowJson(JSON.stringify(steps))) as ToolExecutionReport;
+  } catch {
+    return null;
+  }
+}
+
+export function isDefaultDigitalAssistantViaNativeBridge(): boolean | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.isDefaultDigitalAssistant) return null;
+  try {
+    return Boolean(bridge.isDefaultDigitalAssistant());
+  } catch {
+    return null;
+  }
+}
+
+export function requestDefaultDigitalAssistantViaNativeBridge(): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (bridge?.requestDefaultDigitalAssistant) {
+    try {
+      return Boolean(bridge.requestDefaultDigitalAssistant());
+    } catch {
+      return false;
+    }
+  }
+  if (bridge?.openSystemSettings) {
+    try {
+      return Boolean(bridge.openSystemSettings('default_assistant'));
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 export function getNativePermissionsSnapshot(): NativePermissionSnapshot | null {
@@ -390,4 +521,14 @@ export function performNativeAccessibilityCommand(command: string): boolean {
     }
   }
   return false;
+}
+
+export function performNativeAccessibilityDetailed(command: string): ToolExecutionReport | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.performAccessibilityActionDetailedJson) return null;
+  try {
+    return JSON.parse(bridge.performAccessibilityActionDetailedJson(command)) as ToolExecutionReport;
+  } catch {
+    return null;
+  }
 }

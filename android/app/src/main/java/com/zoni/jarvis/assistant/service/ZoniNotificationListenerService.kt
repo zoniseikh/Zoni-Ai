@@ -24,11 +24,13 @@ data class CapturedNotificationSummary(
 )
 
 /**
- * Genuine Android NotificationListenerService.
- * - Captures recent notifications in a bounded in-memory buffer so Zoni AI can read
- *   incoming WhatsApp/SMS/app notifications aloud when requested.
- * - Retains official Android Notification RemoteInput reply handles so approved Smart Replies
- *   or explicitly user-enabled Rule-Based Auto Replies can be sent through official OS channels.
+ * Genuine, privacy-hardened Android NotificationListenerService.
+ * - Captures recent non-sensitive notifications locally in a bounded in-memory buffer ONLY
+ *   after the user explicitly grants Notification Access in Android Settings.
+ * - Strictly filters/redacts banking, payment, password, and OTP notifications so private
+ *   authentication secrets are never captured, displayed, uploaded, or auto-replied to.
+ * - Retains official Android Notification RemoteInput reply handles so explicitly approved
+ *   WhatsApp/message replies or opt-in user rules execute strictly through official OS channels.
  */
 class ZoniNotificationListenerService : NotificationListenerService() {
 
@@ -42,15 +44,26 @@ class ZoniNotificationListenerService : NotificationListenerService() {
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         sbn ?: return
         if (sbn.packageName == packageName) return
+        // Privacy guard: ignore protected banking/payment/authenticator packages
+        if (AccessibilityGuard.isProtectedPackage(sbn.packageName)) return
+
         val notification = sbn.notification ?: return
         if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
 
         val extras = notification.extras ?: return
-        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
-        val text = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
+        val rawTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
+        val rawText = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
             ?: extras.getCharSequence(Notification.EXTRA_TEXT))
             ?.toString()?.trim().orEmpty()
-        if (title.isEmpty() && text.isEmpty()) return
+        if (rawTitle.isEmpty() && rawText.isEmpty()) return
+
+        // Privacy guard: never store or auto-reply to OTPs, PINs, or password codes
+        val containsSecret = AccessibilityGuard.containsOtpOrSecret(rawTitle) ||
+            AccessibilityGuard.containsOtpOrSecret(rawText)
+        if (containsSecret) return
+
+        val title = AccessibilityGuard.redactSensitiveText(rawTitle)
+        val text = AccessibilityGuard.redactSensitiveText(rawText)
 
         val isWhatsApp = sbn.packageName == "com.whatsapp" || sbn.packageName == "com.whatsapp.w4b"
         val appName = resolveAppLabel(sbn.packageName)
@@ -80,8 +93,8 @@ class ZoniNotificationListenerService : NotificationListenerService() {
             recentNotifications.removeAt(recentNotifications.lastIndex)
         }
 
-        // Optional Rule-Based Auto Reply: executes ONLY when explicitly enabled by the user
-        // and strictly via official Android Notification RemoteInput reply action.
+        // Optional Rule-Based Auto Reply: opt-in only (master switch defaults to FALSE),
+        // strictly via official Android Notification RemoteInput reply action.
         if (canReply && ::autoReplyManager.isInitialized) {
             val matchedRule = autoReplyManager.findMatch(
                 sender = title,
@@ -147,6 +160,27 @@ class ZoniNotificationListenerService : NotificationListenerService() {
         val recentNotifications = CopyOnWriteArrayList<CapturedNotificationSummary>()
         private val replyActionsByKey = ConcurrentHashMap<String, Notification.Action>()
         private val autoReplyCooldownBySender = ConcurrentHashMap<String, Long>()
+
+        fun clearRecentNotifications() {
+            recentNotifications.clear()
+            replyActionsByKey.clear()
+        }
+
+        /**
+         * Finds an active, reply-capable WhatsApp notification key matching the sender name
+         * so the user can optionally send an explicitly approved reply via RemoteInput.
+         */
+        fun findReplyableWhatsAppNotificationKey(senderQuery: String): String? {
+            val clean = senderQuery.trim().lowercase()
+            if (clean.isEmpty()) return null
+            val match = recentNotifications.firstOrNull { item ->
+                item.isWhatsApp &&
+                    item.canReply &&
+                    replyActionsByKey.containsKey(item.key) &&
+                    item.title.lowercase().contains(clean)
+            }
+            return match?.key
+        }
 
         fun getRecentNotificationsJson(limit: Int = 15): String {
             val arr = JSONArray()

@@ -127,6 +127,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val defaultAssistantRoleLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        viewModel.refreshSystemStatus()
+        val isDefault = hardwareController.isDefaultDigitalAssistant()
+        dashboardWebView?.post {
+            dashboardWebView?.evaluateJavascript(
+                "window.dispatchEvent(new CustomEvent('zoni:native-permissions-updated'));" +
+                    "window.dispatchEvent(new CustomEvent('zoni:default-assistant-changed', { detail: { isDefault: $isDefault } }));",
+                null
+            )
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
@@ -272,6 +286,16 @@ class MainActivity : ComponentActivity() {
                                         val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
                                         if (mgr != null) {
                                             screenCaptureConsentLauncher.launch(mgr.createScreenCaptureIntent())
+                                        }
+                                    }
+                                },
+                                onRequestDefaultAssistant = {
+                                    runOnUiThread {
+                                        try {
+                                            val roleIntent = hardwareController.createDefaultAssistantRoleIntent()
+                                            defaultAssistantRoleLauncher.launch(roleIntent)
+                                        } catch (_: Exception) {
+                                            hardwareController.openSystemSettings("default_assistant")
                                         }
                                     }
                                 }

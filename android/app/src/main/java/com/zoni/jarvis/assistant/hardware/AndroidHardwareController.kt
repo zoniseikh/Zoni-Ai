@@ -2,6 +2,7 @@ package com.zoni.jarvis.assistant.hardware
 
 import android.Manifest
 import android.app.NotificationManager
+import android.app.role.RoleManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -12,7 +13,6 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
-import android.telephony.SmsManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.zoni.jarvis.assistant.R
@@ -51,7 +51,8 @@ data class AndroidPermissionsSnapshot(
     val batteryOptimizationIgnored: Boolean,
     val overlayAllowed: Boolean,
     val notificationListenerEnabled: Boolean,
-    val accessibilityEnabled: Boolean
+    val accessibilityEnabled: Boolean,
+    val defaultAssistant: Boolean = false
 )
 
 /**
@@ -97,29 +98,14 @@ class AndroidHardwareController(private val context: Context) {
         return contactCallManager.initiateCall(numberToDial)
     }
 
+    /**
+     * Opens the official Android SMS composer with pre-filled recipient and body so the user
+     * reviews and explicitly taps Send. NEVER silently sends SMS in the background.
+     */
     fun sendSms(phoneNumber: String, message: String): Boolean {
         val cleanNumber = when (val norm = NumberNormalizer.normalizePhoneNumber(phoneNumber)) {
             is NumberNormalizerResult.ValidCandidate -> norm.normalizedNumber
             else -> phoneNumber.filter { it.isDigit() || it == '+' }
-        }
-        val canDirectSend = ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.SEND_SMS
-        ) == PackageManager.PERMISSION_GRANTED
-
-        if (canDirectSend && cleanNumber.isNotBlank() && message.isNotBlank()) {
-            try {
-                val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    context.getSystemService(SmsManager::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    SmsManager.getDefault()
-                }
-                smsManager.sendTextMessage(cleanNumber, null, message, null, null)
-                return true
-            } catch (_: Exception) {
-                // Fall back to SMS composer intent
-            }
         }
         return deviceActionExecutor.openSms(cleanNumber, message)
     }
@@ -152,6 +138,8 @@ class AndroidHardwareController(private val context: Context) {
         return BatterySnapshot(level = pct.coerceIn(0, 100), charging = charging)
     }
 
+    fun listInstalledAppsJson(): String = appLauncher.listInstalledAppsAsJson(150)
+
     fun launchInstalledApp(appQuery: String): Boolean {
         return appLauncher.launchAppByVoiceQuery(appQuery) is AppLaunchResult.Success
     }
@@ -163,6 +151,50 @@ class AndroidHardwareController(private val context: Context) {
     fun openCamera(): Boolean = deviceActionExecutor.openCamera()
 
     fun adjustVolume(action: String): String = deviceActionExecutor.adjustVolume(action)
+
+    /**
+     * Accurately checks whether Android currently recognizes Zoni AI as the Default Digital Assistant.
+     * Never falsely reports true.
+     */
+    fun isDefaultDigitalAssistant(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val roleManager = context.getSystemService(RoleManager::class.java)
+                if (roleManager != null && roleManager.isRoleAvailable(RoleManager.ROLE_ASSISTANT)) {
+                    return roleManager.isRoleHeld(RoleManager.ROLE_ASSISTANT)
+                }
+            } catch (_: Exception) {
+                // Fall back to secure setting inspection below
+            }
+        }
+        return try {
+            val currentAssistant = Settings.Secure.getString(context.contentResolver, "assistant") ?: ""
+            currentAssistant.contains(context.packageName, ignoreCase = true)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Creates the official Android RoleManager ROLE_ASSISTANT request intent when available,
+     * falling back to Android Default Digital Assistant Settings (ACTION_VOICE_INPUT_SETTINGS).
+     */
+    fun createDefaultAssistantRoleIntent(): Intent {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val roleManager = context.getSystemService(RoleManager::class.java)
+                if (roleManager != null &&
+                    roleManager.isRoleAvailable(RoleManager.ROLE_ASSISTANT) &&
+                    !roleManager.isRoleHeld(RoleManager.ROLE_ASSISTANT)
+                ) {
+                    return roleManager.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT)
+                }
+            } catch (_: Exception) {
+                // Fallback below
+            }
+        }
+        return Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
+    }
 
     fun openSystemSettings(target: String): Boolean {
         val key = target.trim().lowercase()
@@ -283,7 +315,8 @@ class AndroidHardwareController(private val context: Context) {
             batteryOptimizationIgnored = batteryIgnored,
             overlayAllowed = overlayAllowed,
             notificationListenerEnabled = notifListener,
-            accessibilityEnabled = a11yEnabled
+            accessibilityEnabled = a11yEnabled,
+            defaultAssistant = isDefaultDigitalAssistant()
         )
     }
 }

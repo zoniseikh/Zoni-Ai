@@ -3,149 +3,343 @@ package com.zoni.jarvis.assistant.device
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import org.json.JSONArray
+import org.json.JSONObject
+import kotlin.math.max
+import kotlin.math.min
+
+data class InstalledAppInfo(
+    val label: String,
+    val packageName: String
+)
 
 sealed class AppLaunchResult {
     data class Success(val appLabel: String, val packageName: String) : AppLaunchResult()
+    data class MultipleMatches(val query: String, val candidates: List<InstalledAppInfo>) : AppLaunchResult()
     data class AppNotFound(val query: String) : AppLaunchResult()
-    data class MultipleMatches(val query: String, val matches: List<Pair<String, String>>) : AppLaunchResult()
-    data class LaunchFailed(val appLabel: String, val reason: String) : AppLaunchResult()
+    data class LaunchFailed(val reason: String) : AppLaunchResult()
+}
+
+/**
+ * Pure, unit-testable multilingual (Bengali, English, Hindi) app resolver with alias mapping,
+ * substring matching, and Levenshtein fuzzy matching.
+ */
+object AppNameResolver {
+
+    val LOCALIZED_APP_ALIASES: Map<String, List<String>> = mapOf(
+        // YouTube
+        "ইউটিউব" to listOf("youtube"),
+        "यूट्यूब" to listOf("youtube"),
+        "yt" to listOf("youtube"),
+        // WhatsApp
+        "হোয়াটসঅ্যাপ" to listOf("whatsapp"),
+        "হোয়াটসঅ্যাপ" to listOf("whatsapp"),
+        "ওয়াটসঅ্যাপ" to listOf("whatsapp"),
+        "ওয়াতসঅ্যাপ" to listOf("whatsapp"),
+        "व्हाट्सएप" to listOf("whatsapp"),
+        "व्हाट्सऐप" to listOf("whatsapp"),
+        "whats app" to listOf("whatsapp"),
+        "whatsapp business" to listOf("whatsapp business", "com.whatsapp.w4b"),
+        // Chrome
+        "ক্রোম" to listOf("chrome", "google chrome"),
+        "क्रोम" to listOf("chrome", "google chrome"),
+        "browser" to listOf("chrome", "browser"),
+        "ব্রাউজার" to listOf("chrome", "browser"),
+        // Instagram
+        "ইনস্টাগ্রাম" to listOf("instagram"),
+        "ইন্সটাগ্রাম" to listOf("instagram"),
+        "इंस्टाग्राम" to listOf("instagram"),
+        "insta" to listOf("instagram"),
+        // Facebook
+        "ফেসবুক" to listOf("facebook"),
+        "फेसबुक" to listOf("facebook"),
+        "fb" to listOf("facebook"),
+        // Maps
+        "ম্যাপস" to listOf("maps", "google maps"),
+        "ম্যাপ" to listOf("maps", "google maps"),
+        "গুগল ম্যাপ" to listOf("maps", "google maps"),
+        "গুগল ম্যাপস" to listOf("maps", "google maps"),
+        "मैप्स" to listOf("maps", "google maps"),
+        "गूगल मैप्स" to listOf("maps", "google maps"),
+        // Settings
+        "সেটিংস" to listOf("settings"),
+        "ফোনের সেটিংস" to listOf("settings"),
+        "सेटिंग्स" to listOf("settings"),
+        "फोन की सेटिंग्स" to listOf("settings"),
+        // Calculator
+        "ক্যালকুলেটর" to listOf("calculator"),
+        "ক্যালকুলেটার" to listOf("calculator"),
+        "कैलकुलेटर" to listOf("calculator"),
+        "calc" to listOf("calculator"),
+        // Camera
+        "ক্যামেরা" to listOf("camera"),
+        "कैमरा" to listOf("camera"),
+        // Gallery / Photos
+        "গ্যালারি" to listOf("gallery", "photos"),
+        "ফটো" to listOf("photos", "gallery"),
+        "गैलरी" to listOf("gallery", "photos"),
+        // Gmail / Mail
+        "জিমেইল" to listOf("gmail"),
+        "जीमेल" to listOf("gmail"),
+        "ইমেইল" to listOf("gmail", "email"),
+        // Messages
+        "মেসেজ" to listOf("messages", "messaging"),
+        "মেসেজেস" to listOf("messages", "messaging"),
+        "मैसेज" to listOf("messages", "messaging"),
+        // Phone / Dialer / Contacts
+        "ডায়ালার" to listOf("phone", "dialer"),
+        "ফোন" to listOf("phone", "dialer"),
+        "কন্টাক্টস" to listOf("contacts"),
+        "কন্টাক্ট" to listOf("contacts"),
+        "कॉन्टैक्ट्स" to listOf("contacts"),
+        // Clock / Alarm
+        "ঘড়ি" to listOf("clock"),
+        "ক্লক" to listOf("clock"),
+        "अलार्म" to listOf("clock"),
+        "घड़ी" to listOf("clock"),
+        // Telegram & Spotify
+        "টেলিগ্রাম" to listOf("telegram"),
+        "टेलीग्राम" to listOf("telegram"),
+        "স্পটিফাই" to listOf("spotify"),
+        "स्पॉटिफाई" to listOf("spotify"),
+        // Play Store & Calendar
+        "প্লে স্টোর" to listOf("play store", "google play store"),
+        "प्ले स्टोर" to listOf("play store", "google play store"),
+        "ক্যালেন্ডার" to listOf("calendar"),
+        "कैलेंडर" to listOf("calendar")
+    )
+
+    fun expandQueryVariants(rawQuery: String): List<String> {
+        val cleaned = rawQuery.trim()
+            .replace(Regex("[.,?!।]"), "")
+            .replace(Regex("\\s+"), " ")
+            .lowercase()
+        if (cleaned.isEmpty()) return emptyList()
+
+        val variants = LinkedHashSet<String>()
+        variants.add(cleaned)
+        LOCALIZED_APP_ALIASES[cleaned]?.forEach { variants.add(it) }
+        for ((alias, targets) in LOCALIZED_APP_ALIASES) {
+            if (cleaned.contains(alias)) {
+                targets.forEach { variants.add(it) }
+            }
+        }
+        return variants.toList()
+    }
+
+    fun resolveMatchingApps(rawQuery: String, installedApps: List<InstalledAppInfo>): AppLaunchResult {
+        val query = rawQuery.trim()
+        if (query.isEmpty()) {
+            return AppLaunchResult.AppNotFound(query)
+        }
+        val variants = expandQueryVariants(query)
+        if (variants.isEmpty()) {
+            return AppLaunchResult.AppNotFound(query)
+        }
+
+        // 1. Exact label or exact packageName match
+        val exactMatches = installedApps.filter { app ->
+            val labelLower = app.label.trim().lowercase()
+            val pkgLower = app.packageName.trim().lowercase()
+            variants.any { v -> labelLower == v || pkgLower == v }
+        }
+        if (exactMatches.size == 1) {
+            return AppLaunchResult.Success(exactMatches[0].label, exactMatches[0].packageName)
+        }
+        if (exactMatches.size > 1) {
+            return AppLaunchResult.MultipleMatches(query, exactMatches.take(5))
+        }
+
+        // 2. Prefix match (e.g., "WhatsApp" matches "WhatsApp" & "WhatsApp Business")
+        val prefixMatches = installedApps.filter { app ->
+            val labelLower = app.label.trim().lowercase()
+            variants.any { v -> labelLower.startsWith(v) }
+        }
+        if (prefixMatches.size == 1) {
+            return AppLaunchResult.Success(prefixMatches[0].label, prefixMatches[0].packageName)
+        }
+        if (prefixMatches.size > 1) {
+            return AppLaunchResult.MultipleMatches(query, prefixMatches.take(5))
+        }
+
+        // 3. Substring match on label or package tail
+        val partialMatches = installedApps.filter { app ->
+            val labelLower = app.label.trim().lowercase()
+            val pkgLower = app.packageName.trim().lowercase()
+            variants.any { v ->
+                v.length >= 2 && (labelLower.contains(v) || pkgLower.substringAfterLast('.').contains(v))
+            }
+        }
+        if (partialMatches.size == 1) {
+            return AppLaunchResult.Success(partialMatches[0].label, partialMatches[0].packageName)
+        }
+        if (partialMatches.size > 1) {
+            return AppLaunchResult.MultipleMatches(query, partialMatches.take(5))
+        }
+
+        // 4. Fuzzy Levenshtein similarity match (handles minor voice transcription typos)
+        val fuzzyScored = installedApps.mapNotNull { app ->
+            val labelLower = app.label.trim().lowercase()
+            val bestScore = variants.maxOfOrNull { v -> similarityScore(v, labelLower) } ?: 0.0
+            if (bestScore >= 0.72) Pair(app, bestScore) else null
+        }.sortedByDescending { it.second }
+
+        if (fuzzyScored.size == 1) {
+            val winner = fuzzyScored[0].first
+            return AppLaunchResult.Success(winner.label, winner.packageName)
+        }
+        if (fuzzyScored.size > 1) {
+            // If top match is significantly clearer than second, choose it; otherwise disambiguate
+            if (fuzzyScored[0].second - fuzzyScored[1].second >= 0.12) {
+                val winner = fuzzyScored[0].first
+                return AppLaunchResult.Success(winner.label, winner.packageName)
+            }
+            return AppLaunchResult.MultipleMatches(query, fuzzyScored.take(5).map { it.first })
+        }
+
+        return AppLaunchResult.AppNotFound(query)
+    }
+
+    fun similarityScore(a: String, b: String): Double {
+        if (a.isEmpty() || b.isEmpty()) return 0.0
+        if (a == b) return 1.0
+        val dist = levenshteinDistance(a, b)
+        val maxLen = max(a.length, b.length)
+        return 1.0 - (dist.toDouble() / maxLen.toDouble())
+    }
+
+    private fun levenshteinDistance(a: String, b: String): Int {
+        val m = a.length
+        val n = b.length
+        val prev = IntArray(n + 1) { it }
+        val curr = IntArray(n + 1)
+        for (i in 1..m) {
+            curr[0] = i
+            for (j in 1..n) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                curr[j] = min(min(curr[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost)
+            }
+            System.arraycopy(curr, 0, prev, 0, n + 1)
+        }
+        return prev[n]
+    }
 }
 
 class AppLauncher(private val context: Context) {
 
-    private val packageManager: PackageManager = context.packageManager
-
-    private val LOCALIZED_APP_NAME_MAP = mapOf(
-        // Bengali aliases
-        "ইউটিউব" to "YouTube",
-        "হোয়াটসঅ্যাপ" to "WhatsApp",
-        "হোয়াটসঅ্যাপ" to "WhatsApp",
-        "ক্রোম" to "Chrome",
-        "ক্যামেরা" to "Camera",
-        "ক্যালকুলেটর" to "Calculator",
-        "ক্যালেন্ডার" to "Calendar",
-        "গ্যালারি" to "Gallery",
-        "ম্যাপস" to "Maps",
-        "ম্যাপ" to "Maps",
-        "জিমেইল" to "Gmail",
-        "প্লে স্টোর" to "Play Store",
-        "ফেসবুক" to "Facebook",
-        "ঘড়ি" to "Clock",
-        "ঘড়ি" to "Clock",
-        "মেসেজ" to "Messages",
-        "সেটিংস" to "Settings",
-        // Hindi aliases
-        "यूट्यूब" to "YouTube",
-        "व्हाट्सएप" to "WhatsApp",
-        "व्हाट्सऐप" to "WhatsApp",
-        "क्रोम" to "Chrome",
-        "कैमरा" to "Camera",
-        "कैलकुलेटर" to "Calculator",
-        "कैलेंडर" to "Calendar",
-        "गैलरी" to "Gallery",
-        "मैप्स" to "Maps",
-        "जीमेल" to "Gmail",
-        "प्ले स्टोर" to "Play Store",
-        "फेसबुक" to "Facebook",
-        "इंस्टाग्राम" to "Instagram",
-        "सेटिंग्स" to "Settings"
-    )
-
-    fun launchAppByVoiceQuery(query: String): AppLaunchResult {
-        val trimmed = query.trim()
-        if (trimmed.isBlank()) {
-            return AppLaunchResult.AppNotFound(trimmed)
-        }
-
-        // Translate Bengali/Hindi query if mapped
-        val resolvedName = LOCALIZED_APP_NAME_MAP[trimmed.lowercase()] ?: trimmed
-
-        // Query all installed launcher activities
+    /**
+     * Discovers all installed launchable Android apps using PackageManager
+     * (`ACTION_MAIN` + `CATEGORY_LAUNCHER`), without requiring QUERY_ALL_PACKAGES.
+     */
+    fun listInstalledApps(): List<InstalledAppInfo> {
+        val pm = context.packageManager
         val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
             addCategory(Intent.CATEGORY_LAUNCHER)
         }
+        val resolvedInfos = try {
+            pm.queryIntentActivities(mainIntent, 0)
+        } catch (_: Exception) {
+            emptyList()
+        }
 
-        val resolveInfos = packageManager.queryIntentActivities(mainIntent, 0)
-        val matchedApps = mutableListOf<Pair<String, String>>() // Label to PackageName
-
-        for (info in resolveInfos) {
-            val label = info.loadLabel(packageManager).toString()
-            val packageName = info.activityInfo.packageName
-
-            if (label.equals(resolvedName, ignoreCase = true) ||
-                packageName.contains(resolvedName, ignoreCase = true)
-            ) {
-                matchedApps.add(Pair(label, packageName))
-            } else if (label.contains(resolvedName, ignoreCase = true)) {
-                matchedApps.add(Pair(label, packageName))
+        val deduped = LinkedHashMap<String, InstalledAppInfo>()
+        for (info in resolvedInfos) {
+            val pkg = info.activityInfo?.packageName?.trim().orEmpty()
+            if (pkg.isEmpty() || pkg == context.packageName) continue
+            val label = info.loadLabel(pm)?.toString()?.trim().orEmpty().ifEmpty { pkg }
+            if (!deduped.containsKey(pkg)) {
+                deduped[pkg] = InstalledAppInfo(label = label, packageName = pkg)
             }
         }
-
-        if (matchedApps.isEmpty()) {
-            return AppLaunchResult.AppNotFound(trimmed)
-        }
-
-        if (matchedApps.size == 1) {
-            val (label, pkg) = matchedApps[0]
-            return executeLaunch(label, pkg)
-        }
-
-        // If multiple matches, check for exact match
-        val exact = matchedApps.find { it.first.equals(resolvedName, ignoreCase = true) }
-        if (exact != null) {
-            return executeLaunch(exact.first, exact.second)
-        }
-
-        return AppLaunchResult.MultipleMatches(trimmed, matchedApps)
+        return deduped.values.sortedBy { it.label.lowercase() }
     }
 
-    fun launchAppAsJson(query: String): String {
-        return when (val result = launchAppByVoiceQuery(query)) {
-            is AppLaunchResult.Success -> org.json.JSONObject()
-                .put("status", "success")
-                .put("appLabel", result.appLabel)
-                .put("packageName", result.packageName)
-                .put("message", "Opened ${result.appLabel}.")
-                .toString()
-            is AppLaunchResult.AppNotFound -> org.json.JSONObject()
-                .put("status", "not_found")
-                .put("query", result.query)
-                .put("message", "Could not find an installed app matching \"${result.query}\".")
+    fun listInstalledAppsAsJson(limit: Int = 150): String {
+        val apps = listInstalledApps()
+        val arr = JSONArray()
+        apps.take(limit.coerceIn(1, 300)).forEach { app ->
+            arr.put(
+                JSONObject()
+                    .put("label", app.label)
+                    .put("packageName", app.packageName)
+            )
+        }
+        return JSONObject()
+            .put("success", true)
+            .put("count", apps.size)
+            .put("apps", arr)
+            .toString()
+    }
+
+    fun launchAppByVoiceQuery(rawQuery: String): AppLaunchResult {
+        val query = rawQuery.trim()
+        if (query.isEmpty()) {
+            return AppLaunchResult.AppNotFound(query)
+        }
+
+        val installedApps = listInstalledApps()
+        val resolved = AppNameResolver.resolveMatchingApps(query, installedApps)
+
+        return when (resolved) {
+            is AppLaunchResult.Success -> launchPackage(resolved.packageName, resolved.appLabel)
+            is AppLaunchResult.MultipleMatches -> resolved
+            is AppLaunchResult.AppNotFound -> resolved
+            is AppLaunchResult.LaunchFailed -> resolved
+        }
+    }
+
+    fun launchAppAsJson(rawQuery: String): String {
+        return when (val res = launchAppByVoiceQuery(rawQuery)) {
+            is AppLaunchResult.Success -> JSONObject()
+                .put("status", "launched")
+                .put("success", true)
+                .put("verified", true)
+                .put("appLabel", res.appLabel)
+                .put("packageName", res.packageName)
+                .put("message", "Opened ${res.appLabel}.")
                 .toString()
             is AppLaunchResult.MultipleMatches -> {
-                val candidates = org.json.JSONArray()
-                result.matches.take(6).forEach { (label, pkg) ->
-                    candidates.put(
-                        org.json.JSONObject()
-                            .put("label", label)
-                            .put("packageName", pkg)
-                    )
+                val arr = JSONArray()
+                res.candidates.forEach {
+                    arr.put(JSONObject().put("label", it.label).put("packageName", it.packageName))
                 }
-                org.json.JSONObject()
+                JSONObject()
                     .put("status", "multiple_matches")
-                    .put("query", result.query)
-                    .put("candidates", candidates)
-                    .put("message", "Multiple apps match \"${result.query}\". Please specify which one to open.")
+                    .put("success", false)
+                    .put("verified", false)
+                    .put("query", res.query)
+                    .put("candidates", arr)
+                    .put("message", "Multiple installed apps match \"${res.query}\": ${res.candidates.joinToString(", ") { it.label }}. Which one would you like to open?")
                     .toString()
             }
-            is AppLaunchResult.LaunchFailed -> org.json.JSONObject()
+            is AppLaunchResult.AppNotFound -> JSONObject()
+                .put("status", "not_found")
+                .put("success", false)
+                .put("verified", false)
+                .put("query", res.query)
+                .put("failureReason", "app_not_installed")
+                .put("message", "App \"${res.query}\" is not installed on this device.")
+                .toString()
+            is AppLaunchResult.LaunchFailed -> JSONObject()
                 .put("status", "failed")
-                .put("appLabel", result.appLabel)
-                .put("message", result.reason)
+                .put("success", false)
+                .put("verified", false)
+                .put("failureReason", "launch_intent_failed")
+                .put("message", res.reason)
                 .toString()
         }
     }
 
-    private fun executeLaunch(label: String, packageName: String): AppLaunchResult {
-        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
-            ?: return AppLaunchResult.LaunchFailed(label, "Application has no launchable intent.")
-
+    fun launchPackage(packageName: String, appLabel: String): AppLaunchResult {
+        val pm: PackageManager = context.packageManager
+        val launchIntent = pm.getLaunchIntentForPackage(packageName)
+            ?: return AppLaunchResult.LaunchFailed("Could not resolve a launcher activity for $appLabel ($packageName).")
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         return try {
             context.startActivity(launchIntent)
-            AppLaunchResult.Success(label, packageName)
+            AppLaunchResult.Success(appLabel, packageName)
         } catch (e: Exception) {
-            AppLaunchResult.LaunchFailed(label, e.message ?: "Failed to start activity.")
+            AppLaunchResult.LaunchFailed("Failed to launch $appLabel: ${e.message}")
         }
     }
 }

@@ -21,8 +21,9 @@ import org.json.JSONObject
 /**
  * Typed, allowlisted Android WebView @JavascriptInterface exposed as `window.ZoniAndroidBridge`,
  * connecting the preserved original Zoni AI React dashboard directly to native Android hardware,
- * Contacts, Telecom SIM calling, WhatsApp contact drafts, Screen Awareness (MediaProjection + Accessibility),
- * Notification Listener + RemoteInput replies + Rule-Based Auto Reply, Room DB history, and system services.
+ * Contacts, Telecom SIM calling, WhatsApp review/confirmation drafts, Installed App discovery,
+ * Screen Awareness (MediaProjection + Accessibility), Multi-Step Verified Accessibility Workflows,
+ * Notification Listener + RemoteInput replies, Default Digital Assistant role, and Room DB history.
  */
 class ZoniWebAppInterface(
     private val context: Context,
@@ -31,8 +32,28 @@ class ZoniWebAppInterface(
     private val keyManager: SecureKeyManager = SecureKeyManager(context),
     private val autoReplyManager: AutoReplyRuleManager = AutoReplyRuleManager(context),
     private val onRequestRuntimePermissions: ((Array<String>) -> Unit)? = null,
-    private val onRequestScreenCaptureConsent: (() -> Unit)? = null
+    private val onRequestScreenCaptureConsent: (() -> Unit)? = null,
+    private val onRequestDefaultAssistant: (() -> Unit)? = null
 ) {
+    // --- Typed Allowlisted Action Engine (20 tools + explicit confirmation workflow) ---
+
+    @JavascriptInterface
+    fun executeTypedActionJson(requestJson: String): String =
+        hardware.deviceActionExecutor.executeTypedActionJson(requestJson)
+
+    @JavascriptInterface
+    fun confirmPendingActionJson(pendingActionId: String, editedMessage: String, useNotificationReply: Boolean): String =
+        hardware.deviceActionExecutor.confirmPendingActionJson(pendingActionId, editedMessage, useNotificationReply)
+
+    @JavascriptInterface
+    fun cancelPendingActionJson(pendingActionId: String): String =
+        hardware.deviceActionExecutor.cancelPendingActionJson(pendingActionId)
+
+    @JavascriptInterface
+    fun listInstalledAppsJson(): String = hardware.listInstalledAppsJson()
+
+    // --- Hardware, Calls, Contacts, SMS, WhatsApp ---
+
     @JavascriptInterface
     fun setFlashlight(enable: Boolean): Boolean = hardware.setFlashlight(enable)
 
@@ -93,6 +114,23 @@ class ZoniWebAppInterface(
 
     @JavascriptInterface
     fun openSystemSettings(target: String): Boolean = hardware.openSystemSettings(target)
+
+    // --- Default Digital Assistant Integration ---
+
+    @JavascriptInterface
+    fun isDefaultDigitalAssistant(): Boolean = hardware.isDefaultDigitalAssistant()
+
+    @JavascriptInterface
+    fun requestDefaultDigitalAssistant(): Boolean {
+        val cb = onRequestDefaultAssistant
+        if (cb != null) {
+            cb.invoke()
+            return true
+        }
+        return hardware.openSystemSettings("default_assistant")
+    }
+
+    // --- Runtime Permissions ---
 
     @JavascriptInterface
     fun requestRuntimePermission(permissionKey: String): Boolean {
@@ -182,11 +220,22 @@ class ZoniWebAppInterface(
     @JavascriptInterface
     fun getVisibleScreenText(): String = ZoniAccessibilityService.getVisibleScreenText(80)
 
-    // --- Accessibility Actions ---
+    @JavascriptInterface
+    fun readVisibleScreenDetailedJson(): String = ZoniAccessibilityService.readVisibleScreenDetailedJson(80)
+
+    // --- Accessibility Actions & Verified Multi-Step Workflows ---
 
     @JavascriptInterface
     fun performAccessibilityAction(command: String): Boolean =
         ZoniAccessibilityService.performExplicitAction(command)
+
+    @JavascriptInterface
+    fun performAccessibilityActionDetailedJson(command: String): String =
+        ZoniAccessibilityService.performExplicitActionDetailedJson(command)
+
+    @JavascriptInterface
+    fun executeVerifiedWorkflowJson(stepsJson: String): String =
+        ZoniAccessibilityService.executeVerifiedWorkflowJson(stepsJson)
 
     @JavascriptInterface
     fun scrollScreen(direction: String): Boolean =
@@ -201,6 +250,12 @@ class ZoniWebAppInterface(
     @JavascriptInterface
     fun getRecentNotificationsJson(): String =
         ZoniNotificationListenerService.getRecentNotificationsJson(15)
+
+    @JavascriptInterface
+    fun clearRecentNotifications(): Boolean {
+        ZoniNotificationListenerService.clearRecentNotifications()
+        return true
+    }
 
     @JavascriptInterface
     fun replyToNotification(notificationKey: String, replyText: String): Boolean =
@@ -278,6 +333,7 @@ class ZoniWebAppInterface(
             .put("overlayAllowed", snap.overlayAllowed)
             .put("notificationListenerEnabled", snap.notificationListenerEnabled)
             .put("accessibilityEnabled", snap.accessibilityEnabled)
+            .put("defaultAssistant", snap.defaultAssistant)
             .put("screenCaptureActive", ScreenCaptureManager.isActive())
             .toString()
     }
