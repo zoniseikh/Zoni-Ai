@@ -580,5 +580,12 @@ class SmartAccessibilityEngineTest {
         assertEquals("রাহুল", MultilingualNameMatcher.cleanPersonQuery("রাহুলের"))
         assertEquals("মা", MultilingualNameMatcher.cleanPersonQuery("মায়ের"))
         assertEquals("জাহিদা", MultilingualNameMatcher.cleanPersonQuery("জাহিদার"))
+        // Verify both NFC and NFD Bengali nukta characters (ড়/ড়, ঢ়/ঢ়, য়/য়) transliterate cleanly
+        assertEquals(
+            MultilingualNameMatcher.toPhoneticLatin("মায়া"),
+            MultilingualNameMatcher.toPhoneticLatin("মায়া")
+        )
+        assertEquals("maya", MultilingualNameMatcher.toPhoneticLatin("মায়া"))
+        assertEquals("bari", MultilingualNameMatcher.toPhoneticLatin("বাড়ি"))
     }
 }

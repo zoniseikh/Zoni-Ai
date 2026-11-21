@@ -1230,6 +1230,46 @@ class ZoniAccessibilityService : AccessibilityService() {
         return searchInput.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 
+    private fun findEditableNode(root: AccessibilityNodeInfo, targetHint: String): AccessibilityNodeInfo? {
+        val hintQuery = targetHint.trim().lowercase()
+        var fallbackEditable: AccessibilityNodeInfo? = null
+
+        fun search(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+            if (node == null || node.isPassword) return null
+            if (node.isEditable && node.isVisibleToUser && node.isEnabled) {
+                val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    node.hintText?.toString()?.lowercase().orEmpty()
+                } else {
+                    ""
+                }
+                val text = node.text?.toString()?.lowercase().orEmpty()
+                val desc = node.contentDescription?.toString()?.lowercase().orEmpty()
+                val vid = node.viewIdResourceName?.lowercase().orEmpty()
+                if (AccessibilityGuard.isSensitiveInputHint(hint) ||
+                    AccessibilityGuard.isSensitiveInputHint(desc) ||
+                    AccessibilityGuard.isSensitiveInputHint(vid)
+                ) {
+                    return null
+                }
+                if (hintQuery.isNotEmpty() &&
+                    (hint.contains(hintQuery) || text.contains(hintQuery) || desc.contains(hintQuery) || vid.contains(hintQuery))
+                ) {
+                    return node
+                }
+                if (fallbackEditable == null) {
+                    fallbackEditable = node
+                }
+            }
+            for (i in 0 until node.childCount) {
+                val found = search(node.getChild(i))
+                if (found != null) return found
+            }
+            return null
+        }
+
+        return search(root) ?: fallbackEditable
+    }
+
     // ========================================================================
     // PART 2B — TYPE WHATSAPP MESSAGE ONLY (NEVER CLICKS SEND!)
     // ========================================================================

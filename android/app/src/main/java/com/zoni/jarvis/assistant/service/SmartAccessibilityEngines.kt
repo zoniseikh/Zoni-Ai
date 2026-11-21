@@ -1,5 +1,7 @@
 package com.zoni.jarvis.assistant.service
 
+import java.text.Normalizer
+
 /**
  * Pure, JVM-testable Smart Accessibility Engines for Zoni AI:
  * 1. [YouTubeClickEngine] — Advanced YouTube video card, thumbnail, search result & Play button resolver + watch-screen verifier.
@@ -457,7 +459,7 @@ object MultilingualNameMatcher {
         setOf("স্বামী", "husband", "पति")
     )
 
-    private val BENGALI_CHAR_MAP = mapOf(
+    private val BENGALI_CHAR_MAP: Map<Char, String> = mapOf<Char, String>(
         'অ' to "o", 'আ' to "a", 'ই' to "i", 'ঈ' to "i", 'উ' to "u", 'ঊ' to "u",
         'এ' to "e", 'ঐ' to "oi", 'ও' to "o", 'ঔ' to "ou",
         'ক' to "k", 'খ' to "kh", 'গ' to "g", 'ঘ' to "gh", 'ঙ' to "ng",
@@ -466,13 +468,13 @@ object MultilingualNameMatcher {
         'ত' to "t", 'থ' to "th", 'দ' to "d", 'ধ' to "dh", 'ন' to "n",
         'প' to "p", 'ফ' to "f", 'ব' to "b", 'ভ' to "bh", 'ম' to "m",
         'য' to "j", 'র' to "r", 'ল' to "l", 'শ' to "sh", 'ষ' to "sh", 'স' to "s", 'হ' to "h",
-        'ড়' to "r", 'ঢ়' to "rh", 'য়' to "y", 'য়' to "y", 'ড়' to "r", 'ঢ়' to "rh",
+        '\u09DC' to "r", '\u09DD' to "rh", '\u09DF' to "y",
         'ৎ' to "t", 'ং' to "ng", 'ঃ' to "h", 'ঁ' to "n",
         'া' to "a", 'ি' to "i", 'ী' to "i", 'ু' to "u", 'ূ' to "u",
         'ে' to "e", 'ৈ' to "oi", 'ো' to "o", 'ৌ' to "ou", '্' to ""
     )
 
-    private val DEVANAGARI_CHAR_MAP = mapOf(
+    private val DEVANAGARI_CHAR_MAP: Map<Char, String> = mapOf<Char, String>(
         'अ' to "a", 'आ' to "a", 'इ' to "i", 'ई' to "i", 'उ' to "u", 'ऊ' to "u",
         'ए' to "e", 'ऐ' to "ai", 'ओ' to "o", 'औ' to "au",
         'क' to "k", 'ख' to "kh", 'ग' to "g", 'घ' to "gh", 'ङ' to "ng",
@@ -521,7 +523,7 @@ object MultilingualNameMatcher {
      * "জাহিদা" / "Jahida" / "Zahida" match cleanly across scripts.
      */
     fun toPhoneticLatin(input: String): String {
-        val lower = input.trim().lowercase()
+        val lower = Normalizer.normalize(input.trim(), Normalizer.Form.NFC).lowercase()
         val sb = StringBuilder(lower.length * 2)
         for (ch in lower) {
             val mapped = BENGALI_CHAR_MAP[ch] ?: DEVANAGARI_CHAR_MAP[ch]
