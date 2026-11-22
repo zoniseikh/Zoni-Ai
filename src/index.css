@@ -113,20 +113,31 @@
 }
 
 .zoni-modal-card {
+  box-sizing: border-box;
   width: min(100%, 672px);
+  /* An explicit height gives flex children a real layout box in Android WebView. */
+  height: min(900px, calc(100vh - 24px));
+  height: min(900px, calc(100dvh - 24px));
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
   display: flex;
+  flex: 0 1 auto;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  /* Keep a dependable fallback for Android System WebView viewport handling. */
-  max-height: calc(100vh - 24px);
-  max-height: calc(100dvh - 24px);
+  position: relative;
+  background-color: #020617;
 }
 
-.zoni-modal-scroll {
-  flex: 1 1 0%;
+.zoni-modal-card > .zoni-modal-scroll {
+  display: block;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
+  max-height: 100%;
+  overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior-y: contain;
   -webkit-overflow-scrolling: touch;
