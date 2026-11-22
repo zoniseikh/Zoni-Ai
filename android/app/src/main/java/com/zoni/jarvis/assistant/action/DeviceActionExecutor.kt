@@ -62,6 +62,13 @@ class DeviceActionExecutor(private val context: Context) {
     private val contactCallManager = ContactCallManager(context)
     private val appLauncher = AppLauncher(context)
     private val flashlightController = FlashlightController(context)
+    private val simCallManager: com.zoni.jarvis.assistant.calling.SimCallManager by lazy {
+        com.zoni.jarvis.assistant.calling.SimCallManager(
+            context = context,
+            contactCallManager = contactCallManager,
+            deviceActionExecutor = this
+        )
+    }
 
     fun parseAndExecute(fullText: String): DeviceActionResult {
         val actionRegex = Regex("\\[ACTION:([A-Z]+)(?::([^:\\]]+))?(?::([^\\]]+))?\\]", RegexOption.IGNORE_CASE)
@@ -643,6 +650,62 @@ class DeviceActionExecutor(private val context: Context) {
                 val outcome = ZoniAccessibilityService.verifyWhatsAppSendState(recipient, msg)
                 wrapAccessibilityResult(request, outcome.toJson())
             }
+
+            AllowedActionType.ANSWER_INCOMING_CALL -> wrapCallControlJsonResult(
+                request,
+                simCallManager.answerIncomingCallAsJson()
+            )
+
+            AllowedActionType.REJECT_INCOMING_CALL -> wrapCallControlJsonResult(
+                request,
+                simCallManager.rejectIncomingCallAsJson()
+            )
+
+            AllowedActionType.END_ACTIVE_CALL -> wrapCallControlJsonResult(
+                request,
+                simCallManager.endActiveCallAsJson()
+            )
+        }
+    }
+
+    private fun wrapCallControlJsonResult(
+        request: TypedActionRequest,
+        rawJson: String
+    ): TypedActionResult {
+        return try {
+            val obj = JSONObject(rawJson)
+            val perms = mutableListOf<String>()
+            val missingArr = obj.optJSONArray("missingPermissions")
+            if (missingArr != null) {
+                for (i in 0 until missingArr.length()) {
+                    val p = missingArr.optString(i, "")
+                    if (p.isNotBlank()) perms.add(p)
+                }
+            }
+            val ok = obj.optBoolean("success", false)
+            val status = obj.optString("status", if (ok) "executed" else "failed")
+            TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = ok,
+                verified = obj.optBoolean("verified", false),
+                status = status,
+                executionStatus = status,
+                message = obj.optString("message", if (ok) "Call control executed." else "Call control failed."),
+                failureReason = if (ok) null else status,
+                requiredPermissions = perms,
+                data = obj
+            )
+        } catch (e: Exception) {
+            TypedActionResult(
+                actionId = request.actionId,
+                actionType = request.actionType.toolName,
+                success = false,
+                verified = false,
+                status = "failed",
+                message = "Could not parse call-control outcome: ${e.message}",
+                failureReason = "call_control_parse_error"
+            )
         }
     }
 

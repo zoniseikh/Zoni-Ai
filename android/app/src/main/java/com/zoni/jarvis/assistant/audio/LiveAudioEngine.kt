@@ -1,13 +1,17 @@
 package com.zoni.jarvis.assistant.audio
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import android.util.Base64
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,12 +26,17 @@ import kotlin.math.sqrt
  * Genuine Native Android Full-Duplex PCM Audio Engine for Gemini Live:
  * - Capture: 16,000 Hz Mono 16-bit PCM (with hardware AEC + Noise Suppression)
  * - Playback: 24,000 Hz Mono 16-bit PCM low-latency streaming via AudioTrack
+ * - Manages Android AudioFocus (gain, transient loss / phone call interruption, clean abandon)
  * - Emits normalized audio amplitude (0f..1f) for real-time Arc Reactor visualization
  */
 class LiveAudioEngine(
-    private val onAmplitudeChanged: (Float) -> Unit = {}
+    private val context: Context? = null,
+    private val onAmplitudeChanged: (Float) -> Unit = {},
+    private val onAudioFocusLost: (Int) -> Unit = {}
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val audioManager: AudioManager? =
+        context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
     private var audioRecord: AudioRecord? = null
     private var echoCanceler: AcousticEchoCanceler? = null
@@ -37,15 +46,82 @@ class LiveAudioEngine(
     private var audioTrack: AudioTrack? = null
     private val playbackLock = Any()
 
+    private var focusRequest: AudioFocusRequest? = null
+    private var hasAudioFocus: Boolean = false
+
+    private val focusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                hasAudioFocus = false
+                stopAllPlayback()
+                onAudioFocusLost(focusChange)
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                // Lower transient interference gently without crashing
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                hasAudioFocus = true
+            }
+        }
+    }
+
     @Volatile
     var isMicMuted: Boolean = false
 
     @Volatile
     var isVoiceMuted: Boolean = false
 
+    fun requestVoiceAudioFocus(): Boolean {
+        val am = audioManager ?: return true
+        if (hasAudioFocus) return true
+        return try {
+            val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val attrs = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                    .setAudioAttributes(attrs)
+                    .setAcceptsDelayedFocusGain(false)
+                    .setOnAudioFocusChangeListener(focusChangeListener)
+                    .build()
+                focusRequest = req
+                am.requestAudioFocus(req)
+            } else {
+                @Suppress("DEPRECATION")
+                am.requestAudioFocus(
+                    focusChangeListener,
+                    AudioManager.STREAM_VOICE_CALL,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                )
+            }
+            hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+            hasAudioFocus
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    fun abandonVoiceAudioFocus() {
+        val am = audioManager ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                focusRequest?.let { am.abandonAudioFocusRequest(it) }
+                focusRequest = null
+            } else {
+                @Suppress("DEPRECATION")
+                am.abandonAudioFocus(focusChangeListener)
+            }
+        } catch (_: Exception) {
+        }
+        hasAudioFocus = false
+    }
+
     @SuppressLint("MissingPermission")
     fun startMicrophoneCapture(onBase64PcmChunk: (String) -> Unit): Boolean {
         stopMicrophoneCapture()
+        requestVoiceAudioFocus()
 
         val minBuf = AudioRecord.getMinBufferSize(
             INPUT_SAMPLE_RATE,
@@ -65,6 +141,7 @@ class LiveAudioEngine(
             )
             if (recorder.state != AudioRecord.STATE_INITIALIZED) {
                 recorder.release()
+                abandonVoiceAudioFocus()
                 return false
             }
 
@@ -124,6 +201,7 @@ class LiveAudioEngine(
         } catch (_: Exception) {
         }
         audioRecord = null
+        abandonVoiceAudioFocus()
         onAmplitudeChanged(0f)
     }
 
@@ -147,7 +225,7 @@ class LiveAudioEngine(
             val track = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )

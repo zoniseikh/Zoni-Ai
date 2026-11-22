@@ -9,7 +9,7 @@ import { PermissionsSetupModal } from './components/PermissionsSetupModal';
 import { ZoniSettingsModal, BackendHealthSnapshot } from './components/ZoniSettingsModal';
 import { SimCallingModal } from './components/SimCallingModal';
 import { ActionConfirmationCard, PendingActionDraftState } from './components/ActionConfirmationCard';
-import { AlertTriangle, RefreshCw, Settings2, X } from 'lucide-react';
+import { AlertTriangle, PhoneIncoming, PhoneOff, RefreshCw, Settings2, X } from 'lucide-react';
 import { OfflineIndicator } from './components/PWAInstallButton';
 import {
   LiveAudioPlayer,
@@ -63,7 +63,26 @@ import {
   performNativeAccessibilityDetailed,
   resolveAndroidPackageForQuery,
   buildAndroidIntentUrl,
+  getNativeWakeWordStatus,
+  startNativeBackgroundWakeWord,
+  stopNativeBackgroundWakeWord,
+  setNativeWakePhrase,
+  notifyNativeVoiceSessionState,
+  pauseNativeWakeWordForVoice,
+  resumeNativeWakeWordAfterVoice,
+  getNativeIncomingCallStatus,
+  answerNativeIncomingCall,
+  rejectNativeIncomingCall,
+  endNativeActiveCall,
+  requestNativeCallControlRole,
 } from './utils/androidBridge';
+import {
+  deriveVoiceLifecycleState,
+  stripWakePhraseFromCommand,
+  type WakeWordStatusSnapshot,
+  type IncomingCallStatusSnapshot,
+  type VoiceLifecycleState,
+} from './utils/voiceLifecycle';
 import { buildStructuredTaskPlan, TaskStep } from './utils/taskExecutionEngine';
 import {
   ASSISTANT_TOOL_SPECS,
@@ -263,6 +282,12 @@ function mapTaskStepToAssistantTool(
           message: String(step.args.message || ''),
         },
       };
+    case 'answer_incoming_call':
+      return { name: 'answer_incoming_call', args: {} };
+    case 'reject_incoming_call':
+      return { name: 'reject_incoming_call', args: {} };
+    case 'end_active_call':
+      return { name: 'end_active_call', args: {} };
     default:
       return null;
   }
@@ -276,6 +301,16 @@ export default function App() {
   const [sessionResumed, setSessionResumed] = useState<boolean>(false);
   const [backendHealth, setBackendHealth] = useState<BackendHealthSnapshot | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [wakeWordStatus, setWakeWordStatus] = useState<WakeWordStatusSnapshot | null>(() =>
+    getNativeWakeWordStatus()
+  );
+  const [incomingCallStatus, setIncomingCallStatus] = useState<IncomingCallStatusSnapshot | null>(
+    () => getNativeIncomingCallStatus()
+  );
+  const [callControlNotice, setCallControlNotice] = useState<string | null>(null);
+  const [isDisconnectingLive, setIsDisconnectingLive] = useState(false);
+  const liveStartInFlightRef = useRef(false);
+  const handleSendMessageRef = useRef<((text: string) => void) | null>(null);
 
   // Initialize global selectedAffectionName from localStorage, defaulting to "Boss" on first launch
   const [selectedAffectionName, setSelectedAffectionName] = useState<string>(() => {
@@ -746,6 +781,7 @@ export default function App() {
 
   // Stop only microphone audio capture while keeping the shared Gemini Live WebSocket session open
   const stopVoiceCapture = useCallback((preserveErrorState = false) => {
+    setIsDisconnectingLive(true);
     if (scriptProcessorRef.current) {
       try {
         scriptProcessorRef.current.disconnect();
@@ -768,9 +804,11 @@ export default function App() {
     }
     setIsLiveActive(false);
     isLiveActiveRef.current = false;
+    resumeNativeWakeWordAfterVoice();
     if (!preserveErrorState) {
       setAssistantState('idle');
     }
+    setIsDisconnectingLive(false);
   }, []);
 
   // Unified Allowlisted Android Personal Assistant Tool Executor (20 Tools, Strict Verification & Confirmation)
@@ -1423,6 +1461,51 @@ export default function App() {
               lang === 'bn-BD'
                 ? 'ইনস্টলড অ্যাপ যাচাইকরণ Android APK-তে PackageManager দিয়ে কাজ করে।'
                 : 'Installed app lookup requires the native Android APK.',
+          };
+        }
+        case 'answer_incoming_call':
+        case 'reject_incoming_call':
+        case 'end_active_call': {
+          const callActionResult =
+            req.actionType === 'answer_incoming_call'
+              ? answerNativeIncomingCall()
+              : req.actionType === 'reject_incoming_call'
+              ? rejectNativeIncomingCall()
+              : endNativeActiveCall();
+
+          const freshCallStatus = getNativeIncomingCallStatus();
+          if (freshCallStatus) {
+            setIncomingCallStatus(freshCallStatus);
+          }
+
+          if (callActionResult.status !== 'native_bridge_unavailable') {
+            return {
+              actionId: req.actionId,
+              actionType: req.actionType,
+              success: callActionResult.success,
+              verified: callActionResult.verified,
+              status: callActionResult.status,
+              message: callActionResult.message,
+              requiredPermissions: callActionResult.missingPermissions,
+              data: {
+                callState: callActionResult.resultingCallState,
+                requiresDefaultDialer: Boolean(callActionResult.requiresDialerRole),
+              },
+            };
+          }
+
+          return {
+            actionId: req.actionId,
+            actionType: req.actionType,
+            success: false,
+            verified: true,
+            status: 'native_android_required',
+            message:
+              lang === 'bn-BD'
+                ? 'ইনকামিং বা সক্রিয় ফোন কল নিয়ন্ত্রণ করতে ইনস্টল করা Android APK ও Telecom পারমিশন প্রয়োজন।'
+                : lang === 'hi-IN'
+                ? 'इनकमिंग या सक्रिय कॉल नियंत्रित करने के लिए इंस्टॉल किया गया Android APK और Telecom अनुमति आवश्यक है।'
+                : 'Controlling incoming or active phone calls requires the installed Android APK with Telecom permissions.',
           };
         }
         case 'cancel_current_task': {
@@ -2573,121 +2656,134 @@ export default function App() {
 
   // Start Live Voice microphone capture ONLY after the Gemini Live WebSocket handshake actually succeeds
   const startVoiceCapture = useCallback(async () => {
+    if (liveStartInFlightRef.current || isLiveActiveRef.current) {
+      return;
+    }
+    liveStartInFlightRef.current = true;
     stopVoiceCapture();
-    const configError = getBackendConfigError();
-    if (configError) {
-      setAssistantState('error');
-      setConnectionError(configError);
-      setLatestTranscript(configError);
-      return;
-    }
+    pauseNativeWakeWordForVoice();
 
-    setAssistantState('connecting');
-    setConnectionError(null);
-    setLatestTranscript(
-      activeLanguageRef.current === 'bn-BD'
-        ? `Gemini Live সার্ভারের সাথে সংযোগ করা হচ্ছে ${selectedAffectionNameRef.current}...`
-        : `Connecting to Gemini Live server, ${selectedAffectionNameRef.current}...`
-    );
-    getAudioContext();
-
-    // 1. Await real server 'connected' handshake BEFORE activating mic or showing LISTENING
     try {
-      await connectSharedLiveWs(wsStatusRef.current === 'error');
-    } catch (wsErr: any) {
-      const wsMsg =
-        wsErr?.message ||
-        'Could not establish Gemini Live WebSocket session. Verify backend health and server GEMINI_API_KEY.';
-      setAssistantState('error');
-      setConnectionError(wsMsg);
-      setLatestTranscript(wsMsg);
-      return;
-    }
-
-    // 2. Request microphone hardware stream
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          sampleRate: 16000,
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
-      });
-
-      // Re-verify WebSocket remained connected while user responded to mic prompt
-      if (
-        !wsRef.current ||
-        wsRef.current.readyState !== WebSocket.OPEN ||
-        !isSessionReadyRef.current
-      ) {
-        stream.getTracks().forEach((track) => track.stop());
-        const droppedMsg =
-          'Gemini Live connection closed before microphone capture started. Please retry.';
+      const configError = getBackendConfigError();
+      if (configError) {
         setAssistantState('error');
-        setConnectionError(droppedMsg);
-        setLatestTranscript(droppedMsg);
+        setConnectionError(configError);
+        setLatestTranscript(configError);
+        resumeNativeWakeWordAfterVoice();
         return;
       }
 
-      mediaStreamRef.current = stream;
+      setAssistantState('connecting');
+      setConnectionError(null);
+      setLatestTranscript(
+        activeLanguageRef.current === 'bn-BD'
+          ? `Gemini Live সার্ভারের সাথে সংযোগ করা হচ্ছে ${selectedAffectionNameRef.current}...`
+          : `Connecting to Gemini Live server, ${selectedAffectionNameRef.current}...`
+      );
+      getAudioContext();
 
-      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
-      const inputCtx = new AudioCtxClass({ sampleRate: 16000 });
-      inputAudioCtxRef.current = inputCtx;
-      const source = inputCtx.createMediaStreamSource(stream);
-      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-      scriptProcessorRef.current = processor;
+      // 1. Await real server 'connected' handshake BEFORE activating mic or showing LISTENING
+      try {
+        await connectSharedLiveWs(wsStatusRef.current === 'error');
+      } catch (wsErr: any) {
+        const wsMsg =
+          wsErr?.message ||
+          'Could not establish Gemini Live WebSocket session. Verify backend health and server GEMINI_API_KEY.';
+        setAssistantState('error');
+        setConnectionError(wsMsg);
+        setLatestTranscript(wsMsg);
+        resumeNativeWakeWordAfterVoice();
+        return;
+      }
 
-      processor.onaudioprocess = (e) => {
-        if (isMicMutedRef.current) return;
+      // 2. Request microphone hardware stream
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true,
+          },
+        });
+
+        // Re-verify WebSocket remained connected while user responded to mic prompt
         if (
           !wsRef.current ||
           wsRef.current.readyState !== WebSocket.OPEN ||
           !isSessionReadyRef.current
         ) {
-          // Stop capture immediately instead of silently discarding audio
-          stopVoiceCapture(true);
+          stream.getTracks().forEach((track) => track.stop());
+          const droppedMsg =
+            'Gemini Live connection closed before microphone capture started. Please retry.';
           setAssistantState('error');
-          setConnectionError(
-            'Live WebSocket connection lost — microphone stopped.'
-          );
+          setConnectionError(droppedMsg);
+          setLatestTranscript(droppedMsg);
+          resumeNativeWakeWordAfterVoice();
           return;
         }
-        const channelData = e.inputBuffer.getChannelData(0);
-        const base64Audio = pcm16ToBase64(channelData);
-        try {
-          wsRef.current.send(JSON.stringify({ audio: base64Audio }));
-        } catch {
-          stopVoiceCapture(true);
-          setAssistantState('error');
-          setConnectionError('Failed sending microphone audio to Gemini Live.');
-        }
-      };
 
-      source.connect(processor);
-      processor.connect(inputCtx.destination);
+        mediaStreamRef.current = stream;
 
-      setIsLiveActive(true);
-      isLiveActiveRef.current = true;
-      setAssistantState('listening');
-      const connectMsg =
-        activeLanguageRef.current === 'bn-BD'
-          ? `Zoni AI লাইভ ভয়েস সংযোগ স্থাপিত! বলুন ${selectedAffectionNameRef.current}, আমি শুনছি ❤️`
-          : `Zoni AI Live Link connected! Speak freely with me, ${selectedAffectionNameRef.current} ❤️`;
-      setLatestTranscript(connectMsg);
-    } catch (err: any) {
-      console.error('Failed to start Live Voice microphone:', err);
-      stopVoiceCapture(true);
-      setAssistantState('error');
-      checkAllPermissions().then((fresh) => setPermissionsReport(fresh));
-      const errMsg =
-        activeLanguageRef.current === 'bn-BD'
-          ? 'মাইক্রোফোন পারমিশন প্রয়োজন। Chrome Site Settings থেকে Allow করুন!'
-          : 'Microphone access is needed for live voice. Please allow microphone permissions.';
-      setConnectionError(errMsg);
-      setLatestTranscript(errMsg);
-      setIsPermissionsModalOpen(true);
+        const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+        const inputCtx = new AudioCtxClass({ sampleRate: 16000 });
+        inputAudioCtxRef.current = inputCtx;
+        const source = inputCtx.createMediaStreamSource(stream);
+        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+        scriptProcessorRef.current = processor;
+
+        processor.onaudioprocess = (e) => {
+          if (isMicMutedRef.current) return;
+          if (
+            !wsRef.current ||
+            wsRef.current.readyState !== WebSocket.OPEN ||
+            !isSessionReadyRef.current
+          ) {
+            // Stop capture immediately instead of silently discarding audio
+            stopVoiceCapture(true);
+            setAssistantState('error');
+            setConnectionError(
+              'Live WebSocket connection lost — microphone stopped.'
+            );
+            return;
+          }
+          const channelData = e.inputBuffer.getChannelData(0);
+          const base64Audio = pcm16ToBase64(channelData);
+          try {
+            wsRef.current.send(JSON.stringify({ audio: base64Audio }));
+          } catch {
+            stopVoiceCapture(true);
+            setAssistantState('error');
+            setConnectionError('Failed sending microphone audio to Gemini Live.');
+          }
+        };
+
+        source.connect(processor);
+        processor.connect(inputCtx.destination);
+
+        setIsLiveActive(true);
+        isLiveActiveRef.current = true;
+        setAssistantState('listening');
+        const connectMsg =
+          activeLanguageRef.current === 'bn-BD'
+            ? `Zoni AI লাইভ ভয়েস সংযোগ স্থাপিত! বলুন ${selectedAffectionNameRef.current}, আমি শুনছি ❤️`
+            : `Zoni AI Live Link connected! Speak freely with me, ${selectedAffectionNameRef.current} ❤️`;
+        setLatestTranscript(connectMsg);
+      } catch (err: any) {
+        console.error('Failed to start Live Voice microphone:', err);
+        stopVoiceCapture(true);
+        setAssistantState('error');
+        checkAllPermissions().then((fresh) => setPermissionsReport(fresh));
+        const errMsg =
+          activeLanguageRef.current === 'bn-BD'
+            ? 'মাইক্রোফোন পারমিশন প্রয়োজন। Chrome Site Settings থেকে Allow করুন!'
+            : 'Microphone access is needed for live voice. Please allow microphone permissions.';
+        setConnectionError(errMsg);
+        setLatestTranscript(errMsg);
+        setIsPermissionsModalOpen(true);
+      }
+    } finally {
+      liveStartInFlightRef.current = false;
     }
   }, [connectSharedLiveWs, stopVoiceCapture]);
 
@@ -3312,6 +3408,194 @@ export default function App() {
     });
   }, [checkBackendHealth, connectSharedLiveWs]);
 
+  useEffect(() => {
+    handleSendMessageRef.current = handleSendMessage;
+  }, [handleSendMessage]);
+
+  const voiceLifecycleState: VoiceLifecycleState = deriveVoiceLifecycleState({
+    wsStatus,
+    assistantState,
+    isLiveActive,
+    isDisconnecting: isDisconnectingLive,
+    wakeWordStatus,
+  });
+
+  useEffect(() => {
+    notifyNativeVoiceSessionState(voiceLifecycleState);
+  }, [voiceLifecycleState]);
+
+  useEffect(() => {
+    const syncNativeStatuses = () => {
+      const ww = getNativeWakeWordStatus();
+      if (ww) setWakeWordStatus(ww);
+      const cs = getNativeIncomingCallStatus();
+      if (cs) setIncomingCallStatus(cs);
+    };
+    syncNativeStatuses();
+
+    const onWakeWordStatus = (ev: Event) => {
+      const detail = (ev as CustomEvent<WakeWordStatusSnapshot>).detail;
+      if (detail && typeof detail === 'object') {
+        setWakeWordStatus(detail);
+      }
+    };
+
+    const onCallStateChanged = (ev: Event) => {
+      const detail = (ev as CustomEvent<IncomingCallStatusSnapshot>).detail;
+      if (detail && typeof detail === 'object') {
+        setIncomingCallStatus(detail);
+      }
+    };
+
+    const onVoiceStateChanged = () => {
+      const ww = getNativeWakeWordStatus();
+      if (ww) setWakeWordStatus(ww);
+    };
+
+    const onWakeWordDetected = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ wakeWord?: string; confidence?: number; remainingCommand?: string }>).detail || {};
+      const phrase = detail.wakeWord || wakeWordStatus?.wakePhrase || 'Zoni';
+      const cleanedRemainder = stripWakePhraseFromCommand(detail.remainingCommand || '', phrase);
+
+      if (cleanedRemainder) {
+        // Execute only the stripped command; never pass bare wake word as a command
+        handleSendMessageRef.current?.(cleanedRemainder);
+        return;
+      }
+
+      if (!isLiveActiveRef.current && !liveStartInFlightRef.current) {
+        setLatestTranscript(
+          activeLanguageRef.current === 'bn-BD'
+            ? `"${phrase}" ওয়েক ওয়ার্ড শনাক্ত হয়েছে — Gemini Live চালু হচ্ছে...`
+            : `Wake word "${phrase}" detected — activating Gemini Live...`
+        );
+        void startVoiceCapture();
+      }
+    };
+
+    window.addEventListener('zoni:wake-word-status', onWakeWordStatus);
+    window.addEventListener('zoni:call-state-changed', onCallStateChanged);
+    window.addEventListener('zoni:voice-state-changed', onVoiceStateChanged);
+    window.addEventListener('zoni:wake-word-detected', onWakeWordDetected);
+
+    return () => {
+      window.removeEventListener('zoni:wake-word-status', onWakeWordStatus);
+      window.removeEventListener('zoni:call-state-changed', onCallStateChanged);
+      window.removeEventListener('zoni:voice-state-changed', onVoiceStateChanged);
+      window.removeEventListener('zoni:wake-word-detected', onWakeWordDetected);
+    };
+  }, [startVoiceCapture, wakeWordStatus?.wakePhrase]);
+
+  const handleStartBackgroundWakeWord = useCallback(() => {
+    const result = startNativeBackgroundWakeWord();
+    const fresh = getNativeWakeWordStatus();
+    if (fresh) {
+      setWakeWordStatus(fresh);
+    } else {
+      setWakeWordStatus((prev) => ({
+        wakeWordEnabled: false,
+        backgroundServiceRunning: false,
+        listening: false,
+        wakePhrase: prev?.wakePhrase || 'Zoni',
+        voiceState: 'IDLE',
+        micPermissionGranted: false,
+        notificationPermissionGranted: false,
+        detectorEngine: 'on_device_two_stage_acoustic_gate',
+        lastDetectedAtMs: prev?.lastDetectedAtMs ?? 0,
+        lastConfidence: prev?.lastConfidence ?? 0,
+        lastError:
+          result.message ||
+          '24-hour background wake word listening requires the installed ZONI Android APK.',
+      }));
+    }
+    if (!result.success && result.message) {
+      setLatestTranscript(result.message);
+    }
+  }, []);
+
+  const handleStopBackgroundWakeWord = useCallback(() => {
+    stopNativeBackgroundWakeWord();
+    const fresh = getNativeWakeWordStatus();
+    if (fresh) {
+      setWakeWordStatus(fresh);
+    } else {
+      setWakeWordStatus((prev) =>
+        prev
+          ? {
+              ...prev,
+              wakeWordEnabled: false,
+              backgroundServiceRunning: false,
+              listening: false,
+              voiceState: 'DISABLED',
+            }
+          : null
+      );
+    }
+  }, []);
+
+  const handleUpdateWakePhrase = useCallback((phrase: string) => {
+    const cleaned = phrase.trim() || 'Zoni';
+    setNativeWakePhrase(cleaned);
+    const fresh = getNativeWakeWordStatus();
+    if (fresh) {
+      setWakeWordStatus(fresh);
+    } else {
+      setWakeWordStatus((prev) => ({
+        wakeWordEnabled: prev?.wakeWordEnabled ?? false,
+        backgroundServiceRunning: prev?.backgroundServiceRunning ?? false,
+        listening: prev?.listening ?? false,
+        wakePhrase: cleaned,
+        voiceState: prev?.voiceState || 'IDLE',
+        micPermissionGranted: prev?.micPermissionGranted ?? false,
+        notificationPermissionGranted: prev?.notificationPermissionGranted ?? false,
+        detectorEngine: prev?.detectorEngine || 'on_device_two_stage_acoustic_gate',
+        lastDetectedAtMs: prev?.lastDetectedAtMs ?? 0,
+        lastConfidence: prev?.lastConfidence ?? 0,
+        lastError: prev?.lastError || '',
+      }));
+    }
+  }, []);
+
+  const handleRefreshCallStatus = useCallback(() => {
+    const fresh = getNativeIncomingCallStatus();
+    if (fresh) {
+      setIncomingCallStatus(fresh);
+      setCallControlNotice(null);
+    } else {
+      setCallControlNotice('Live Telecom call state requires the installed Android APK.');
+    }
+  }, []);
+
+  const handleCallControlAction = useCallback(
+    async (action: 'answer_incoming_call' | 'reject_incoming_call' | 'end_active_call') => {
+      const report = await executeValidatedAssistantTool(action, {});
+      setCallControlNotice(report.message);
+      setLatestTranscript(report.message);
+      const fresh = getNativeIncomingCallStatus();
+      if (fresh) setIncomingCallStatus(fresh);
+    },
+    [executeValidatedAssistantTool]
+  );
+
+  const handleRequestCallPermissions = useCallback(() => {
+    const bridge = getNativeAndroidBridge();
+    if (bridge?.requestRuntimePermission) {
+      bridge.requestRuntimePermission('call_control');
+      setCallControlNotice('Requested Android phone call permissions (READ_PHONE_STATE & ANSWER_PHONE_CALLS).');
+    } else {
+      setCallControlNotice('Android phone permissions can only be requested inside the installed APK.');
+    }
+  }, []);
+
+  const handleRequestDialerRole = useCallback(() => {
+    const started = requestNativeCallControlRole();
+    setCallControlNotice(
+      started
+        ? 'Opened Android Call Control / Default Dialer role request.'
+        : 'Default Dialer role prompt is available only inside the installed Android APK.'
+    );
+  }, []);
+
   return (
     <div className="relative min-h-screen w-full bg-slate-950 text-cyan-50 flex flex-col justify-between overflow-x-hidden selection:bg-pink-500/30 selection:text-pink-200">
       {/* Background Animated Sci-Fi Ambient Glow & Grid */}
@@ -3351,6 +3635,60 @@ export default function App() {
             onReactorClick={handleReactorClick}
           />
         </div>
+
+        {/* Live Incoming / Active Phone Call Control Strip (Shown ONLY when Android Telecom reports RINGING or ACTIVE) */}
+        {(incomingCallStatus?.isIncomingRinging || incomingCallStatus?.isActiveCall) && (
+          <div
+            data-testid="live-call-control-strip"
+            className="w-full max-w-2xl mt-3 px-4 py-3 rounded-2xl bg-emerald-950/90 border border-emerald-400/60 text-emerald-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-[0_0_25px_rgba(16,185,129,0.25)]"
+          >
+            <div className="flex items-center gap-2.5 min-w-0">
+              <PhoneIncoming className="w-5 h-5 text-emerald-300 shrink-0" />
+              <div className="min-w-0">
+                <div className="font-sci-fi text-xs font-bold tracking-wider uppercase text-emerald-200">
+                  {incomingCallStatus.isIncomingRinging ? 'INCOMING PHONE CALL' : 'ACTIVE PHONE CALL'}
+                </div>
+                <div className="text-xs text-emerald-100/90 truncate">
+                  {incomingCallStatus.callerDisplayName ||
+                    incomingCallStatus.callerNumber ||
+                    incomingCallStatus.callState}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {incomingCallStatus.isIncomingRinging && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void handleCallControlAction('answer_incoming_call')}
+                    className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-hud text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <PhoneIncoming className="w-3.5 h-3.5" />
+                    <span>ANSWER</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleCallControlAction('reject_incoming_call')}
+                    className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-hud text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <PhoneOff className="w-3.5 h-3.5" />
+                    <span>REJECT</span>
+                  </button>
+                </>
+              )}
+              {incomingCallStatus.isActiveCall && (
+                <button
+                  type="button"
+                  onClick={() => void handleCallControlAction('end_active_call')}
+                  className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-hud text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <PhoneOff className="w-3.5 h-3.5" />
+                  <span>END CALL</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Interactive Review / Edit / Cancel / Approve Card for WhatsApp, SMS & Calls */}
         <ActionConfirmationCard
@@ -3433,6 +3771,14 @@ export default function App() {
         soundFxEnabled={vitals.soundFxEnabled}
         selectedAffectionName={selectedAffectionName}
         activeLanguage={activeLanguage}
+        incomingCallStatus={incomingCallStatus}
+        onAnswerIncomingCall={() => void handleCallControlAction('answer_incoming_call')}
+        onRejectIncomingCall={() => void handleCallControlAction('reject_incoming_call')}
+        onEndActiveCall={() => void handleCallControlAction('end_active_call')}
+        onRefreshCallStatus={handleRefreshCallStatus}
+        onRequestCallPermissions={handleRequestCallPermissions}
+        onRequestDialerRole={handleRequestDialerRole}
+        callControlNotice={callControlNotice}
       />
 
       {/* APK & Mobile Assistant Export Hub Modal */}
@@ -3445,7 +3791,7 @@ export default function App() {
         selectedAffectionName={selectedAffectionName}
       />
 
-      {/* Clean Zoni Jarvis Settings Modal (Soul Core, Personality Matrix, Voice Modulator, Telemetry, Device Action Diagnostics) */}
+      {/* Clean Zoni Jarvis Settings Modal (Soul Core, Personality Matrix, Voice Modulator, Wake Word, Telemetry, Device Action Diagnostics) */}
       <ZoniSettingsModal
         isOpen={isSettingsModalOpen}
         onClose={() => setIsSettingsModalOpen(false)}
@@ -3455,6 +3801,29 @@ export default function App() {
         wsStatus={wsStatus}
         backendHealth={backendHealth}
         deviceDiagnostics={deviceDiagnostics}
+        wakeWordStatus={wakeWordStatus}
+        voiceLifecycleState={voiceLifecycleState}
+        onStartBackgroundWakeWord={handleStartBackgroundWakeWord}
+        onStopBackgroundWakeWord={handleStopBackgroundWakeWord}
+        onUpdateWakePhrase={handleUpdateWakePhrase}
+        onToggleLiveMode={handleToggleLiveMode}
+        onOpenBatterySettings={() => {
+          const bridge = getNativeAndroidBridge();
+          if (bridge?.openSystemSettings) {
+            bridge.openSystemSettings('battery');
+          } else {
+            setIsSettingsModalOpen(false);
+            setIsPermissionsModalOpen(true);
+          }
+        }}
+        onRequestMicPermission={() => {
+          const bridge = getNativeAndroidBridge();
+          if (bridge?.requestRuntimePermission) {
+            bridge.requestRuntimePermission('microphone');
+          } else {
+            void requestMicrophoneAccess();
+          }
+        }}
         onSelectMode={handleSelectMode}
         onUpdateAffectionName={handleUpdateAffectionName}
         onSelectVoice={handleSelectVoice}

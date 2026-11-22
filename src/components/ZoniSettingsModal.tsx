@@ -5,6 +5,8 @@ import { PREDEFINED_AFFECTION_OPTIONS } from './GfStatusPanel';
 import { WsConnectionStatus } from '../utils/liveSessionProtocol';
 import { getDisplayBackendUrl, getBackendConfigError } from '../utils/apiConfig';
 import type { DeviceActionDiagnosticsState } from '../utils/liveToolRelay';
+import { ASSISTANT_TOOL_SPECS } from '../utils/assistantActionRegistry';
+import type { WakeWordStatusSnapshot, VoiceLifecycleState } from '../utils/voiceLifecycle';
 import {
   X,
   Settings,
@@ -12,6 +14,7 @@ import {
   Shield,
   Moon,
   Smile,
+  Mic,
   Mic2,
   Radio,
   Check,
@@ -23,6 +26,12 @@ import {
   AlertTriangle,
   Activity,
   ExternalLink,
+  Power,
+  Battery,
+  Bell,
+  Play,
+  Square,
+  Save,
 } from 'lucide-react';
 
 export interface BackendHealthSnapshot {
@@ -51,6 +60,14 @@ interface ZoniSettingsModalProps {
   onOpenBackendSetup?: () => void;
   onRefreshDiagnostics?: () => void;
   onOpenAccessibilitySettings?: () => void;
+  wakeWordStatus?: WakeWordStatusSnapshot | null;
+  voiceLifecycleState?: VoiceLifecycleState;
+  onStartBackgroundWakeWord?: () => void;
+  onStopBackgroundWakeWord?: () => void;
+  onUpdateWakePhrase?: (phrase: string) => void;
+  onToggleLiveMode?: () => void;
+  onOpenBatterySettings?: () => void;
+  onRequestMicPermission?: () => void;
 }
 
 export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
@@ -70,13 +87,29 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
   onOpenBackendSetup,
   onRefreshDiagnostics,
   onOpenAccessibilitySettings,
+  wakeWordStatus,
+  voiceLifecycleState = 'IDLE',
+  onStartBackgroundWakeWord,
+  onStopBackgroundWakeWord,
+  onUpdateWakePhrase,
+  onToggleLiveMode,
+  onOpenBatterySettings,
+  onRequestMicPermission,
 }) => {
   const [isEditingCustom, setIsEditingCustom] = useState(false);
   const [customInput, setCustomInput] = useState(selectedAffectionName || 'Boss');
+  const [wakePhraseInput, setWakePhraseInput] = useState(wakeWordStatus?.wakePhrase || 'Zoni');
+  const [wakePhraseSavedNotice, setWakePhraseSavedNotice] = useState<string | null>(null);
 
   useEffect(() => {
     setCustomInput(selectedAffectionName || 'Boss');
   }, [selectedAffectionName]);
+
+  useEffect(() => {
+    if (wakeWordStatus?.wakePhrase) {
+      setWakePhraseInput(wakeWordStatus.wakePhrase);
+    }
+  }, [wakeWordStatus?.wakePhrase]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -429,10 +462,233 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
             )}
           </section>
 
-          {/* SECTION 4: PROTOCOL & TELEMETRY SPECS */}
+          {/* SECTION 4: WAKE WORD & 24-HOUR BACKGROUND LISTENING */}
+          <section
+            data-testid="wake-word-settings-section"
+            className="p-4 rounded-xl bg-slate-900/60 border border-pink-500/30 space-y-3 font-mono text-xs"
+          >
+            <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-pink-500/20">
+              <div className="flex items-center gap-2 min-w-0">
+                <Mic className="w-4 h-4 text-pink-400 shrink-0" />
+                <h4 className="font-sci-fi text-[11px] text-pink-300 tracking-wider uppercase truncate">
+                  4. On-Device Wake Word &amp; Background Service (&quot;Zoni&quot;)
+                </h4>
+              </div>
+              <span
+                data-testid="wake-word-voice-state"
+                className={`text-[10px] font-bold px-2 py-0.5 rounded border shrink-0 ${
+                  voiceLifecycleState === 'ERROR'
+                    ? 'bg-rose-950/60 border-rose-500/50 text-rose-300'
+                    : voiceLifecycleState === 'WAKE_WORD_LISTENING' ||
+                      voiceLifecycleState === 'LISTENING' ||
+                      voiceLifecycleState === 'CONNECTED'
+                    ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300'
+                    : voiceLifecycleState === 'SPEAKING' ||
+                      voiceLifecycleState === 'PROCESSING' ||
+                      voiceLifecycleState === 'WAKE_WORD_DETECTED'
+                    ? 'bg-cyan-950/60 border-cyan-500/50 text-cyan-300'
+                    : 'bg-slate-950 border-slate-700 text-slate-300'
+                }`}
+              >
+                {voiceLifecycleState}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div className="p-2.5 rounded-lg bg-slate-950/70 border border-cyan-500/15 flex items-center justify-between gap-2">
+                <span className="text-slate-400">WAKE WORD:</span>
+                <span
+                  data-testid="wake-word-enabled-status"
+                  className={
+                    wakeWordStatus?.wakeWordEnabled ? 'text-emerald-400 font-bold' : 'text-slate-400 font-bold'
+                  }
+                >
+                  {wakeWordStatus?.wakeWordEnabled ? 'ENABLED' : 'DISABLED'}
+                </span>
+              </div>
+              <div className="p-2.5 rounded-lg bg-slate-950/70 border border-cyan-500/15 flex items-center justify-between gap-2">
+                <span className="text-slate-400">DETECTOR:</span>
+                <span
+                  data-testid="wake-word-listening-status"
+                  className={
+                    wakeWordStatus?.listening
+                      ? 'text-emerald-400 font-bold'
+                      : isLiveActive
+                      ? 'text-cyan-300 font-bold'
+                      : 'text-slate-400 font-bold'
+                  }
+                >
+                  {wakeWordStatus?.listening
+                    ? 'LISTENING (ON-DEVICE)'
+                    : isLiveActive
+                    ? 'PAUSED FOR LIVE VOICE'
+                    : 'NOT LISTENING'}
+                </span>
+              </div>
+              <div className="p-2.5 rounded-lg bg-slate-950/70 border border-cyan-500/15 flex items-center justify-between gap-2">
+                <span className="text-slate-400">MIC PERMISSION:</span>
+                <span
+                  className={
+                    wakeWordStatus?.micPermissionGranted
+                      ? 'text-emerald-400 font-bold'
+                      : deviceDiagnostics?.bridgeConnected
+                      ? 'text-amber-300 font-bold'
+                      : 'text-slate-400 font-bold'
+                  }
+                >
+                  {wakeWordStatus?.micPermissionGranted
+                    ? 'GRANTED'
+                    : deviceDiagnostics?.bridgeConnected
+                    ? 'REQUIRED'
+                    : 'ANDROID APK ONLY'}
+                </span>
+              </div>
+              <div className="p-2.5 rounded-lg bg-slate-950/70 border border-cyan-500/15 flex items-center justify-between gap-2">
+                <span className="text-slate-400">FOREGROUND SERVICE:</span>
+                <span
+                  className={
+                    wakeWordStatus?.backgroundServiceRunning
+                      ? 'text-emerald-400 font-bold'
+                      : 'text-slate-400 font-bold'
+                  }
+                >
+                  {wakeWordStatus?.backgroundServiceRunning
+                    ? 'RUNNING (VISIBLE NOTIFICATION)'
+                    : 'STOPPED'}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-pink-500/10">
+              <span className="text-slate-400 flex items-center gap-1.5">
+                <Bell className="w-3.5 h-3.5 text-cyan-400" />
+                <span>NOTIFICATION STATUS:</span>
+              </span>
+              <span className="text-cyan-200 font-bold text-right">
+                {wakeWordStatus?.backgroundServiceRunning
+                  ? 'VISIBLE (OPEN ZONI / STOP LISTENING)'
+                  : !deviceDiagnostics?.bridgeConnected
+                  ? 'ANDROID APK ONLY'
+                  : wakeWordStatus?.notificationPermissionGranted === false
+                  ? 'POST_NOTIFICATIONS NEEDED'
+                  : 'INACTIVE'}
+              </span>
+            </div>
+
+            {/* Configurable Wake Phrase (Default: Zoni) */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const cleaned = wakePhraseInput.trim() || 'Zoni';
+                setWakePhraseInput(cleaned);
+                if (onUpdateWakePhrase) {
+                  onUpdateWakePhrase(cleaned);
+                  setWakePhraseSavedNotice(`Wake word set to "${cleaned}"`);
+                  window.setTimeout(() => setWakePhraseSavedNotice(null), 2500);
+                }
+              }}
+              className="flex items-center gap-2 pt-1"
+            >
+              <label htmlFor="zoni-wake-phrase-input" className="text-slate-400 shrink-0">
+                WAKE PHRASE:
+              </label>
+              <input
+                id="zoni-wake-phrase-input"
+                type="text"
+                value={wakePhraseInput}
+                onChange={(e) => setWakePhraseInput(e.target.value)}
+                placeholder="Zoni"
+                className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-pink-500/40 text-xs text-pink-100 focus:outline-none focus:border-pink-400"
+              />
+              <button
+                type="submit"
+                className="shrink-0 px-3 py-1.5 rounded-lg bg-pink-600 hover:bg-pink-500 text-white font-hud text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>SAVE</span>
+              </button>
+            </form>
+
+            {wakePhraseSavedNotice && (
+              <p className="text-[11px] font-sans text-emerald-300">{wakePhraseSavedNotice}</p>
+            )}
+
+            {wakeWordStatus?.lastError && (
+              <div className="p-2 rounded-lg bg-amber-950/40 border border-amber-500/40 text-amber-200 font-sans text-[11px] flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <span>{wakeWordStatus.lastError}</span>
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-2 pt-1 font-hud">
+              {wakeWordStatus?.backgroundServiceRunning || wakeWordStatus?.wakeWordEnabled ? (
+                <button
+                  type="button"
+                  onClick={onStopBackgroundWakeWord}
+                  className="px-3 py-1.5 rounded-lg border border-rose-500/50 bg-rose-950/60 hover:bg-rose-900/60 text-rose-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Power className="w-3.5 h-3.5" />
+                  <span>STOP BACKGROUND LISTENING</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={onStartBackgroundWakeWord}
+                  className="px-3 py-1.5 rounded-lg border border-emerald-500/50 bg-emerald-950/60 hover:bg-emerald-900/60 text-emerald-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Power className="w-3.5 h-3.5" />
+                  <span>ENABLE 24H BACKGROUND &quot;ZONI&quot;</span>
+                </button>
+              )}
+
+              {onToggleLiveMode && (
+                <button
+                  type="button"
+                  onClick={onToggleLiveMode}
+                  className="px-3 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-950/50 hover:bg-cyan-900/60 text-cyan-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                >
+                  {isLiveActive ? <Square className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                  <span>{isLiveActive ? 'STOP ASSISTANT' : 'START ASSISTANT'}</span>
+                </button>
+              )}
+
+              {onOpenBatterySettings && (
+                <button
+                  type="button"
+                  onClick={onOpenBatterySettings}
+                  className="px-3 py-1.5 rounded-lg border border-amber-500/40 bg-amber-950/50 hover:bg-amber-900/60 text-amber-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Battery className="w-3.5 h-3.5" />
+                  <span>BATTERY OPTIMIZATION</span>
+                </button>
+              )}
+
+              {onRequestMicPermission &&
+                deviceDiagnostics?.bridgeConnected &&
+                wakeWordStatus &&
+                !wakeWordStatus.micPermissionGranted && (
+                  <button
+                    type="button"
+                    onClick={onRequestMicPermission}
+                    className="px-3 py-1.5 rounded-lg border border-pink-500/40 bg-pink-950/50 hover:bg-pink-900/60 text-pink-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Mic className="w-3.5 h-3.5" />
+                    <span>GRANT MIC PERMISSION</span>
+                  </button>
+                )}
+            </div>
+
+            <p className="text-[10px] font-sans text-slate-400 leading-relaxed">
+              On-device wake word detection listens locally only for &ldquo;{wakeWordStatus?.wakePhrase || 'Zoni'}&rdquo; (জোনি)
+              with a persistent Android microphone notification and never streams ambient audio to Gemini until triggered.
+              On Android 12–14+, disable battery optimization for reliable background uptime.
+            </p>
+          </section>
+
+          {/* SECTION 5: PROTOCOL & TELEMETRY SPECS */}
           <section className="p-4 rounded-xl bg-slate-900/60 border border-cyan-500/30 space-y-2.5 font-mono text-xs">
             <h4 className="font-sci-fi text-[11px] text-cyan-300 tracking-wider uppercase block pb-1 border-b border-cyan-500/20">
-              4. System Telemetry &amp; Protocol Specifications:
+              5. System Telemetry &amp; Protocol Specifications:
             </h4>
             <div className="flex items-center justify-between gap-2 py-1 border-b border-cyan-500/10">
               <span className="text-slate-400 shrink-0">PROTOCOL:</span>
@@ -517,7 +773,7 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
               <div className="flex items-center gap-2 min-w-0">
                 <Activity className="w-4 h-4 text-emerald-400 shrink-0" />
                 <h4 className="font-sci-fi text-[11px] text-emerald-300 tracking-wider uppercase truncate">
-                  5. Device Action Diagnostics (রিয়েল-টাইম ডায়াগনস্টিক্স)
+                  6. Device Action Diagnostics (রিয়েল-টাইম ডায়াগনস্টিক্স)
                 </h4>
               </div>
               {onRefreshDiagnostics && (
@@ -570,7 +826,7 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
                 }
               >
                 {deviceDiagnostics?.geminiToolCallingAvailable
-                  ? `AVAILABLE (${deviceDiagnostics.declaredToolsCount || 25} TOOLS)`
+                  ? `AVAILABLE (${deviceDiagnostics.declaredToolsCount || ASSISTANT_TOOL_SPECS.length} TOOLS)`
                   : 'UNAVAILABLE'}
               </span>
             </div>

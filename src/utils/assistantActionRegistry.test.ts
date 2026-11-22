@@ -7,8 +7,8 @@ import {
   formatLocalizedActionOutcome,
 } from './assistantActionRegistry.ts';
 
-test('Category A & C & E: Registry declares all 33 allowlisted Android personal assistant tools', () => {
-  assert.equal(ASSISTANT_TOOL_SPECS.length, 33);
+test('Category A & C & E: Registry declares all 36 allowlisted Android personal assistant tools', () => {
+  assert.equal(ASSISTANT_TOOL_SPECS.length, 36);
   const expectedTools = [
     'list_installed_apps',
     'open_app',
@@ -43,6 +43,9 @@ test('Category A & C & E: Registry declares all 33 allowlisted Android personal 
     'type_whatsapp_message',
     'send_whatsapp_message',
     'verify_whatsapp_send',
+    'answer_incoming_call',
+    'reject_incoming_call',
+    'end_active_call',
   ];
   for (const name of expectedTools) {
     assert.equal(isAllowlistedAssistantTool(name), true, `Expected ${name} to be allowlisted`);
@@ -427,5 +430,41 @@ test('Part 1 & 2: New YouTube Click and WhatsApp Smart Contact/Send tools valida
     'Boss'
   );
   assert.ok(sendBtnMissing.includes('Send'));
+});
+
+test('Incoming & Active Call Control tools validate cleanly and format honest Android Telecom outcomes', () => {
+  for (const tool of ['answer_incoming_call', 'reject_incoming_call', 'end_active_call']) {
+    const res = validateGeminiToolCall(tool, {});
+    assert.equal(res.valid, true, `Expected ${tool} to validate`);
+    assert.equal(res.request?.requiresConfirmation, false);
+  }
+
+  const answeredBn = formatLocalizedActionOutcome(
+    {
+      actionId: 'call_ans',
+      actionType: 'answer_incoming_call',
+      success: true,
+      verified: true,
+      status: 'call_answered',
+      message: 'Call answered',
+    },
+    'bn-BD',
+    'Boss'
+  );
+  assert.ok(answeredBn.includes('রিসিভ') || answeredBn.includes('কল'));
+
+  const noIncomingEn = formatLocalizedActionOutcome(
+    {
+      actionId: 'call_none',
+      actionType: 'answer_incoming_call',
+      success: false,
+      verified: true,
+      status: 'no_incoming_call',
+      message: 'No incoming call is ringing right now.',
+    },
+    'en-US',
+    'Boss'
+  );
+  assert.ok(noIncomingEn.toLowerCase().includes('no incoming') || noIncomingEn.toLowerCase().includes('ringing'));
 });
 

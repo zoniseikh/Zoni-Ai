@@ -27,9 +27,11 @@ class ZoniCallScreeningService : CallScreeningService() {
         }
 
         if (direction == Call.Details.DIRECTION_INCOMING) {
+            CallStateHub.reportScreenedIncomingCall(number)
             postIncomingCallNotification(number)
         }
 
+        // Never silently reject incoming calls during screening
         val response = CallResponse.Builder()
             .setDisallowCall(false)
             .setRejectCall(false)

@@ -54,7 +54,10 @@ enum class AllowedActionType(
     OPEN_WHATSAPP_CHAT("open_whatsapp_chat", listOf("ACCESSIBILITY_SERVICE"), false, 6000L),
     TYPE_WHATSAPP_MESSAGE("type_whatsapp_message", listOf("ACCESSIBILITY_SERVICE"), false, 6000L),
     SEND_WHATSAPP_MESSAGE("send_whatsapp_message", listOf("ACCESSIBILITY_SERVICE"), false, 8000L),
-    VERIFY_WHATSAPP_SEND("verify_whatsapp_send", listOf("ACCESSIBILITY_SERVICE"), false, 4000L);
+    VERIFY_WHATSAPP_SEND("verify_whatsapp_send", listOf("ACCESSIBILITY_SERVICE"), false, 4000L),
+    ANSWER_INCOMING_CALL("answer_incoming_call", listOf("READ_PHONE_STATE", "ANSWER_PHONE_CALLS"), false, 4000L),
+    REJECT_INCOMING_CALL("reject_incoming_call", listOf("READ_PHONE_STATE", "ANSWER_PHONE_CALLS"), false, 4000L),
+    END_ACTIVE_CALL("end_active_call", listOf("READ_PHONE_STATE", "ANSWER_PHONE_CALLS"), false, 4000L);
 
     companion object {
         fun fromToolName(name: String?): AllowedActionType? {

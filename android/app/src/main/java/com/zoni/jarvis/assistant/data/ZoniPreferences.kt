@@ -29,6 +29,9 @@ data class ZoniUserSettings(
     val soundFxEnabled: Boolean = true,
     val onboardingCompleted: Boolean = false,
     val floatingOrbEnabled: Boolean = false,
+    val wakeWordEnabled: Boolean = false,
+    val backgroundListeningEnabled: Boolean = false,
+    val wakePhrase: String = "Zoni",
     val backendServerUrl: String = DEFAULT_BACKEND_URL
 ) {
     companion object {
@@ -60,7 +63,14 @@ class ZoniPreferences(private val context: Context) {
         val SOUND_FX = booleanPreferencesKey("zoni_sound_fx")
         val ONBOARDING_DONE = booleanPreferencesKey("zoni_onboarding_completed")
         val FLOATING_ORB = booleanPreferencesKey("zoni_floating_orb_enabled")
+        val WAKE_WORD_ENABLED = booleanPreferencesKey("zoni_wake_word_enabled")
+        val BACKGROUND_LISTENING_ENABLED = booleanPreferencesKey("zoni_background_listening_enabled")
+        val WAKE_PHRASE = stringPreferencesKey("zoni_wake_phrase")
         val BACKEND_URL = stringPreferencesKey("zoni_backend_url")
+    }
+
+    private val syncPrefs: SharedPreferences by lazy {
+        context.getSharedPreferences("zoni_wake_sync_prefs", Context.MODE_PRIVATE)
     }
 
     private val encryptedPrefs: SharedPreferences by lazy {
@@ -91,6 +101,9 @@ class ZoniPreferences(private val context: Context) {
             soundFxEnabled = prefs[Keys.SOUND_FX] ?: true,
             onboardingCompleted = prefs[Keys.ONBOARDING_DONE] ?: false,
             floatingOrbEnabled = prefs[Keys.FLOATING_ORB] ?: false,
+            wakeWordEnabled = prefs[Keys.WAKE_WORD_ENABLED] ?: isWakeWordEnabledSync(),
+            backgroundListeningEnabled = prefs[Keys.BACKGROUND_LISTENING_ENABLED] ?: isBackgroundListeningEnabledSync(),
+            wakePhrase = prefs[Keys.WAKE_PHRASE]?.takeIf { it.isNotBlank() } ?: getWakePhraseSync(),
             backendServerUrl = prefs[Keys.BACKEND_URL]
                 ?.takeIf { ZoniUserSettings.isValidProductionBackendUrl(it) }
                 ?: ZoniUserSettings.DEFAULT_BACKEND_URL
@@ -134,6 +147,42 @@ class ZoniPreferences(private val context: Context) {
         context.zoniDataStore.edit { it[Keys.FLOATING_ORB] = enabled }
     }
 
+    suspend fun setWakeWordEnabled(enabled: Boolean) {
+        setWakeWordEnabledSync(enabled)
+        context.zoniDataStore.edit { it[Keys.WAKE_WORD_ENABLED] = enabled }
+    }
+
+    suspend fun setBackgroundListeningEnabled(enabled: Boolean) {
+        setBackgroundListeningEnabledSync(enabled)
+        context.zoniDataStore.edit { it[Keys.BACKGROUND_LISTENING_ENABLED] = enabled }
+    }
+
+    suspend fun setWakePhrase(phrase: String) {
+        val clean = phrase.trim().ifBlank { "Zoni" }
+        setWakePhraseSync(clean)
+        context.zoniDataStore.edit { it[Keys.WAKE_PHRASE] = clean }
+    }
+
+    fun isWakeWordEnabledSync(): Boolean = syncPrefs.getBoolean(SYNC_WAKE_WORD_ENABLED, false)
+
+    fun setWakeWordEnabledSync(enabled: Boolean) {
+        syncPrefs.edit().putBoolean(SYNC_WAKE_WORD_ENABLED, enabled).apply()
+    }
+
+    fun isBackgroundListeningEnabledSync(): Boolean = syncPrefs.getBoolean(SYNC_BG_LISTENING_ENABLED, false)
+
+    fun setBackgroundListeningEnabledSync(enabled: Boolean) {
+        syncPrefs.edit().putBoolean(SYNC_BG_LISTENING_ENABLED, enabled).apply()
+    }
+
+    fun getWakePhraseSync(): String =
+        syncPrefs.getString(SYNC_WAKE_PHRASE, "Zoni")?.trim()?.ifBlank { "Zoni" } ?: "Zoni"
+
+    fun setWakePhraseSync(phrase: String) {
+        val clean = phrase.trim().ifBlank { "Zoni" }
+        syncPrefs.edit().putString(SYNC_WAKE_PHRASE, clean).apply()
+    }
+
     suspend fun setBackendServerUrl(url: String) {
         val clean = url.trim().trimEnd('/')
         if (ZoniUserSettings.isValidProductionBackendUrl(clean)) {
@@ -150,5 +199,8 @@ class ZoniPreferences(private val context: Context) {
 
     companion object {
         private const val KEY_GEMINI_API = "zoni_encrypted_gemini_api_key"
+        private const val SYNC_WAKE_WORD_ENABLED = "zoni_sync_wake_word_enabled"
+        private const val SYNC_BG_LISTENING_ENABLED = "zoni_sync_bg_listening_enabled"
+        private const val SYNC_WAKE_PHRASE = "zoni_sync_wake_phrase"
     }
 }

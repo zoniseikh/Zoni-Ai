@@ -27,7 +27,7 @@ class CommandDispatcher {
      */
     fun stripWakeWord(rawText: String): String {
         return rawText.trim()
-            .replace(Regex("^(?:hey\\s+|ওহে\\s+|হেই\\s+)?(?:zoni\\s*ai|zoni|জনি\\s*এআই|জনি|ज़ोनी\\s*एआई|ज़ोनी)\\s*[,:\\-!।]*\\s*", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("^(?:hey\\s+|ওহে\\s+|হেই\\s+)?(?:zoni\\s*ai|zoni|জোনি\\s*এআই|জোনি|জনি\\s*এআই|জনি|ज़ोनी\\s*एआई|ज़ोनी|जोनी)\\s*[,:\\-!।]*\\s*", RegexOption.IGNORE_CASE), "")
             .trim()
     }
 
@@ -53,6 +53,12 @@ class CommandDispatcher {
         }
         if (isReviewPendingDraftCommand(lower)) {
             return VoiceCommand.ReviewPendingDraft(cleaned)
+        }
+
+        // 0b. Strict Incoming & Active Phone Call Control (requires explicit call-control intent)
+        val callCtrl = parseIncomingCallControlCommand(cleaned, lower)
+        if (callCtrl != null) {
+            return callCtrl
         }
 
         // 1. Flashlight On/Off
@@ -162,6 +168,48 @@ class CommandDispatcher {
             "(?:পাঠানোর\\s*আগে\\s*(?:আমাকে\\s*)?দেখাও|মেসেজটা\\s*(?:আমাকে\\s*)?দেখাও|ড্রাফট\\s*দেখাও|show\\s*(?:me\\s*)?(?:the\\s*)?(?:draft|message)\\s*(?:before\\s+sending)?|भेजने\\s*से\\s*पहले\\s*दिखाओ)",
             RegexOption.IGNORE_CASE
         ).containsMatchIn(lower)
+    }
+
+    private fun parseIncomingCallControlCommand(raw: String, lower: String): VoiceCommand? {
+        val clean = lower.trimEnd('।', '.', '!', '?').trim()
+
+        // Answer Incoming Call ("receive the call", "answer the call", "pick up the call", "কল রিসিভ করো", "ফোনটা ধরো", "कॉल उठाओ")
+        if (Regex(
+                "^(?:please\\s+)?(?:receive|answer|accept|pick\\s*up)\\s+(?:the\\s+|this\\s+|my\\s+|incoming\\s+)?(?:phone\\s+)?call$|" +
+                "^(?:ইনকামিং\\s+)?(?:কলটা|কল|ফোনটা|ফোন)\\s*(?:রিসিভ\\s*করো|ধরো|ধরে\\s*নাও|তুলো|উঠাও|অ্যাকসেপ্ট\\s*করো)$|" +
+                "^(?:इनकमिंग\\s+)?(?:कॉल|फ़ोन|फोन)\\s*(?:उठाओ|रिसीव\\s*करो|पिक\\s*करो|अटेंड\\s*करो)$",
+                RegexOption.IGNORE_CASE
+            ).matches(clean)
+        ) {
+            return VoiceCommand.AnswerIncomingCall(raw)
+        }
+
+        // Reject Incoming Call ("reject the call", "decline the call", "কল রিজেক্ট করো", "ইনকামিং কল কেটে দাও", "कॉल रिजेक्ट करो", "इनकमिंग कॉल काट दो")
+        if (Regex(
+                "^(?:please\\s+)?(?:reject|decline|dismiss|ignore)\\s+(?:the\\s+|this\\s+|my\\s+|incoming\\s+)?(?:phone\\s+)?call$|" +
+                "^(?:ইনকামিং\\s+)?(?:কলটা|কল|ফোনটা|ফোন)\\s*(?:রিজেক্ট\\s*করো|বাতিল\\s*করো|না\\s*ধরে\\s*কাটো)$|" +
+                "^ইনকামিং\\s+(?:কলটা|কল|ফোনটা|ফোন)\\s*কেটে\\s*দাও$|" +
+                "^(?:इनकमिंग\\s+)?(?:कॉल|फ़ोन|फोन)\\s*(?:रिजेक्ट\\s*करो|डिक्लाइन\\s*करो|अस्वीकार\\s*करो)$|" +
+                "^इनकमिंग\\s+(?:कॉल|फ़ोन|फोन)\\s*(?:काट\\s*दो|काटो)$",
+                RegexOption.IGNORE_CASE
+            ).matches(clean)
+        ) {
+            return VoiceCommand.RejectIncomingCall(raw)
+        }
+
+        // End Active Call ("end the call", "hang up", "disconnect the call", "কল কেটে দাও", "কল বন্ধ করো", "কল শেষ করো", "कॉल बंद करो", "कॉल काटो")
+        if (Regex(
+                "^(?:please\\s+)?(?:end|disconnect|cut|terminate|stop)\\s+(?:the\\s+|this\\s+|my\\s+|active\\s+|current\\s+)?(?:phone\\s+)?call$|" +
+                "^(?:please\\s+)?hang\\s*up(?:\\s+(?:the\\s+)?call)?$|" +
+                "^(?:চলমান\\s+)?(?:কলটা|কল|ফোনটা|ফোন)\\s*(?:কেটে\\s*দাও|বন্ধ\\s*করো|শেষ\\s*করো|ডিসকানেক্ট\\s*করো|রেখে\\s*দাও)$|" +
+                "^(?:कॉल|फ़ोन|फोन)\\s*(?:काटो|काट\\s*दो|बंद\\s*करो|खत्म\\s*करो|डिस्कनेक्ट\\s*करो)$",
+                RegexOption.IGNORE_CASE
+            ).matches(clean)
+        ) {
+            return VoiceCommand.EndActiveCall(raw)
+        }
+
+        return null
     }
 
     private fun parseAccessibilityNav(raw: String, lower: String): VoiceCommand? {

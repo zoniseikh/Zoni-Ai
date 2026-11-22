@@ -429,4 +429,33 @@ test('Part 2: buildStructuredTaskPlan parses all Bengali, English, and Hindi Wha
   assert.equal(enTypeOnly.steps[0]?.args.message, 'On my way');
 });
 
+test('Incoming & Active Call Control: parses strict Bengali, English, and Hindi call-control commands without false triggers', () => {
+  // Answer incoming call
+  assert.equal(buildStructuredTaskPlan('কল রিসিভ করো').steps[0]?.tool, 'answer_incoming_call');
+  assert.equal(buildStructuredTaskPlan('ফোন ধরো').steps[0]?.tool, 'answer_incoming_call');
+  assert.equal(buildStructuredTaskPlan('Answer the call').steps[0]?.tool, 'answer_incoming_call');
+  assert.equal(buildStructuredTaskPlan('Pick up the call').steps[0]?.tool, 'answer_incoming_call');
+  assert.equal(buildStructuredTaskPlan('कॉल उठाओ').steps[0]?.tool, 'answer_incoming_call');
+
+  // Reject incoming call
+  assert.equal(buildStructuredTaskPlan('ইনকামিং কল কেটে দাও').steps[0]?.tool, 'reject_incoming_call');
+  assert.equal(buildStructuredTaskPlan('Reject the call').steps[0]?.tool, 'reject_incoming_call');
+  assert.equal(buildStructuredTaskPlan('Decline incoming call').steps[0]?.tool, 'reject_incoming_call');
+  assert.equal(buildStructuredTaskPlan('इनकमिंग कॉल काट दो').steps[0]?.tool, 'reject_incoming_call');
+
+  // End active call
+  assert.equal(buildStructuredTaskPlan('কল কেটে দাও').steps[0]?.tool, 'end_active_call');
+  assert.equal(buildStructuredTaskPlan('End the call').steps[0]?.tool, 'end_active_call');
+  assert.equal(buildStructuredTaskPlan('Hang up').steps[0]?.tool, 'end_active_call');
+  assert.equal(buildStructuredTaskPlan('कॉल बंद करो').steps[0]?.tool, 'end_active_call');
+
+  // Wake prefix "জোনি" stripped cleanly before command
+  const wakeCall = buildStructuredTaskPlan('জোনি, কল রিসিভ করো');
+  assert.equal(wakeCall.steps[0]?.tool, 'answer_incoming_call');
+
+  // Ordinary unrelated sentences must NOT trigger call control
+  assert.equal(buildStructuredTaskPlan('Tell me about how phone calls work').steps.length, 0);
+  assert.equal(buildStructuredTaskPlan('আজকে অনেক কল এসেছে').steps.length, 0);
+});
+
 

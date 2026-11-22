@@ -49,7 +49,10 @@ export type AllowedTaskTool =
   | 'open_whatsapp_chat'
   | 'type_whatsapp_message'
   | 'send_whatsapp_message'
-  | 'verify_whatsapp_send';
+  | 'verify_whatsapp_send'
+  | 'answer_incoming_call'
+  | 'reject_incoming_call'
+  | 'end_active_call';
 
 export const ALLOWED_TASK_TOOLS: ReadonlySet<AllowedTaskTool> = new Set([
   'open_app',
@@ -83,6 +86,9 @@ export const ALLOWED_TASK_TOOLS: ReadonlySet<AllowedTaskTool> = new Set([
   'type_whatsapp_message',
   'send_whatsapp_message',
   'verify_whatsapp_send',
+  'answer_incoming_call',
+  'reject_incoming_call',
+  'end_active_call',
 ]);
 
 export interface TaskStep {
@@ -176,7 +182,10 @@ export function buildStructuredTaskPlan(rawInput: string): TaskPlan {
 
 function stripWakePrefix(text: string): string {
   return text
-    .replace(/^(?:hey\s+|ok\s+|okay\s+|হ্যালো\s+|হেই\s+)?(?:zoni(?:\s+ai)?|জনি(?:\s+এআই)?|ज़ोनी(?:\s+एआई)?)\s*[,:\-!।]?\s*/i, '')
+    .replace(
+      /^(?:hey\s+|hi\s+|ok\s+|okay\s+|hello\s+|ওহে\s+|হ্যালো\s+|হেই\s+|हे\s+|ओए\s+)?(?:zoni(?:\s+ai)?|জোনি(?:\s+এআই)?|জোনী(?:\s+এআই)?|জনি(?:\s+এআই)?|ज़ोनी(?:\s+एआई)?|जोनी(?:\s+एआई)?)\s*[,:\-!।]?\s*/i,
+      ''
+    )
     .trim();
 }
 
@@ -260,6 +269,73 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
       requiredPermissions: [],
       requiresUserConfirmation: false,
       honestOutcomeNote: 'Cancels the active task or pending communication draft safely.',
+    };
+  }
+
+  // 0a-call. Strict Incoming & Active Phone Call Control (requires explicit call-control phrase)
+  if (
+    /^(?:please\s+)?(?:receive|answer|accept|pick\s*up)\s+(?:the\s+|this\s+|my\s+|incoming\s+)?(?:phone\s+)?call$/i.test(
+      segment
+    ) ||
+    /^(?:ইনকামিং\s+)?(?:কলটা|কল|ফোনটা|ফোন)\s*(?:রিসিভ\s*করো|ধরো|ধরে\s*নাও|তুলো|উঠাও|অ্যাকসেপ্ট\s*করো)$/i.test(
+      segment
+    ) ||
+    /^(?:इनकमिंग\s+)?(?:कॉल|फ़ोन|फोन)\s*(?:उठाओ|रिसीव\s*करो|पिक\s*करो|अटेंड\s*करो)$/i.test(
+      segment
+    )
+  ) {
+    return {
+      stepId,
+      tool: 'answer_incoming_call',
+      args: {},
+      requiredPermissions: ['READ_PHONE_STATE', 'ANSWER_PHONE_CALLS'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Verifies ringing call state and answers via supported Android Telecom APIs.',
+    };
+  }
+
+  if (
+    /^(?:please\s+)?(?:reject|decline|dismiss|ignore)\s+(?:the\s+|this\s+|my\s+|incoming\s+)?(?:phone\s+)?call$/i.test(
+      segment
+    ) ||
+    /^(?:ইনকামিং\s+)?(?:কলটা|কল|ফোনটা|ফোন)\s*(?:রিজেক্ট\s*করো|বাতিল\s*করো|না\s*ধরে\s*কাটো)$/i.test(
+      segment
+    ) ||
+    /^ইনকামিং\s+(?:কলটা|কল|ফোনটা|ফোন)\s*কেটে\s*দাও$/i.test(segment) ||
+    /^(?:इनकमिंग\s+)?(?:कॉल|फ़ोन|फोन)\s*(?:रिजेक्ट\s*करो|डिक्लाइन\s*करो|अस्वीकार\s*करो)$/i.test(
+      segment
+    ) ||
+    /^इनकमिंग\s+(?:कॉल|फ़ोन|फोन)\s*(?:काट\s*दो|काटो)$/i.test(segment)
+  ) {
+    return {
+      stepId,
+      tool: 'reject_incoming_call',
+      args: {},
+      requiredPermissions: ['READ_PHONE_STATE', 'ANSWER_PHONE_CALLS'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Verifies ringing call state and rejects via supported Android Telecom APIs.',
+    };
+  }
+
+  if (
+    /^(?:please\s+)?(?:end|disconnect|cut|terminate|stop)\s+(?:the\s+|this\s+|my\s+|active\s+|current\s+)?(?:phone\s+)?call$/i.test(
+      segment
+    ) ||
+    /^(?:please\s+)?hang\s*up(?:\s+(?:the\s+)?call)?$/i.test(segment) ||
+    /^(?:চলমান\s+)?(?:কলটা|কল|ফোনটা|ফোন)\s*(?:কেটে\s*দাও|বন্ধ\s*করো|শেষ\s*করো|ডিসকানেক্ট\s*করো|রেখে\s*দাও)$/i.test(
+      segment
+    ) ||
+    /^(?:कॉल|फ़ोन|फोन)\s*(?:काटो|काट\s*दो|बंद\s*करो|खत्म\s*करो|डिस्कनेक्ट\s*करो)$/i.test(
+      segment
+    )
+  ) {
+    return {
+      stepId,
+      tool: 'end_active_call',
+      args: {},
+      requiredPermissions: ['READ_PHONE_STATE', 'ANSWER_PHONE_CALLS'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Verifies active call state and ends the call via supported Android Telecom APIs.',
     };
   }
 
@@ -1470,6 +1546,12 @@ export function formatHonestTaskOutcome(tool: AllowedTaskTool, succeeded: boolea
       return detail || 'অ্যান্ড্রয়েড সেটিংস খোলা হয়েছে।';
     case 'reminder':
       return detail || 'রিমাইন্ডার সংরক্ষণ করা হয়েছে।';
+    case 'answer_incoming_call':
+      return detail || 'ইনকামিং কল রিসিভ করা হয়েছে।';
+    case 'reject_incoming_call':
+      return detail || 'ইনকামিং কল রিজেক্ট করা হয়েছে।';
+    case 'end_active_call':
+      return detail || 'চলমান কল বন্ধ করা হয়েছে।';
     default:
       return detail || 'কাজটি সফলভাবে সম্পন্ন হয়েছে।';
   }

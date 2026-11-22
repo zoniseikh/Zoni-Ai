@@ -34,9 +34,12 @@ class ZoniWebAppInterface(
     private val autoReplyManager: AutoReplyRuleManager = AutoReplyRuleManager(context),
     private val onRequestRuntimePermissions: ((Array<String>) -> Unit)? = null,
     private val onRequestScreenCaptureConsent: (() -> Unit)? = null,
-    private val onRequestDefaultAssistant: (() -> Unit)? = null
+    private val onRequestDefaultAssistant: (() -> Unit)? = null,
+    private val onRequestCallControlRole: (() -> Unit)? = null
 ) {
-    // --- Typed Allowlisted Action Engine (20 tools + explicit confirmation workflow) ---
+    private val preferences by lazy { com.zoni.jarvis.assistant.data.ZoniPreferences(context.applicationContext) }
+
+    // --- Typed Allowlisted Action Engine (36 tools) ---
 
     @JavascriptInterface
     fun executeTypedActionJson(requestJson: String): String {
@@ -66,6 +69,120 @@ class ZoniWebAppInterface(
 
     @JavascriptInterface
     fun listInstalledAppsJson(): String = hardware.listInstalledAppsJson()
+
+    // --- On-Device ZONI Wake Word & 24-Hour Transparent Background Listening ---
+
+    @JavascriptInterface
+    fun getWakeWordStatusJson(): String =
+        com.zoni.jarvis.assistant.service.ZoniForegroundService.getCurrentStatusSnapshot(context).toJson()
+
+    @JavascriptInterface
+    fun setWakeWordEnabled(enabled: Boolean): String {
+        return if (enabled) {
+            com.zoni.jarvis.assistant.service.ZoniForegroundService.startWakeWordListening(
+                context,
+                preferences.getWakePhraseSync()
+            )
+        } else {
+            com.zoni.jarvis.assistant.service.ZoniForegroundService.stop(context, disablePreference = true)
+        }
+    }
+
+    @JavascriptInterface
+    fun setWakePhrase(phrase: String): String {
+        val clean = phrase.trim().take(32).ifBlank {
+            com.zoni.jarvis.assistant.wakeword.WakeWordConfig.DEFAULT_WAKE_PHRASE
+        }
+        preferences.setWakePhraseSync(clean)
+        if (com.zoni.jarvis.assistant.service.ZoniForegroundService.isServiceRunning &&
+            preferences.isWakeWordEnabledSync()
+        ) {
+            return com.zoni.jarvis.assistant.service.ZoniForegroundService.startWakeWordListening(context, clean)
+        }
+        val snap = com.zoni.jarvis.assistant.service.ZoniForegroundService.getCurrentStatusSnapshot(context)
+        return JSONObject()
+            .put("success", true)
+            .put("status", "wake_phrase_updated")
+            .put("wakePhrase", clean)
+            .put("message", "Wake phrase updated to \"$clean\".")
+            .put("snapshot", JSONObject(snap.toJson()))
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun startBackgroundWakeWordJson(): String =
+        com.zoni.jarvis.assistant.service.ZoniForegroundService.startWakeWordListening(
+            context,
+            preferences.getWakePhraseSync()
+        )
+
+    @JavascriptInterface
+    fun stopBackgroundWakeWordJson(): String =
+        com.zoni.jarvis.assistant.service.ZoniForegroundService.stop(context, disablePreference = true)
+
+    @JavascriptInterface
+    fun notifyVoiceSessionState(state: String): Boolean {
+        val parsed = com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.fromString(state)
+        when (parsed) {
+            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.ACTIVATING,
+            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.CONNECTING,
+            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.CONNECTED,
+            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.LISTENING,
+            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.PROCESSING,
+            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.SPEAKING -> {
+                com.zoni.jarvis.assistant.service.ZoniForegroundService.pauseWakeWordForConversation(context, parsed)
+            }
+            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.IDLE -> {
+                com.zoni.jarvis.assistant.service.ZoniForegroundService.updateVoiceState(context, parsed)
+                if (preferences.isWakeWordEnabledSync() && preferences.isBackgroundListeningEnabledSync()) {
+                    com.zoni.jarvis.assistant.service.ZoniForegroundService.resumeWakeWordAfterConversation(context)
+                }
+            }
+            else -> {
+                com.zoni.jarvis.assistant.service.ZoniForegroundService.updateVoiceState(context, parsed)
+            }
+        }
+        return true
+    }
+
+    @JavascriptInterface
+    fun pauseWakeWordForVoiceSession(): Boolean {
+        com.zoni.jarvis.assistant.service.ZoniForegroundService.pauseWakeWordForConversation(
+            context,
+            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.ACTIVATING
+        )
+        return true
+    }
+
+    @JavascriptInterface
+    fun resumeWakeWordAfterVoiceSession(): Boolean {
+        com.zoni.jarvis.assistant.service.ZoniForegroundService.resumeWakeWordAfterConversation(context)
+        return true
+    }
+
+    // --- Incoming & Active Phone Call Control (Android Telecom / InCallService) ---
+
+    @JavascriptInterface
+    fun getIncomingCallStatusJson(): String = simCallManager.getIncomingCallStatusAsJson()
+
+    @JavascriptInterface
+    fun answerIncomingCallJson(): String = simCallManager.answerIncomingCallAsJson()
+
+    @JavascriptInterface
+    fun rejectIncomingCallJson(): String = simCallManager.rejectIncomingCallAsJson()
+
+    @JavascriptInterface
+    fun endActiveCallJson(): String = simCallManager.endActiveCallAsJson()
+
+    @JavascriptInterface
+    fun requestCallControlRole(): Boolean {
+        val cb = onRequestCallControlRole
+        if (cb != null) {
+            cb.invoke()
+            return true
+        }
+        return false
+    }
 
     // --- Hardware, Calls, Contacts, SMS, WhatsApp ---
 
@@ -182,10 +299,12 @@ class ZoniWebAppInterface(
             } else {
                 emptyArray()
             }
-            "manage_calls", "managecalls" -> arrayOf(
-                android.Manifest.permission.READ_PHONE_STATE,
-                android.Manifest.permission.ANSWER_PHONE_CALLS
-            )
+            "manage_calls", "managecalls", "call_control", "answer_phone_calls", "read_phone_state" -> buildList {
+                add(android.Manifest.permission.READ_PHONE_STATE)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    add(android.Manifest.permission.ANSWER_PHONE_CALLS)
+                }
+            }.toTypedArray()
             "gallery" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 arrayOf(android.Manifest.permission.READ_MEDIA_IMAGES)
             } else {
@@ -199,6 +318,9 @@ class ZoniWebAppInterface(
                 add(android.Manifest.permission.SEND_SMS)
                 add(android.Manifest.permission.ACCESS_FINE_LOCATION)
                 add(android.Manifest.permission.READ_PHONE_STATE)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    add(android.Manifest.permission.ANSWER_PHONE_CALLS)
+                }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     add(android.Manifest.permission.POST_NOTIFICATIONS)
                     add(android.Manifest.permission.READ_MEDIA_IMAGES)
@@ -347,6 +469,7 @@ class ZoniWebAppInterface(
     @JavascriptInterface
     fun getPermissionsStatusJson(): String {
         val snap = hardware.getPermissionsSnapshot()
+        val wakeSnap = com.zoni.jarvis.assistant.service.ZoniForegroundService.getCurrentStatusSnapshot(context)
         return JSONObject()
             .put("recordAudio", snap.recordAudio)
             .put("camera", snap.camera)
@@ -356,6 +479,11 @@ class ZoniWebAppInterface(
             .put("location", snap.location)
             .put("notifications", snap.postNotifications)
             .put("bluetooth", snap.bluetooth)
+            .put("readPhoneState", simCallManager.hasReadPhoneStatePermission())
+            .put("answerPhoneCalls", simCallManager.hasAnswerPhoneCallsPermission())
+            .put("defaultDialerRole", simCallManager.isDefaultDialerRoleHeld())
+            .put("wakeWordEnabled", wakeSnap.wakeWordEnabled)
+            .put("backgroundWakeWordRunning", wakeSnap.backgroundServiceRunning)
             .put("batteryOptimizationIgnored", snap.batteryOptimizationIgnored)
             .put("overlayAllowed", snap.overlayAllowed)
             .put("notificationListenerEnabled", snap.notificationListenerEnabled)

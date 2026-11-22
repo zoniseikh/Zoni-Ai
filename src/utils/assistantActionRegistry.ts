@@ -45,7 +45,10 @@ export type AssistantToolName =
   | 'open_whatsapp_chat'
   | 'type_whatsapp_message'
   | 'send_whatsapp_message'
-  | 'verify_whatsapp_send';
+  | 'verify_whatsapp_send'
+  | 'answer_incoming_call'
+  | 'reject_incoming_call'
+  | 'end_active_call';
 
 export interface AssistantToolParamSpec {
   type: 'STRING' | 'BOOLEAN' | 'INTEGER';
@@ -705,6 +708,42 @@ export const ASSISTANT_TOOL_SPECS: readonly AssistantToolSpec[] = [
       required: ['message'],
     },
   },
+  {
+    name: 'answer_incoming_call',
+    description:
+      'Answer a currently ringing incoming SIM phone call via supported Android TelecomManager / InCallService APIs ONLY when the user explicitly requests receiving or answering the call. Verifies call state and reports real success or missing permission honestly.',
+    requiredPermissions: ['READ_PHONE_STATE', 'ANSWER_PHONE_CALLS'],
+    requiresConfirmation: false,
+    timeoutMs: 4000,
+    parameters: {
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: 'reject_incoming_call',
+    description:
+      'Reject a currently ringing incoming SIM phone call via supported Android TelecomManager / InCallService APIs ONLY when the user explicitly requests rejecting or declining the call. Verifies call state and reports real outcome honestly.',
+    requiredPermissions: ['READ_PHONE_STATE', 'ANSWER_PHONE_CALLS'],
+    requiresConfirmation: false,
+    timeoutMs: 4000,
+    parameters: {
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: 'end_active_call',
+    description:
+      'End an active or dialing SIM phone call via supported Android TelecomManager / InCallService APIs ONLY when the user explicitly requests ending or hanging up the call. Verifies disconnected state honestly.',
+    requiredPermissions: ['READ_PHONE_STATE', 'ANSWER_PHONE_CALLS'],
+    requiresConfirmation: false,
+    timeoutMs: 4000,
+    parameters: {
+      properties: {},
+      required: [],
+    },
+  },
 ] as const;
 
 export const ASSISTANT_TOOL_MAP: ReadonlyMap<AssistantToolName, AssistantToolSpec> = new Map(
@@ -1053,6 +1092,66 @@ export function formatLocalizedActionOutcome(
       return `${name}, आपका उत्तर Android नोटिफिकेशन रिप्लाई के ज़रिए भेज दिया गया है।`;
     }
     return `${name}, your reply was sent through Android Notification Reply.`;
+  }
+
+  if (report.status === 'call_answered') {
+    if (lang === 'bn-BD') {
+      return `${name}, ইনকামিং ফোন কলটি রিসিভ করা হয়েছে।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, इनकमिंग फ़ोन कॉल रिसीव कर लिया गया है।`;
+    }
+    return `${name}, the incoming phone call has been answered.`;
+  }
+
+  if (report.status === 'call_rejected') {
+    if (lang === 'bn-BD') {
+      return `${name}, ইনকামিং ফোন কলটি রিজেক্ট করা হয়েছে।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, इनकमिंग फ़ोन कॉल रिजेक्ट कर दिया गया है।`;
+    }
+    return `${name}, the incoming phone call has been rejected.`;
+  }
+
+  if (report.status === 'call_ended') {
+    if (lang === 'bn-BD') {
+      return `${name}, চলমান ফোন কলটি বন্ধ করা হয়েছে।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, चल रहा फ़ोन कॉल समाप्त कर दिया गया है।`;
+    }
+    return `${name}, the active phone call has been ended.`;
+  }
+
+  if (report.status === 'no_ringing_call') {
+    if (lang === 'bn-BD') {
+      return `${name}, এই মুহূর্তে কোনো ইনকামিং রিং হওয়া কল শনাক্ত হয়নি।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, इस समय कोई इनकमिंग कॉल रिंग नहीं हो रहा है।`;
+    }
+    return `${name}, no incoming ringing call is currently detected.`;
+  }
+
+  if (report.status === 'no_active_call') {
+    if (lang === 'bn-BD') {
+      return `${name}, এই মুহূর্তে কোনো চলমান কল পাওয়া যায়নি।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, इस समय कोई सक्रिय कॉल नहीं चल रहा है।`;
+    }
+    return `${name}, no active phone call is currently in progress.`;
+  }
+
+  if (report.status === 'telecom_declined') {
+    if (lang === 'bn-BD') {
+      return `${name}, Android Telecom সিস্টেম কল কন্ট্রোল প্রত্যাখ্যান করেছে। এই ডিভাইসে কাজ করার জন্য Zoni AI-কে Default Dialer রোল দিতে হতে পারে।`;
+    }
+    if (lang === 'hi-IN') {
+      return `${name}, Android Telecom ने कॉल कंट्रोल अस्वीकार किया है। इस डिवाइस पर Default Dialer रोल आवश्यक हो सकता है।`;
+    }
+    return `${name}, Android Telecom declined the call-control request. On this device, granting Default Dialer role (ROLE_DIALER) may be required.`;
   }
 
   if (report.status === 'cancelled') {

@@ -7,9 +7,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -31,6 +34,8 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -40,14 +45,17 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.lifecycle.lifecycleScope
 import androidx.webkit.WebViewAssetLoader
 import com.zoni.jarvis.assistant.BuildConfig
 import com.zoni.jarvis.assistant.bridge.ZoniWebAppInterface
 import com.zoni.jarvis.assistant.calling.SimCallManager
+import com.zoni.jarvis.assistant.calling.ZoniInCallService
 import com.zoni.jarvis.assistant.data.SecureKeyManager
 import com.zoni.jarvis.assistant.data.ZoniUserSettings
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
 import com.zoni.jarvis.assistant.service.ScreenCaptureService
+import com.zoni.jarvis.assistant.service.ZoniForegroundService
 import com.zoni.jarvis.assistant.ui.components.AndroidHardwareHubDialog
 import com.zoni.jarvis.assistant.ui.components.ArcReactorView
 import com.zoni.jarvis.assistant.ui.components.ChatTranscriptDialog
@@ -57,6 +65,7 @@ import com.zoni.jarvis.assistant.ui.components.ZoniSettingsDialog
 import com.zoni.jarvis.assistant.ui.onboarding.OnboardingActivity
 import com.zoni.jarvis.assistant.ui.theme.ZoniColors
 import com.zoni.jarvis.assistant.ui.theme.ZoniTheme
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 /**
@@ -66,8 +75,11 @@ import org.json.JSONObject
  * - Preserves the EXACT original Zoni AI React/Vite Sci-Fi JARVIS Dashboard as the primary UI,
  *   packaged inside `assets/public/` and served securely via `WebViewAssetLoader`
  *   (`https://appassets.androidplatform.net/assets/public/index.html`).
- * - Exposes full native Android hardware, Contacts, SIM Telecom calling,
- *   Room DB history, Floating Orb, and Foreground Service through `window.ZoniAndroidBridge`.
+ * - Exposes full native Android hardware, Contacts, SIM Telecom calling, Incoming Call Control,
+ *   On-Device Wake Word, Transparent Background Listening, Room DB history, Floating Orb,
+ *   and Foreground Service through `window.ZoniAndroidBridge`.
+ * - Detects WebView renderer termination (`onRenderProcessGone`) and recovers cleanly instead of
+ *   leaving a blank screen.
  * - Gracefully falls back to the synchronized Jetpack Compose HUD if bundled web assets
  *   are not yet synced during local Kotlin-only testing.
  */
@@ -79,6 +91,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var keyManager: SecureKeyManager
     private var dashboardWebView: WebView? = null
     private var pendingWebPermissionRequest: PermissionRequest? = null
+    private var pendingWakePayloadJson: String? = null
+    private var webViewReloadEpoch = mutableIntStateOf(0)
 
     private val micPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -88,6 +102,11 @@ class MainActivity : ComponentActivity() {
             if (granted) req.grant(req.resources) else req.deny()
             pendingWebPermissionRequest = null
         }
+        dispatchNativeEvent("zoni:native-permissions-updated", "{}")
+        dispatchNativeEvent(
+            "zoni:wake-word-status",
+            ZoniForegroundService.getCurrentStatusSnapshot(applicationContext).toJson()
+        )
         if (granted && !hasBundledReactDashboard()) {
             viewModel.startLiveVoice()
         }
@@ -97,12 +116,15 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         viewModel.refreshSystemStatus()
-        dashboardWebView?.post {
-            dashboardWebView?.evaluateJavascript(
-                "window.dispatchEvent(new CustomEvent('zoni:native-permissions-updated'));",
-                null
-            )
+        simCallManager.startCallStateMonitoring { callJson ->
+            dispatchNativeEvent("zoni:call-state-changed", callJson)
         }
+        dispatchNativeEvent("zoni:native-permissions-updated", "{}")
+        dispatchNativeEvent(
+            "zoni:wake-word-status",
+            ZoniForegroundService.getCurrentStatusSnapshot(applicationContext).toJson()
+        )
+        dispatchNativeEvent("zoni:call-state-changed", simCallManager.getIncomingCallStatusAsJson())
     }
 
     private val screenCaptureConsentLauncher = registerForActivityResult(
@@ -111,19 +133,9 @@ class MainActivity : ComponentActivity() {
         val data = result.data
         if (result.resultCode == Activity.RESULT_OK && data != null) {
             ScreenCaptureService.startWithConsent(applicationContext, result.resultCode, data)
-            dashboardWebView?.post {
-                dashboardWebView?.evaluateJavascript(
-                    "window.dispatchEvent(new CustomEvent('zoni:screen-capture-changed', { detail: { active: true } }));",
-                    null
-                )
-            }
+            dispatchNativeEvent("zoni:screen-capture-changed", JSONObject().put("active", true).toString())
         } else {
-            dashboardWebView?.post {
-                dashboardWebView?.evaluateJavascript(
-                    "window.dispatchEvent(new CustomEvent('zoni:screen-capture-changed', { detail: { active: false } }));",
-                    null
-                )
-            }
+            dispatchNativeEvent("zoni:screen-capture-changed", JSONObject().put("active", false).toString())
         }
     }
 
@@ -132,13 +144,19 @@ class MainActivity : ComponentActivity() {
     ) {
         viewModel.refreshSystemStatus()
         val isDefault = hardwareController.isDefaultDigitalAssistant()
-        dashboardWebView?.post {
-            dashboardWebView?.evaluateJavascript(
-                "window.dispatchEvent(new CustomEvent('zoni:native-permissions-updated'));" +
-                    "window.dispatchEvent(new CustomEvent('zoni:default-assistant-changed', { detail: { isDefault: $isDefault } }));",
-                null
-            )
-        }
+        dispatchNativeEvent("zoni:native-permissions-updated", "{}")
+        dispatchNativeEvent(
+            "zoni:default-assistant-changed",
+            JSONObject().put("isDefault", isDefault).put("active", isDefault).toString()
+        )
+    }
+
+    private val dialerRoleLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        viewModel.refreshSystemStatus()
+        dispatchNativeEvent("zoni:native-permissions-updated", "{}")
+        dispatchNativeEvent("zoni:call-state-changed", simCallManager.getIncomingCallStatusAsJson())
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -149,6 +167,11 @@ class MainActivity : ComponentActivity() {
         hardwareController = AndroidHardwareController(applicationContext)
         simCallManager = SimCallManager(applicationContext)
         keyManager = SecureKeyManager(applicationContext)
+
+        simCallManager.startCallStateMonitoring { callJson ->
+            dispatchNativeEvent("zoni:call-state-changed", callJson)
+        }
+        observeNativeLifecycleStreams()
 
         // Back button navigates inside the original Zoni React dashboard before exiting
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -170,10 +193,55 @@ class MainActivity : ComponentActivity() {
         setContent {
             ZoniTheme {
                 if (useBundledOriginalDashboard) {
-                    OriginalDashboardWebShell()
+                    val reloadKey = webViewReloadEpoch.intValue
+                    key(reloadKey) {
+                        OriginalDashboardWebShell()
+                    }
                 } else {
                     NativeComposeFallbackHud()
                 }
+            }
+        }
+    }
+
+    private fun observeNativeLifecycleStreams() {
+        lifecycleScope.launch {
+            ZoniForegroundService.statusFlow.collect { snap ->
+                val json = snap.toJson()
+                dispatchNativeEvent("zoni:wake-word-status", json)
+                dispatchNativeEvent(
+                    "zoni:voice-state-changed",
+                    JSONObject().put("voiceState", snap.voiceState.name).toString()
+                )
+            }
+        }
+        lifecycleScope.launch {
+            ZoniForegroundService.wakeWordEvents.collect { event ->
+                val payload = JSONObject()
+                    .put("wakePhrase", event.wakePhrase)
+                    .put("matchedVariant", event.matchedVariant)
+                    .put("confidence", event.confidence.toDouble())
+                    .put("remainingCommand", event.remainingCommand)
+                    .put("detectedAtMs", event.detectedAtMs)
+                    .toString()
+                dispatchNativeEvent("zoni:wake-word-detected", payload)
+            }
+        }
+        lifecycleScope.launch {
+            ZoniInCallService.simCallState.collect {
+                dispatchNativeEvent("zoni:call-state-changed", simCallManager.getIncomingCallStatusAsJson())
+            }
+        }
+    }
+
+    private fun dispatchNativeEvent(eventName: String, jsonDetail: String) {
+        val wv = dashboardWebView ?: return
+        val safeDetail = jsonDetail.ifBlank { "{}" }
+        val js = "(function(){ try { window.dispatchEvent(new CustomEvent(${JSONObject.quote(eventName)}, { detail: $safeDetail })); } catch(e) {} })();"
+        wv.post {
+            try {
+                wv.evaluateJavascript(js, null)
+            } catch (_: Exception) {
             }
         }
     }
@@ -298,6 +366,20 @@ class MainActivity : ComponentActivity() {
                                             hardwareController.openSystemSettings("default_assistant")
                                         }
                                     }
+                                },
+                                onRequestCallControlRole = {
+                                    runOnUiThread {
+                                        try {
+                                            val roleIntent = simCallManager.createDialerRoleRequestIntent()
+                                            if (roleIntent != null) {
+                                                dialerRoleLauncher.launch(roleIntent)
+                                            } else {
+                                                hardwareController.openSystemSettings("applications")
+                                            }
+                                        } catch (_: Exception) {
+                                            hardwareController.openSystemSettings("applications")
+                                        }
+                                    }
                                 }
                             ),
                             "ZoniAndroidBridge"
@@ -309,6 +391,30 @@ class MainActivity : ComponentActivity() {
                                 request: WebResourceRequest
                             ): WebResourceResponse? {
                                 return assetLoader.shouldInterceptRequest(request.url)
+                            }
+
+                            override fun onRenderProcessGone(
+                                view: WebView?,
+                                detail: RenderProcessGoneDetail?
+                            ): Boolean {
+                                val didCrash = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                    detail?.didCrash() == true
+                                } else {
+                                    true
+                                }
+                                Log.e(TAG, "WebView render process terminated (didCrash=$didCrash) — recovering cleanly.")
+                                runOnUiThread {
+                                    if (dashboardWebView == view) {
+                                        dashboardWebView = null
+                                    }
+                                    try {
+                                        view?.destroy()
+                                    } catch (_: Exception) {
+                                    }
+                                    // Trigger Compose recreation of a fresh WebView instance instead of leaving a blank screen
+                                    webViewReloadEpoch.intValue += 1
+                                }
+                                return true
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
@@ -327,6 +433,18 @@ class MainActivity : ComponentActivity() {
                                         "} })();",
                                     null
                                 )
+                                // Push fresh native wake-word & call status on initial load
+                                dispatchNativeEvent(
+                                    "zoni:wake-word-status",
+                                    ZoniForegroundService.getCurrentStatusSnapshot(applicationContext).toJson()
+                                )
+                                dispatchNativeEvent("zoni:call-state-changed", simCallManager.getIncomingCallStatusAsJson())
+
+                                val pendingWake = pendingWakePayloadJson
+                                if (pendingWake != null) {
+                                    pendingWakePayloadJson = null
+                                    dispatchNativeEvent("zoni:wake-word-detected", pendingWake)
+                                }
                             }
                         }
 
@@ -477,27 +595,67 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handleLaunchIntent(intent)
     }
 
     override fun onResume() {
         super.onResume()
         viewModel.refreshSystemStatus()
+        simCallManager.startCallStateMonitoring { callJson ->
+            dispatchNativeEvent("zoni:call-state-changed", callJson)
+        }
+        dispatchNativeEvent(
+            "zoni:wake-word-status",
+            ZoniForegroundService.getCurrentStatusSnapshot(applicationContext).toJson()
+        )
+        dispatchNativeEvent("zoni:call-state-changed", simCallManager.getIncomingCallStatusAsJson())
     }
 
     override fun onDestroy() {
-        dashboardWebView?.destroy()
+        simCallManager.stopCallStateMonitoring()
+        try {
+            dashboardWebView?.destroy()
+        } catch (_: Exception) {
+        }
         dashboardWebView = null
         super.onDestroy()
     }
 
     private fun handleLaunchIntent(intent: Intent?) {
         intent ?: return
+
+        if (intent.getBooleanExtra(EXTRA_RESUME_WAKE_WORD, false)) {
+            ZoniForegroundService.startWakeWordListening(applicationContext)
+        }
+
+        val wakeTriggered = intent.getBooleanExtra(EXTRA_WAKE_WORD_TRIGGERED, false)
+        val remainingCmd = intent.getStringExtra(EXTRA_WAKE_REMAINING_COMMAND).orEmpty()
         val shouldAutoVoice = intent.action == Intent.ACTION_ASSIST ||
             intent.action == Intent.ACTION_VOICE_COMMAND ||
-            intent.getBooleanExtra(EXTRA_AUTO_VOICE, false)
-        if (shouldAutoVoice && !hasBundledReactDashboard()) {
-            triggerVoiceStartWithPermission()
+            intent.getBooleanExtra(EXTRA_AUTO_VOICE, false) ||
+            wakeTriggered
+
+        if (shouldAutoVoice) {
+            if (hasBundledReactDashboard()) {
+                val payload = JSONObject()
+                    .put("wakePhrase", "Zoni")
+                    .put("matchedVariant", if (wakeTriggered) "zoni" else "assist_intent")
+                    .put("confidence", 1.0)
+                    .put("remainingCommand", remainingCmd)
+                    .put("detectedAtMs", System.currentTimeMillis())
+                    .toString()
+                if (dashboardWebView != null) {
+                    dispatchNativeEvent("zoni:wake-word-detected", payload)
+                } else {
+                    pendingWakePayloadJson = payload
+                }
+            } else {
+                triggerVoiceStartWithPermission()
+                if (remainingCmd.isNotBlank()) {
+                    viewModel.sendTextMessage(remainingCmd)
+                }
+            }
         }
     }
 
@@ -508,6 +666,10 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        private const val TAG = "ZoniMainActivity"
         const val EXTRA_AUTO_VOICE = "extra_auto_voice"
+        const val EXTRA_WAKE_WORD_TRIGGERED = "extra_wake_word_triggered"
+        const val EXTRA_WAKE_REMAINING_COMMAND = "extra_wake_remaining_command"
+        const val EXTRA_RESUME_WAKE_WORD = "extra_resume_wake_word"
     }
 }

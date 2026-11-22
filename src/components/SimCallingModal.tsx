@@ -1,5 +1,16 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { X, PhoneCall, History, Trash2, Search, ShieldCheck } from 'lucide-react';
+import {
+  X,
+  PhoneCall,
+  PhoneIncoming,
+  PhoneOff,
+  History,
+  Trash2,
+  Search,
+  ShieldCheck,
+  ShieldAlert,
+  RefreshCw,
+} from 'lucide-react';
 import { playProceduralSfx } from '../utils/audio';
 import { executeCall } from '../utils/mobileAssistant';
 import { normalizePhoneNumber } from '../utils/numberNormalizer';
@@ -12,6 +23,7 @@ import {
   clearLocalSimCallHistory,
 } from '../utils/simCalling';
 import { SupportedLanguage } from '../types';
+import type { IncomingCallStatusSnapshot } from '../utils/voiceLifecycle';
 
 interface SimCallingModalProps {
   isOpen: boolean;
@@ -19,6 +31,14 @@ interface SimCallingModalProps {
   soundFxEnabled: boolean;
   selectedAffectionName: string;
   activeLanguage: SupportedLanguage;
+  incomingCallStatus?: IncomingCallStatusSnapshot | null;
+  onAnswerIncomingCall?: () => void;
+  onRejectIncomingCall?: () => void;
+  onEndActiveCall?: () => void;
+  onRefreshCallStatus?: () => void;
+  onRequestCallPermissions?: () => void;
+  onRequestDialerRole?: () => void;
+  callControlNotice?: string | null;
 }
 
 export const SimCallingModal: React.FC<SimCallingModalProps> = ({
@@ -26,6 +46,14 @@ export const SimCallingModal: React.FC<SimCallingModalProps> = ({
   onClose,
   soundFxEnabled,
   selectedAffectionName,
+  incomingCallStatus,
+  onAnswerIncomingCall,
+  onRejectIncomingCall,
+  onEndActiveCall,
+  onRefreshCallStatus,
+  onRequestCallPermissions,
+  onRequestDialerRole,
+  callControlNotice,
 }) => {
   const [activeTab, setActiveTab] = useState<'sim' | 'history'>('sim');
 
@@ -176,6 +204,151 @@ export const SimCallingModal: React.FC<SimCallingModalProps> = ({
         <div className="zoni-modal-scroll p-4 sm:p-6 space-y-4">
           {activeTab === 'sim' && (
             <div className="space-y-4">
+              {/* Incoming & Active Call Control Panel */}
+              <div
+                data-testid="incoming-call-control-panel"
+                className="p-4 rounded-xl bg-slate-900/70 border border-emerald-500/30 space-y-3"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-hud text-sm font-bold text-emerald-200 flex items-center gap-2">
+                    <PhoneIncoming className="w-4 h-4 text-emerald-400" />
+                    Incoming &amp; Active Call Control
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <span
+                      data-testid="call-control-live-state"
+                      className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${
+                        incomingCallStatus?.isIncomingRinging
+                          ? 'bg-emerald-950 border-emerald-400 text-emerald-300'
+                          : incomingCallStatus?.isActiveCall
+                          ? 'bg-cyan-950 border-cyan-400 text-cyan-300'
+                          : 'bg-slate-950 border-slate-700 text-slate-300'
+                      }`}
+                    >
+                      {incomingCallStatus?.callState || 'IDLE'}
+                    </span>
+                    {onRefreshCallStatus && (
+                      <button
+                        type="button"
+                        onClick={onRefreshCallStatus}
+                        aria-label="Refresh Call Status"
+                        className="p-1 rounded-md border border-emerald-500/30 text-emerald-300 hover:bg-emerald-950/60 cursor-pointer"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {(incomingCallStatus?.isIncomingRinging || incomingCallStatus?.isActiveCall) && (
+                  <div className="p-2.5 rounded-lg bg-emerald-950/30 border border-emerald-500/30 text-xs flex items-center justify-between gap-2">
+                    <span className="text-emerald-200 font-semibold truncate">
+                      {incomingCallStatus.callerDisplayName ||
+                        incomingCallStatus.callerNumber ||
+                        (incomingCallStatus.isIncomingRinging ? 'Incoming Phone Call' : 'Active Phone Call')}
+                    </span>
+                    <span className="font-mono text-[10px] text-emerald-300 shrink-0">
+                      {incomingCallStatus.isIncomingRinging ? 'RINGING' : 'IN CALL'}
+                    </span>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={onAnswerIncomingCall}
+                    className="py-2 px-3 rounded-lg bg-emerald-600/80 hover:bg-emerald-500 text-white font-hud text-xs font-bold uppercase flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <PhoneIncoming className="w-3.5 h-3.5" />
+                    <span>ANSWER CALL</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onRejectIncomingCall}
+                    className="py-2 px-3 rounded-lg bg-amber-600/80 hover:bg-amber-500 text-white font-hud text-xs font-bold uppercase flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <PhoneOff className="w-3.5 h-3.5" />
+                    <span>REJECT CALL</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onEndActiveCall}
+                    className="py-2 px-3 rounded-lg bg-rose-600/80 hover:bg-rose-500 text-white font-hud text-xs font-bold uppercase flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <PhoneOff className="w-3.5 h-3.5" />
+                    <span>END CALL</span>
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono">
+                  <span
+                    className={`px-2 py-0.5 rounded border ${
+                      incomingCallStatus?.hasReadPhoneStatePermission
+                        ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300'
+                        : 'bg-slate-950 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    READ_PHONE_STATE: {incomingCallStatus?.hasReadPhoneStatePermission ? 'OK' : 'MISSING'}
+                  </span>
+                  <span
+                    className={`px-2 py-0.5 rounded border ${
+                      incomingCallStatus?.hasAnswerPermission
+                        ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300'
+                        : 'bg-slate-950 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    ANSWER_PHONE_CALLS: {incomingCallStatus?.hasAnswerPermission ? 'OK' : 'MISSING'}
+                  </span>
+                  <span
+                    className={`px-2 py-0.5 rounded border ${
+                      incomingCallStatus?.isDefaultDialerRoleHeld
+                        ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300'
+                        : 'bg-slate-950 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    DIALER ROLE: {incomingCallStatus?.isDefaultDialerRoleHeld ? 'ACTIVE' : 'OPTIONAL'}
+                  </span>
+                </div>
+
+                {(onRequestCallPermissions || onRequestDialerRole) && (
+                  <div className="flex flex-wrap gap-2">
+                    {onRequestCallPermissions && (
+                      <button
+                        type="button"
+                        onClick={onRequestCallPermissions}
+                        className="px-3 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-950/50 hover:bg-cyan-900/60 text-cyan-200 font-hud text-[11px] font-bold flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <ShieldCheck className="w-3.5 h-3.5" />
+                        <span>GRANT CALL PERMISSIONS</span>
+                      </button>
+                    )}
+                    {onRequestDialerRole && (
+                      <button
+                        type="button"
+                        onClick={onRequestDialerRole}
+                        className="px-3 py-1.5 rounded-lg border border-amber-500/40 bg-amber-950/50 hover:bg-amber-900/60 text-amber-200 font-hud text-[11px] font-bold flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <ShieldAlert className="w-3.5 h-3.5" />
+                        <span>REQUEST DIALER ROLE</span>
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {(callControlNotice || incomingCallStatus?.lastError) && (
+                  <p className="text-xs text-amber-200 bg-amber-950/40 border border-amber-500/30 rounded-lg p-2.5">
+                    {callControlNotice || incomingCallStatus?.lastError}
+                  </p>
+                )}
+
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  Voice commands: <code>&ldquo;কল রিসিভ করো&rdquo;</code>, <code>&ldquo;কল কেটে দাও&rdquo;</code>,{' '}
+                  <code>&ldquo;Answer the call&rdquo;</code>, <code>&ldquo;Reject the call&rdquo;</code>,{' '}
+                  <code>&ldquo;End the call&rdquo;</code>, <code>&ldquo;कॉल उठाओ&rdquo;</code>. Uses native Android Telecom
+                  and verifies real ringing/active state.
+                </p>
+              </div>
+
               <div className="p-4 rounded-xl bg-slate-900/70 border border-cyan-500/30 space-y-3">
                 <div className="flex items-center justify-between">
                   <span className="font-hud text-sm font-bold text-cyan-200 flex items-center gap-2">

@@ -65,8 +65,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<ZoniUiState> = _uiState.asStateFlow()
 
     private val audioEngine = LiveAudioEngine(
+        context = app,
         onAmplitudeChanged = { amp ->
             _uiState.update { it.copy(audioAmplitude = amp) }
+        },
+        onAudioFocusLost = {
+            if (_uiState.value.isLiveActive) {
+                stopLiveVoice()
+            }
         }
     )
 
@@ -161,7 +167,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (droppedWhileLive) {
                     pendingVoiceStart = false
                     audioEngine.stopMicrophoneCapture()
-                    ZoniForegroundService.stop(app)
+                    if (preferences.isWakeWordEnabledSync() && preferences.isBackgroundListeningEnabledSync()) {
+                        ZoniForegroundService.resumeWakeWordAfterConversation(app)
+                    } else {
+                        ZoniForegroundService.stop(app, disablePreference = false)
+                    }
                     _uiState.update {
                         it.copy(
                             wsStatus = event.status,
@@ -267,7 +277,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 pendingVoiceStart = false
                 if (_uiState.value.isLiveActive) {
                     audioEngine.stopMicrophoneCapture()
-                    ZoniForegroundService.stop(app)
+                    if (preferences.isWakeWordEnabledSync() && preferences.isBackgroundListeningEnabledSync()) {
+                        ZoniForegroundService.resumeWakeWordAfterConversation(app)
+                    } else {
+                        ZoniForegroundService.stop(app, disablePreference = false)
+                    }
                 }
                 _uiState.update {
                     it.copy(
@@ -329,6 +343,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val perms = hardware.getPermissionsSnapshot()
         if (!perms.recordAudio) return false
 
+        // Prevent duplicate simultaneous Gemini Live sessions
+        if (_uiState.value.isLiveActive || pendingVoiceStart) {
+            return true
+        }
+
         val s = _uiState.value.settings
         if (!ZoniUserSettings.isValidProductionBackendUrl(s.backendServerUrl)) {
             _uiState.update {
@@ -341,6 +360,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             return false
         }
+
+        // Release wake-word microphone cleanly before Gemini Live takes over audio
+        ZoniForegroundService.pauseWakeWordForConversation(
+            app,
+            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.CONNECTING
+        )
 
         if (liveClient.isConnected()) {
             return activateMicrophoneAfterConnected()
@@ -373,7 +398,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun stopLiveVoice() {
         pendingVoiceStart = false
         audioEngine.stopMicrophoneCapture()
-        ZoniForegroundService.stop(app)
+        if (preferences.isWakeWordEnabledSync() && preferences.isBackgroundListeningEnabledSync()) {
+            ZoniForegroundService.resumeWakeWordAfterConversation(app)
+        } else {
+            ZoniForegroundService.stop(app, disablePreference = false)
+        }
         _uiState.update {
             it.copy(
                 isLiveActive = false,

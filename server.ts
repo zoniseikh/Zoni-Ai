@@ -23,6 +23,7 @@ import {
   ValidatedActionRequest,
 } from './src/utils/assistantActionRegistry.ts';
 import { LiveToolRelayManager } from './src/utils/liveToolRelay.ts';
+import { ALL_VOICE_LIFECYCLE_STATES } from './src/utils/voiceLifecycle.ts';
 
 const ZONI_ASSISTANT_TOOLS: FunctionDeclaration[] = ASSISTANT_TOOL_SPECS.map((spec) => {
   const properties: Record<string, any> = {};
@@ -371,6 +372,9 @@ app.get('/api/status', (req: Request, res: Response) => {
     assistantToolsCount: ZONI_ASSISTANT_TOOLS.length,
     liveToolsCount: ZONI_ASSISTANT_TOOLS.length,
     simCallingSupported: true,
+    callControlSupported: true,
+    wakeWordSupported: true,
+    voiceLifecycleStates: ALL_VOICE_LIFECYCLE_STATES,
     screenAwarenessSupported: geminiConfigured,
     notificationSmartReplySupported: geminiConfigured,
   });

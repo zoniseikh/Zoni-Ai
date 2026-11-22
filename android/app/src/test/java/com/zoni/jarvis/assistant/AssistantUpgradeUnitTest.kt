@@ -122,7 +122,7 @@ class AssistantUpgradeUnitTest {
 
     @Test
     fun categoryCD_actionProtocolAllowlistAndConfirmationEnforcement() {
-        assertEquals(33, AllowedActionType.entries.size)
+        assertEquals(36, AllowedActionType.entries.size)
         assertEquals(AllowedActionType.CONTACT_SEARCH, AllowedActionType.fromToolName("search_contacts"))
         assertEquals(AllowedActionType.FLASHLIGHT_CONTROL, AllowedActionType.fromToolName("set_flashlight"))
         assertEquals(AllowedActionType.PREPARE_APP_CHAT_MESSAGE, AllowedActionType.fromToolName("prepare_app_chat_message"))
@@ -136,6 +136,9 @@ class AssistantUpgradeUnitTest {
         assertEquals(AllowedActionType.TYPE_WHATSAPP_MESSAGE, AllowedActionType.fromToolName("type_whatsapp_message"))
         assertEquals(AllowedActionType.SEND_WHATSAPP_MESSAGE, AllowedActionType.fromToolName("send_whatsapp_message"))
         assertEquals(AllowedActionType.VERIFY_WHATSAPP_SEND, AllowedActionType.fromToolName("verify_whatsapp_send"))
+        assertEquals(AllowedActionType.ANSWER_INCOMING_CALL, AllowedActionType.fromToolName("answer_incoming_call"))
+        assertEquals(AllowedActionType.REJECT_INCOMING_CALL, AllowedActionType.fromToolName("reject_incoming_call"))
+        assertEquals(AllowedActionType.END_ACTIVE_CALL, AllowedActionType.fromToolName("end_active_call"))
 
         // Explicit communication actions execute directly without routine confirmation gates
         val (waReq, waErr) = ActionProtocolValidator.validate(

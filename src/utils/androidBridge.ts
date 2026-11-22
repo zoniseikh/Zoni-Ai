@@ -7,9 +7,15 @@
  */
 
 import type { ToolExecutionReport } from './assistantActionRegistry';
+import type {
+  CallControlActionResult,
+  IncomingCallStatusSnapshot,
+  VoiceLifecycleState,
+  WakeWordStatusSnapshot,
+} from './voiceLifecycle';
 
 export interface NativeAndroidBridge {
-  // Typed 25-tool allowlisted action engine & confirmation workflow
+  // Typed 36-tool allowlisted action engine
   executeTypedActionJson?: (requestJson: string) => string;
   confirmPendingActionJson?: (
     pendingActionId: string,
@@ -19,6 +25,23 @@ export interface NativeAndroidBridge {
   cancelPendingActionJson?: (pendingActionId: string) => string;
   listInstalledAppsJson?: () => string;
   getRuntimeDiagnosticsJson?: () => string;
+
+  // On-Device ZONI Wake Word & 24-Hour Transparent Background Listening
+  getWakeWordStatusJson?: () => string;
+  setWakeWordEnabled?: (enabled: boolean) => string;
+  setWakePhrase?: (phrase: string) => string;
+  startBackgroundWakeWordJson?: () => string;
+  stopBackgroundWakeWordJson?: () => string;
+  notifyVoiceSessionState?: (state: string) => boolean;
+  pauseWakeWordForVoiceSession?: () => boolean;
+  resumeWakeWordAfterVoiceSession?: () => boolean;
+
+  // Incoming & Active Phone Call Control (TelecomManager / InCallService)
+  getIncomingCallStatusJson?: () => string;
+  answerIncomingCallJson?: () => string;
+  rejectIncomingCallJson?: () => string;
+  endActiveCallJson?: () => string;
+  requestCallControlRole?: () => boolean;
 
   // Hardware, Calls, Contacts, SMS, WhatsApp
   setFlashlight?: (enable: boolean) => boolean;
@@ -93,6 +116,11 @@ export interface NativePermissionSnapshot {
   location: boolean;
   notifications: boolean;
   bluetooth?: boolean;
+  readPhoneState?: boolean;
+  answerPhoneCalls?: boolean;
+  defaultDialerRole?: boolean;
+  wakeWordEnabled?: boolean;
+  backgroundWakeWordRunning?: boolean;
   batteryOptimizationIgnored: boolean;
   overlayAllowed: boolean;
   notificationListenerEnabled: boolean;
@@ -566,5 +594,217 @@ export function performNativeAccessibilityDetailed(command: string): ToolExecuti
     return JSON.parse(bridge.performAccessibilityActionDetailedJson(command)) as ToolExecutionReport;
   } catch {
     return null;
+  }
+}
+
+// --- Wake Word, Background Service & Unified Voice Lifecycle Helpers ---
+
+export interface WakeWordBridgeResponse {
+  success: boolean;
+  status: string;
+  message: string;
+  wakePhrase?: string;
+  snapshot?: WakeWordStatusSnapshot;
+}
+
+export function getNativeWakeWordStatus(): WakeWordStatusSnapshot | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getWakeWordStatusJson) return null;
+  try {
+    return JSON.parse(bridge.getWakeWordStatusJson()) as WakeWordStatusSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+export function startNativeBackgroundWakeWord(): WakeWordBridgeResponse {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.startBackgroundWakeWordJson) {
+    return {
+      success: false,
+      status: 'native_bridge_unavailable',
+      message: '24-hour background microphone wake-word service is available inside the installed Android APK.',
+    };
+  }
+  try {
+    return JSON.parse(bridge.startBackgroundWakeWordJson()) as WakeWordBridgeResponse;
+  } catch {
+    return {
+      success: false,
+      status: 'parse_error',
+      message: 'Failed to parse native wake-word start response.',
+    };
+  }
+}
+
+export function stopNativeBackgroundWakeWord(): WakeWordBridgeResponse {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.stopBackgroundWakeWordJson) {
+    return {
+      success: false,
+      status: 'native_bridge_unavailable',
+      message: 'Background wake-word service is not running in browser preview.',
+    };
+  }
+  try {
+    return JSON.parse(bridge.stopBackgroundWakeWordJson()) as WakeWordBridgeResponse;
+  } catch {
+    return {
+      success: false,
+      status: 'parse_error',
+      message: 'Failed to parse native wake-word stop response.',
+    };
+  }
+}
+
+export function setNativeWakePhrase(phrase: string): WakeWordBridgeResponse {
+  const clean = phrase.trim().slice(0, 32) || 'Zoni';
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.setWakePhrase) {
+    return {
+      success: true,
+      status: 'saved_locally',
+      wakePhrase: clean,
+      message: `Wake phrase saved as "${clean}" (active inside Android APK).`,
+    };
+  }
+  try {
+    return JSON.parse(bridge.setWakePhrase(clean)) as WakeWordBridgeResponse;
+  } catch {
+    return {
+      success: false,
+      status: 'parse_error',
+      message: 'Failed to update wake phrase on Android bridge.',
+    };
+  }
+}
+
+export function notifyNativeVoiceSessionState(state: VoiceLifecycleState): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.notifyVoiceSessionState) return false;
+  try {
+    return Boolean(bridge.notifyVoiceSessionState(state));
+  } catch {
+    return false;
+  }
+}
+
+export function pauseNativeWakeWordForVoice(): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.pauseWakeWordForVoiceSession) return false;
+  try {
+    return Boolean(bridge.pauseWakeWordForVoiceSession());
+  } catch {
+    return false;
+  }
+}
+
+export function resumeNativeWakeWordAfterVoice(): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.resumeWakeWordAfterVoiceSession) return false;
+  try {
+    return Boolean(bridge.resumeWakeWordAfterVoiceSession());
+  } catch {
+    return false;
+  }
+}
+
+// --- Incoming & Active Phone Call Control Helpers ---
+
+export function getNativeIncomingCallStatus(): IncomingCallStatusSnapshot | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getIncomingCallStatusJson) return null;
+  try {
+    return JSON.parse(bridge.getIncomingCallStatusJson()) as IncomingCallStatusSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+export function answerNativeIncomingCall(): CallControlActionResult {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.answerIncomingCallJson) {
+    return {
+      success: false,
+      verified: false,
+      action: 'answer',
+      resultingCallState: 'IDLE',
+      status: 'native_bridge_unavailable',
+      message: 'Incoming call control requires the installed Android APK with Telecom permissions.',
+    };
+  }
+  try {
+    return JSON.parse(bridge.answerIncomingCallJson()) as CallControlActionResult;
+  } catch {
+    return {
+      success: false,
+      verified: false,
+      action: 'answer',
+      resultingCallState: 'IDLE',
+      status: 'parse_error',
+      message: 'Could not parse Android answer-call result.',
+    };
+  }
+}
+
+export function rejectNativeIncomingCall(): CallControlActionResult {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.rejectIncomingCallJson) {
+    return {
+      success: false,
+      verified: false,
+      action: 'reject',
+      resultingCallState: 'IDLE',
+      status: 'native_bridge_unavailable',
+      message: 'Incoming call rejection requires the installed Android APK with Telecom permissions.',
+    };
+  }
+  try {
+    return JSON.parse(bridge.rejectIncomingCallJson()) as CallControlActionResult;
+  } catch {
+    return {
+      success: false,
+      verified: false,
+      action: 'reject',
+      resultingCallState: 'IDLE',
+      status: 'parse_error',
+      message: 'Could not parse Android reject-call result.',
+    };
+  }
+}
+
+export function endNativeActiveCall(): CallControlActionResult {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.endActiveCallJson) {
+    return {
+      success: false,
+      verified: false,
+      action: 'end',
+      resultingCallState: 'IDLE',
+      status: 'native_bridge_unavailable',
+      message: 'Ending an active phone call requires the installed Android APK with Telecom permissions.',
+    };
+  }
+  try {
+    return JSON.parse(bridge.endActiveCallJson()) as CallControlActionResult;
+  } catch {
+    return {
+      success: false,
+      verified: false,
+      action: 'end',
+      resultingCallState: 'IDLE',
+      status: 'parse_error',
+      message: 'Could not parse Android end-call result.',
+    };
+  }
+}
+
+export function requestNativeCallControlRole(): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.requestCallControlRole) return false;
+  try {
+    return Boolean(bridge.requestCallControlRole());
+  } catch {
+    return false;
   }
 }
