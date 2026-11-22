@@ -98,10 +98,12 @@ test('getReconnectDelayMs increases exponentially up to maxMs', () => {
   assert.equal(d10, 10000);
 });
 
-test('shouldAutoReconnectLiveWs stops on non-retryable auth/config errors and respects maxAttempts', () => {
+test('shouldAutoReconnectLiveWs retries recoverable disconnects indefinitely but stops on permanent config errors', () => {
   assert.equal(shouldAutoReconnectLiveWs('GEMINI_KEY_MISSING', false, 0), false);
   assert.equal(shouldAutoReconnectLiveWs('GEMINI_KEY_INVALID', undefined, 0), false);
   assert.equal(shouldAutoReconnectLiveWs('BACKEND_URL_MISSING', undefined, 0), false);
+  assert.equal(shouldAutoReconnectLiveWs(undefined, true, 0), true);
+  assert.equal(shouldAutoReconnectLiveWs(undefined, true, 100), true);
   assert.equal(shouldAutoReconnectLiveWs(undefined, true, 0, 5), true);
   assert.equal(shouldAutoReconnectLiveWs(undefined, true, 5, 5), false);
 });
