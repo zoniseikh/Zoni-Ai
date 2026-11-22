@@ -480,6 +480,7 @@ export default function App() {
   const isSessionReadyRef = useRef<boolean>(false);
   const resumptionHandleRef = useRef<string | undefined>(undefined);
   const hadConnectedOnceRef = useRef<boolean>(false);
+  const resumeLiveVoiceAfterReconnectRef = useRef<boolean>(false);
   const reconnectAttemptRef = useRef<number>(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const turnTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2288,6 +2289,7 @@ export default function App() {
 
                 // Immediately halt mic capture so UI never falsely displays LISTENING
                 if (isLiveActiveRef.current) {
+                  resumeLiveVoiceAfterReconnectRef.current = true;
                   stopVoiceCapture(true);
                 }
                 setAssistantState('error');
@@ -2327,6 +2329,7 @@ export default function App() {
 
             // Never leave microphone active / UI showing LISTENING after WS disconnects
             if (isLiveActiveRef.current) {
+              resumeLiveVoiceAfterReconnectRef.current = true;
               stopVoiceCapture(true);
               setAssistantState('error');
               setConnectionError(disconnectReason);
@@ -2450,6 +2453,7 @@ export default function App() {
     const handleOffline = () => {
       setWsStatus('disconnected');
       if (isLiveActiveRef.current) {
+        resumeLiveVoiceAfterReconnectRef.current = true;
         stopVoiceCapture(true);
       }
       const offlineMsg =
@@ -2717,6 +2721,19 @@ export default function App() {
       setIsPermissionsModalOpen(true);
     }
   }, [connectSharedLiveWs, stopVoiceCapture]);
+
+  // Resume microphone capture automatically after a recoverable Live reconnect.
+  // The browser still enforces microphone permission and foreground execution rules.
+  useEffect(() => {
+    if (
+      wsStatus === 'connected' &&
+      resumeLiveVoiceAfterReconnectRef.current &&
+      !isLiveActiveRef.current
+    ) {
+      resumeLiveVoiceAfterReconnectRef.current = false;
+      void startVoiceCapture();
+    }
+  }, [wsStatus, startVoiceCapture]);
 
   // Toggle Live Voice Mode (uses the same shared WebSocket session)
   const handleToggleLiveMode = async () => {
