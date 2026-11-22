@@ -528,9 +528,12 @@ object MultilingualNameMatcher {
             Normalizer.Form.NFC
         ).lowercase()
 
-        // Normalize Bengali YA + NUKTA (য়) to Bengali YYA (য়).
-        // NFC does not consistently compose this Bengali sequence.
-        val normalized = lower.replace("\u09AF\u09BC", "\u09DF")
+        // Normalize Bengali consonant + NUKTA sequences to their precomposed forms.
+        // NFC does not consistently compose these Bengali sequences.
+        val normalized = lower
+            .replace("\u09A1\u09BC", "\u09DC") // ড়
+            .replace("\u09A2\u09BC", "\u09DD") // ঢ়
+            .replace("\u09AF\u09BC", "\u09DF") // য়
 
         val sb = StringBuilder(normalized.length * 2)
 
