@@ -242,7 +242,7 @@ export function upsertUserSpeechTurnMessage(
 /**
  * Calculates exponential backoff delay in ms for WebSocket reconnection.
  */
-export function getReconnectDelayMs(attempt: number, baseMs = 1500, maxMs = 60000): number {
+export function getReconnectDelayMs(attempt: number, baseMs = 1500, maxMs = 15000): number {
   const safeAttempt = Math.max(0, Math.min(10, attempt));
   const delay = baseMs * Math.pow(1.6, safeAttempt);
   return Math.min(maxMs, Math.round(delay));
@@ -250,14 +250,13 @@ export function getReconnectDelayMs(attempt: number, baseMs = 1500, maxMs = 6000
 
 /**
  * Determines whether the client should schedule an automatic WebSocket reconnect.
- * Stops futile retry loops on non-retryable auth/config failures. Retryable outages
- * continue with capped exponential backoff until the user stops the Live session.
+ * Stops futile retry loops on non-retryable auth/config failures or after maxAttempts.
  */
 export function shouldAutoReconnectLiveWs(
   errorCode: string | undefined,
   retryable: boolean | undefined,
   attempt: number,
-  maxAttempts: number = Number.POSITIVE_INFINITY
+  maxAttempts: number = 5
 ): boolean {
   if (retryable === false) return false;
   if (errorCode === 'GEMINI_KEY_MISSING' || errorCode === 'GEMINI_KEY_INVALID' || errorCode === 'BACKEND_URL_MISSING') {

@@ -480,7 +480,6 @@ export default function App() {
   const isSessionReadyRef = useRef<boolean>(false);
   const resumptionHandleRef = useRef<string | undefined>(undefined);
   const hadConnectedOnceRef = useRef<boolean>(false);
-  const resumeLiveVoiceAfterReconnectRef = useRef<boolean>(false);
   const reconnectAttemptRef = useRef<number>(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const turnTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1923,21 +1922,6 @@ export default function App() {
                 return;
               }
 
-              // Gemini may retire an upstream Live session while the client WebSocket
-              // remains open. Force a clean reconnect so the saved resumption handle is used.
-              if (msg.type === 'go_away' || msg.type === 'session_closed') {
-                isSessionReadyRef.current = false;
-                setWsStatus('reconnecting');
-                try {
-                  if (ws.readyState === WebSocket.OPEN) {
-                    ws.close(1012, msg.type === 'go_away' ? 'Gemini Live session retiring' : 'Gemini Live session closed');
-                  }
-                } catch {
-                  // onclose will schedule recovery if the transport is still active.
-                }
-                return;
-              }
-
               // Bidirectional Gemini Live Native Tool Call Relay (Root Cause 1 & 2)
               if (msg.type === 'native_tool_call' && msg.toolCallId && msg.actionType) {
                 clearTurnTimeout();
@@ -2265,31 +2249,18 @@ export default function App() {
                 setWsStatus('error');
                 setConnectionError(serverErr);
 
-                const canRetryLive = shouldAutoReconnectLiveWs(
-                  msg.code,
-                  msg.retryable,
-                  reconnectAttemptRef.current
-                );
-                if (!canRetryLive) {
+                if (
+                  !shouldAutoReconnectLiveWs(
+                    msg.code,
+                    msg.retryable,
+                    reconnectAttemptRef.current
+                  )
+                ) {
                   liveNonRetryableErrorRef.current = serverErr;
-                }
-
-                // Close the client socket for retryable upstream errors; merely showing
-                // ERROR leaves the outer WebSocket open and prevents onclose recovery.
-                try {
-                  if (ws.readyState === WebSocket.OPEN) {
-                    ws.close(
-                      canRetryLive ? 1012 : 1008,
-                      canRetryLive ? 'Retryable Gemini Live error' : 'Non-retryable Gemini Live error'
-                    );
-                  }
-                } catch {
-                  // onclose / reconnect handling remains the single recovery path.
                 }
 
                 // Immediately halt mic capture so UI never falsely displays LISTENING
                 if (isLiveActiveRef.current) {
-                  resumeLiveVoiceAfterReconnectRef.current = true;
                   stopVoiceCapture(true);
                 }
                 setAssistantState('error');
@@ -2329,7 +2300,6 @@ export default function App() {
 
             // Never leave microphone active / UI showing LISTENING after WS disconnects
             if (isLiveActiveRef.current) {
-              resumeLiveVoiceAfterReconnectRef.current = true;
               stopVoiceCapture(true);
               setAssistantState('error');
               setConnectionError(disconnectReason);
@@ -2453,7 +2423,6 @@ export default function App() {
     const handleOffline = () => {
       setWsStatus('disconnected');
       if (isLiveActiveRef.current) {
-        resumeLiveVoiceAfterReconnectRef.current = true;
         stopVoiceCapture(true);
       }
       const offlineMsg =
@@ -2721,19 +2690,6 @@ export default function App() {
       setIsPermissionsModalOpen(true);
     }
   }, [connectSharedLiveWs, stopVoiceCapture]);
-
-  // Resume microphone capture automatically after a recoverable Live reconnect.
-  // The browser still enforces microphone permission and foreground execution rules.
-  useEffect(() => {
-    if (
-      wsStatus === 'connected' &&
-      resumeLiveVoiceAfterReconnectRef.current &&
-      !isLiveActiveRef.current
-    ) {
-      resumeLiveVoiceAfterReconnectRef.current = false;
-      void startVoiceCapture();
-    }
-  }, [wsStatus, startVoiceCapture]);
 
   // Toggle Live Voice Mode (uses the same shared WebSocket session)
   const handleToggleLiveMode = async () => {
