@@ -54,11 +54,21 @@ class GeminiRepository(
     private var outputStream: OutputStream? = null
     private var readerJob: Job? = null
     private var reconnectJob: Job? = null
+    private var heartbeatJob: Job? = null
+    private var stableConnectionJob: Job? = null
+    @Volatile
+    private var isConnecting = false
+    @Volatile
+    private var lastPongAt = 0L
     @Volatile
     private var isConnected = false
     @Volatile
     private var isManuallyClosed = false
     private var reconnectAttempt = 0
+    @Volatile private var activeMode = "romantic"
+    @Volatile private var activeNickname = "Boss"
+    @Volatile private var activeVoice = "Kore"
+    @Volatile private var activeLang = "bn-BD"
     private val outgoingQueue = mutableListOf<String>()
     private var listener: LiveSessionListener? = null
 
@@ -105,11 +115,20 @@ class GeminiRepository(
         forceReconnect: Boolean = false
     ) {
         if (isConnected && !forceReconnect) return
+        if (isConnecting && !forceReconnect) return
         isManuallyClosed = false
+        activeMode = mode
+        activeNickname = nickname
+        activeVoice = voice
+        activeLang = lang
         reconnectJob?.cancel()
+        if (forceReconnect) {
+            reconnectAttempt = 0
+            closeCurrentTransport()
+        }
 
         scope.launch {
-            openWebSocketInternal(mode, nickname, voice, lang)
+            openWebSocketInternal(activeMode, activeNickname, activeVoice, activeLang)
         }
     }
 
@@ -182,13 +201,12 @@ class GeminiRepository(
     fun disconnectSession() {
         isManuallyClosed = true
         isConnected = false
+        isConnecting = false
         reconnectJob?.cancel()
+        heartbeatJob?.cancel()
+        stableConnectionJob?.cancel()
         readerJob?.cancel()
-        try {
-            socket?.close()
-        } catch (_: Exception) {}
-        socket = null
-        outputStream = null
+        closeCurrentTransport()
     }
 
     private suspend fun openWebSocketInternal(
@@ -197,6 +215,8 @@ class GeminiRepository(
         voice: String,
         lang: String
     ) {
+        if (isManuallyClosed || isConnected || isConnecting) return
+        isConnecting = true
         try {
             listener?.onConnectionStateChanged(
                 false,
@@ -262,16 +282,24 @@ class GeminiRepository(
             }
 
             isConnected = true
-            reconnectAttempt = 0
+            isConnecting = false
+            lastPongAt = System.currentTimeMillis()
+            startHeartbeat()
+            stableConnectionJob?.cancel()
+            stableConnectionJob = scope.launch {
+                delay(30000)
+                if (isConnected && !isManuallyClosed) reconnectAttempt = 0
+            }
 
             readerJob = scope.launch {
                 readWebSocketLoop(input)
             }
         } catch (e: Exception) {
+            isConnecting = false
             isConnected = false
             listener?.onConnectionStateChanged(false, false, "error")
             listener?.onError("Live WebSocket connection error: ${e.localizedMessage ?: "Disconnected"}")
-            scheduleReconnect(mode, nickname, voice, lang)
+            scheduleReconnect(activeMode, activeNickname, activeVoice, activeLang)
         }
     }
 
@@ -319,8 +347,11 @@ class GeminiRepository(
                     0x8 -> { // Close frame
                         break
                     }
-                    0x9 -> { // Ping -> send Pong
+                    0x9 -> { // Server Ping -> Pong
                         outputStream?.let { writeWebSocketControlFrame(it, 0xA, payload) }
+                    }
+                    0xA -> { // Pong acknowledges our heartbeat
+                        lastPongAt = System.currentTimeMillis()
                     }
                 }
             }
@@ -328,9 +359,13 @@ class GeminiRepository(
             // Connection dropped
         } finally {
             isConnected = false
+            isConnecting = false
+            heartbeatJob?.cancel()
+            stableConnectionJob?.cancel()
+            closeCurrentTransport()
             if (!isManuallyClosed) {
                 listener?.onConnectionStateChanged(false, false, "reconnecting")
-                scheduleReconnect("romantic", "Boss", "Kore", "bn-BD")
+                scheduleReconnect(activeMode, activeNickname, activeVoice, activeLang)
             } else {
                 listener?.onConnectionStateChanged(false, false, "disconnected")
             }
@@ -383,8 +418,24 @@ class GeminiRepository(
                 "interrupted" -> {
                     listener?.onInterrupted(turnId)
                 }
+                "go_away" -> {
+                    // Gemini is retiring this Live session. Resume proactively before it closes.
+                    scheduleReconnect(activeMode, activeNickname, activeVoice, activeLang, 1500L)
+                }
+                "session_closed" -> {
+                    scheduleReconnect(activeMode, activeNickname, activeVoice, activeLang, 1000L)
+                }
                 "error", "live_init_failed" -> {
-                    listener?.onError(msg.optString("message", "Live session error"))
+                    val message = msg.optString("message", "Live session error")
+                    listener?.onError(message)
+                    if (msg.optBoolean("retryable", true)) {
+                        scheduleReconnect(activeMode, activeNickname, activeVoice, activeLang, 2000L)
+                    } else {
+                        isConnected = false
+                        isManuallyClosed = true
+                        closeCurrentTransport()
+                        listener?.onConnectionStateChanged(false, false, "error")
+                    }
                 }
             }
         } catch (_: Exception) {}
@@ -408,17 +459,55 @@ class GeminiRepository(
         }
     }
 
-    private fun scheduleReconnect(mode: String, nickname: String, voice: String, lang: String) {
+    private fun scheduleReconnect(
+        mode: String,
+        nickname: String,
+        voice: String,
+        lang: String,
+        overrideDelayMs: Long? = null
+    ) {
         if (isManuallyClosed) return
-        reconnectJob?.cancel()
-        val delayMs = min(15000L, (1500.0 * 1.6.pow(reconnectAttempt.toDouble())).toLong())
-        reconnectAttempt += 1
+        if (reconnectJob?.isActive == true) return
+        isConnected = false
+        isConnecting = false
+        heartbeatJob?.cancel()
+        closeCurrentTransport()
+        val delayMs = overrideDelayMs
+            ?: min(60000L, (1500.0 * 1.8.pow(reconnectAttempt.toDouble())).toLong())
+        reconnectAttempt = (reconnectAttempt + 1).coerceAtMost(20)
+        listener?.onConnectionStateChanged(false, false, "reconnecting")
         reconnectJob = scope.launch {
             delay(delayMs)
-            if (!isManuallyClosed && !isConnected) {
+            if (!isManuallyClosed && !isConnected && !isConnecting) {
                 openWebSocketInternal(mode, nickname, voice, lang)
             }
         }
+    }
+
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = scope.launch {
+            while (isConnected && !isManuallyClosed) {
+                delay(20000L)
+                val out = outputStream ?: break
+                if (System.currentTimeMillis() - lastPongAt > 50000L) {
+                    try { socket?.close() } catch (_: Exception) {}
+                    break
+                }
+                try {
+                    writeWebSocketControlFrame(out, 0x9, ByteArray(0))
+                } catch (_: Exception) {
+                    try { socket?.close() } catch (_: Exception) {}
+                    break
+                }
+            }
+        }
+    }
+
+    private fun closeCurrentTransport() {
+        try { socket?.close() } catch (_: Exception) {}
+        socket = null
+        outputStream = null
     }
 
     @Synchronized
