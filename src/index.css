@@ -97,25 +97,31 @@
 .zoni-modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 50;
+  z-index: 1000;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  padding-top: max(0.75rem, env(safe-area-inset-top));
-  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
-  padding-left: max(0.75rem, env(safe-area-inset-left));
-  padding-right: max(0.75rem, env(safe-area-inset-right));
+  box-sizing: border-box;
+  padding: 12px;
+  padding-top: max(12px, env(safe-area-inset-top));
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+  padding-left: max(12px, env(safe-area-inset-left));
+  padding-right: max(12px, env(safe-area-inset-right));
+  pointer-events: auto;
+  isolation: isolate;
 }
 
 .zoni-modal-card {
   width: min(100%, 672px);
   display: flex;
   flex-direction: column;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
+  /* Keep a dependable fallback for Android System WebView viewport handling. */
   max-height: calc(100vh - 24px);
-  max-height: calc(var(--zoni-visual-vh, 100dvh) - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 24px);
+  max-height: calc(100dvh - 24px);
 }
 
 .zoni-modal-scroll {
