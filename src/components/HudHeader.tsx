@@ -387,8 +387,9 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
         {onOpenSettings && (
           <button
             onClick={() => {
-              if (vitals.soundFxEnabled) playProceduralSfx('click');
+              // Open the panel first; sound effects must never block core navigation.
               onOpenSettings();
+              if (vitals.soundFxEnabled) playProceduralSfx('click');
             }}
             className="flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1 rounded-lg border border-cyan-400/60 bg-gradient-to-r from-cyan-950/60 via-slate-900 to-pink-950/50 hover:border-cyan-300 text-cyan-200 text-[11px] sm:text-xs font-hud tracking-wider transition-all shadow-[0_0_14px_rgba(6,182,212,0.3)] font-bold whitespace-nowrap"
             title="Open Zoni Jarvis System Settings"
