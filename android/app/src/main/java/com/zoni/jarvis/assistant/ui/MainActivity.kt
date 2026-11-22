@@ -8,10 +8,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
-import android.util.Log
 import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
-import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -313,27 +311,8 @@ class MainActivity : ComponentActivity() {
                                 return assetLoader.shouldInterceptRequest(request.url)
                             }
 
-                            override fun onRenderProcessGone(
-                                view: WebView,
-                                detail: RenderProcessGoneDetail
-                            ): Boolean {
-                                Log.e(
-                                    "ZoniWebView",
-                                    "Renderer exited; crashed=${detail.didCrash()}. Recreating dashboard WebView."
-                                )
-                                if (dashboardWebView === view) {
-                                    dashboardWebView = null
-                                    runOnUiThread {
-                                        if (!isFinishing && !isDestroyed) recreate()
-                                    }
-                                }
-                                view.destroy()
-                                return true
-                            }
-
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
-                                Log.d("ZoniWebView", "Dashboard loaded: $url")
                                 val savedBackend = keyManager.getBackendUrl().trim()
                                 val hasValidBackend = ZoniUserSettings.isValidProductionBackendUrl(savedBackend)
                                 val quotedBackendUrl = JSONObject.quote(if (hasValidBackend) savedBackend else ZoniUserSettings.DEFAULT_BACKEND_URL)
@@ -352,20 +331,6 @@ class MainActivity : ComponentActivity() {
                         }
 
                         webChromeClient = object : WebChromeClient() {
-                            override fun onConsoleMessage(message: android.webkit.ConsoleMessage): Boolean {
-                                val level = when (message.messageLevel()) {
-                                    android.webkit.ConsoleMessage.MessageLevel.ERROR -> Log.ERROR
-                                    android.webkit.ConsoleMessage.MessageLevel.WARNING -> Log.WARN
-                                    else -> Log.DEBUG
-                                }
-                                Log.println(
-                                    level,
-                                    "ZoniWebConsole",
-                                    "${message.message()} ( ${message.sourceId()}: ${message.lineNumber()} )"
-                                )
-                                return true
-                            }
-
                             override fun onPermissionRequest(request: PermissionRequest) {
                                 runOnUiThread {
                                     val originHost = request.origin?.host
