@@ -521,17 +521,62 @@ object MultilingualNameMatcher {
     /**
      * Phonetic Latin skeleton so Bengali "রাহুল" / Hindi "राहुल" / English "Rahul" and
      * "জাহিদা" / "Jahida" / "Zahida" match cleanly across scripts.
+     *
+     * Note: Unicode NFC intentionally decomposes Bengali nukta letters (ড়, ঢ়, য়) into
+     * base consonant + U+09BC (BENGALI SIGN NUKTA) because they are in the Unicode
+     * Composition Exclusion Table. We explicitly match base+nukta pairs first so both
+     * precomposed (U+09DC/U+09DD/U+09DF) and decomposed (ড/ঢ/য + U+09BC) inputs yield
+     * identical, accurate Latin transliterations ("মায়া" -> "maya", "বাড়ি" -> "bari").
      */
     fun toPhoneticLatin(input: String): String {
         val lower = Normalizer.normalize(input.trim(), Normalizer.Form.NFC).lowercase()
         val sb = StringBuilder(lower.length * 2)
-        for (ch in lower) {
+        var i = 0
+        while (i < lower.length) {
+            val ch = lower[i]
+            val next = if (i + 1 < lower.length) lower[i + 1] else '\u0000'
+
+            // Handle Bengali nukta digraphs produced by Unicode NFC composition exclusions
+            if (next == '\u09BC') {
+                val bnNukta = when (ch) {
+                    'ড' -> "r"
+                    'ঢ' -> "rh"
+                    'য' -> "y"
+                    else -> null
+                }
+                if (bnNukta != null) {
+                    sb.append(bnNukta)
+                    i += 2
+                    continue
+                }
+            }
+
+            // Handle Devanagari nukta digraphs (क़, ख़, ग़, ज़, ड़, ढ़, फ़)
+            if (next == '\u093C') {
+                val hiNukta = when (ch) {
+                    'क' -> "k"
+                    'ख' -> "kh"
+                    'ग' -> "g"
+                    'ज' -> "j"
+                    'ड' -> "r"
+                    'ढ' -> "rh"
+                    'फ' -> "f"
+                    else -> null
+                }
+                if (hiNukta != null) {
+                    sb.append(hiNukta)
+                    i += 2
+                    continue
+                }
+            }
+
             val mapped = BENGALI_CHAR_MAP[ch] ?: DEVANAGARI_CHAR_MAP[ch]
             if (mapped != null) {
                 sb.append(mapped)
             } else if (ch.isLetterOrDigit() || ch == ' ') {
                 sb.append(ch)
             }
+            i++
         }
         return sb.toString()
             .replace('z', 'j')

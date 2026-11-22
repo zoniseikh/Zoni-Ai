@@ -24,8 +24,9 @@
 -keep class com.zoni.jarvis.assistant.device.** { *; }
 -keep class com.zoni.jarvis.assistant.calling.** { *; }
 
-# Keep Android Services & Screen Capture Manager declared in AndroidManifest.xml
+# Keep Android Services, Wake Word Engine & Screen Capture Manager declared in AndroidManifest.xml
 -keep class com.zoni.jarvis.assistant.service.** { *; }
+-keep class com.zoni.jarvis.assistant.wakeword.** { *; }
 -keep class com.zoni.jarvis.assistant.screen.** { *; }
 
 # Keep Google Tink / AndroidX Security Crypto key managers safely under R8

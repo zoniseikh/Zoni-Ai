@@ -76,28 +76,57 @@ jobs:
           java -version
           ./android/gradlew -p android --version
 
-      # 7. Run Android Unit Tests
+      # 7. Run Android Unit Tests (always enabled — prints JUnit failure details on error)
       - name: Run Android Unit Tests
         env:
           ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
-        run: ./android/gradlew -p android --no-daemon :app:testDebugUnitTest --stacktrace
+        run: |
+          set +e
+          ./android/gradlew -p android --no-daemon :app:testDebugUnitTest --stacktrace
+          TEST_EXIT=$?
+          if [ "$TEST_EXIT" -ne 0 ]; then
+            echo "=== Android Unit Test Failure Summary ==="
+            for xml in android/app/build/test-results/testDebugUnitTest/*.xml; do
+              if [ -f "$xml" ] && grep -q "<failure" "$xml"; then
+                echo "--- $xml ---"
+                cat "$xml"
+              fi
+            done
+          fi
+          exit "$TEST_EXIT"
 
-      # 8. Build Debug APK (never requires signing secrets)
+      - name: Upload Android Unit Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZONI-AI-Android-Unit-Test-Reports
+          path: |
+            android/app/build/reports/tests/testDebugUnitTest/
+            android/app/build/test-results/testDebugUnitTest/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # 8. Build & Validate Debug APK (never requires signing secrets)
       - name: Build Debug APK
         env:
           ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: |
           ./android/gradlew -p android --no-daemon :app:assembleDebug --stacktrace
-          test -f android/app/build/outputs/apk/debug/app-debug.apk
-          ls -lh android/app/build/outputs/apk/debug/app-debug.apk
+          DEBUG_APK="android/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$DEBUG_APK"
+          ls -lh "$DEBUG_APK"
+          "$ANDROID_HOME/build-tools/34.0.0/aapt2" dump badging "$DEBUG_APK" | head -n 5
 
-      # 9. Build Release APK
+      # 9. Build & Validate Release APK
       - name: Build Release APK
         env:
           ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: |
           ./android/gradlew -p android --no-daemon :app:assembleRelease --stacktrace
           ls -lh android/app/build/outputs/apk/release/
+          RELEASE_APK=$(ls android/app/build/outputs/apk/release/*.apk | head -n 1)
+          test -s "$RELEASE_APK"
+          "$ANDROID_HOME/build-tools/34.0.0/aapt2" dump badging "$RELEASE_APK" | head -n 5
 
       # 10. Sign Release APK only when valid signing secrets are configured (no secrets in if:)
       - name: Sign Release APK (if signing secrets are configured)
@@ -120,6 +149,11 @@ jobs:
 
           if [ -z "$KEY_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KEY_PASS" ] || [ -z "$KEY_ALIAS" ]; then
             echo "Signing secrets not configured; keeping unsigned Release APK."
+            {
+              echo "### ZONI AI APK Build Summary"
+              echo "- **Debug APK**: Built and validated (\`app-debug.apk\`, installable directly on Android devices)"
+              echo "- **Release APK**: Built **UNSIGNED** (\`app-release-unsigned.apk\`) because repository signing secrets are not configured."
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
@@ -151,7 +185,13 @@ jobs:
             --out "$RELEASE_DIR/ZONI-AI-release.apk" \
             "$RELEASE_DIR/app-release-aligned.apk"
 
-          "$BUILD_TOOLS/apksigner" verify "$RELEASE_DIR/ZONI-AI-release.apk"
+          "$BUILD_TOOLS/apksigner" verify --print-certs "$RELEASE_DIR/ZONI-AI-release.apk"
+
+          {
+            echo "### ZONI AI APK Build Summary"
+            echo "- **Debug APK**: Built and validated (\`app-debug.apk\`)"
+            echo "- **Release APK**: Built, **SIGNED**, and verified with \`apksigner\` (\`ZONI-AI-release.apk\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           echo "Release APK signed and verified successfully."
 
