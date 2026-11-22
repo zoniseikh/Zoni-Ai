@@ -523,16 +523,27 @@ object MultilingualNameMatcher {
      * "জাহিদা" / "Jahida" / "Zahida" match cleanly across scripts.
      */
     fun toPhoneticLatin(input: String): String {
-        val lower = Normalizer.normalize(input.trim(), Normalizer.Form.NFC).lowercase()
-        val sb = StringBuilder(lower.length * 2)
-        for (ch in lower) {
+        val lower = Normalizer.normalize(
+            input.trim(),
+            Normalizer.Form.NFC
+        ).lowercase()
+
+        // Normalize Bengali YA + NUKTA (য়) to Bengali YYA (য়).
+        // NFC does not consistently compose this Bengali sequence.
+        val normalized = lower.replace("\u09AF\u09BC", "\u09DF")
+
+        val sb = StringBuilder(normalized.length * 2)
+
+        for (ch in normalized) {
             val mapped = BENGALI_CHAR_MAP[ch] ?: DEVANAGARI_CHAR_MAP[ch]
+
             if (mapped != null) {
                 sb.append(mapped)
             } else if (ch.isLetterOrDigit() || ch == ' ') {
                 sb.append(ch)
             }
         }
+
         return sb.toString()
             .replace('z', 'j')
             .replace("ph", "f")
