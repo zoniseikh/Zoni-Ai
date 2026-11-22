@@ -137,10 +137,15 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
     }
   };
 
+  const safeAffectionName =
+    typeof selectedAffectionName === 'string' && selectedAffectionName.trim()
+      ? selectedAffectionName.trim()
+      : 'Boss';
+
   const isPredefinedMatch = PREDEFINED_AFFECTION_OPTIONS.some(
     (opt) =>
-      opt.value.toLowerCase() === selectedAffectionName.toLowerCase() ||
-      opt.aliases.some((a) => a.toLowerCase() === selectedAffectionName.toLowerCase())
+      opt.value.toLowerCase() === safeAffectionName.toLowerCase() ||
+      opt.aliases.some((a) => a.toLowerCase() === safeAffectionName.toLowerCase())
   );
   const isCustomNameActive = !isPredefinedMatch;
 
@@ -267,7 +272,7 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
                 type="button"
                 onClick={() => {
                   setIsEditingCustom(!isEditingCustom);
-                  setCustomInput(selectedAffectionName);
+                  setCustomInput(safeAffectionName);
                 }}
                 className="shrink-0 text-[10px] text-cyan-400 hover:text-cyan-300 flex items-center gap-1 font-hud uppercase tracking-wider"
               >
@@ -285,7 +290,7 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
                 </span>
                 <span className="text-xs font-hud text-pink-300 shrink-0">বর্তমান নাম:</span>
                 <span className="font-sci-fi text-base font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-pink-300 via-white to-cyan-300 truncate">
-                  &quot;{selectedAffectionName}&quot;
+                  &quot;{safeAffectionName}&quot;
                 </span>
               </div>
               <span className="px-2 py-0.5 rounded text-[9px] font-mono font-bold bg-pink-500/20 text-pink-300 border border-pink-400/40 shrink-0">
@@ -331,8 +336,8 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
               <div className="flex flex-wrap gap-2">
                 {PREDEFINED_AFFECTION_OPTIONS.map((opt) => {
                   const isSelected =
-                    selectedAffectionName.toLowerCase() === opt.value.toLowerCase() ||
-                    opt.aliases.some((a) => a.toLowerCase() === selectedAffectionName.toLowerCase());
+                    safeAffectionName.toLowerCase() === opt.value.toLowerCase() ||
+                    opt.aliases.some((a) => a.toLowerCase() === safeAffectionName.toLowerCase());
                   return (
                     <button
                       type="button"
@@ -352,7 +357,7 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
                 {isCustomNameActive && (
                   <div className="px-3 py-1.5 text-xs rounded-lg font-hud tracking-wide bg-pink-600/40 border-2 border-pink-400 text-pink-100 font-bold shadow-[0_0_14px_rgba(236,72,153,0.5)] flex items-center gap-1.5">
                     <Check className="w-3 h-3 text-pink-300" />
-                    <span>Custom: {selectedAffectionName}</span>
+                    <span>Custom: {safeAffectionName}</span>
                   </div>
                 )}
               </div>

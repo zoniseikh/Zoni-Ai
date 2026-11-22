@@ -163,14 +163,31 @@ class DeviceActionExecutor(private val context: Context) {
         } else {
             true
         }
+        val accessibilityConnected = ZoniAccessibilityService.isConnected()
+        val readContactsGranted = contactCallManager.hasContactPermission()
+        val callPhoneGranted = contactCallManager.hasCallPhonePermission()
+        val notifListenerEnabled = isNotificationListenerEnabled()
+        val discoveryStatus = when {
+            installedCount > 0 -> "ready"
+            installedCount == 0 -> "restricted_or_empty"
+            else -> "error"
+        }
         return JSONObject()
-            .put("accessibilityConnected", ZoniAccessibilityService.isConnected())
-            .put("readContactsGranted", contactCallManager.hasContactPermission())
-            .put("callPhoneGranted", contactCallManager.hasCallPhonePermission())
+            .put("bridgeConnected", true)
+            .put("accessibilityEnabled", accessibilityConnected)
+            .put("accessibilityConnected", accessibilityConnected)
+            .put("contactsPermissionGranted", readContactsGranted)
+            .put("readContactsGranted", readContactsGranted)
+            .put("callPhonePermissionGranted", callPhoneGranted)
+            .put("callPhoneGranted", callPhoneGranted)
+            .put("recordAudioPermissionGranted", recordAudioGranted)
             .put("recordAudioGranted", recordAudioGranted)
+            .put("notificationsPermissionGranted", postNotifGranted)
             .put("postNotificationsGranted", postNotifGranted)
-            .put("notificationListenerEnabled", isNotificationListenerEnabled())
+            .put("notificationListenerEnabled", notifListenerEnabled)
+            .put("installedAppCount", installedCount)
             .put("installedAppsCount", installedCount)
+            .put("installedAppDiscoveryStatus", discoveryStatus)
             .put("packageVisibilityOk", installedCount > 0)
             .put("lastActionRequested", lastActionRequested)
             .put("lastActionResult", lastActionResult)

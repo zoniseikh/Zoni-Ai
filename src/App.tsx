@@ -9,6 +9,7 @@ import { PermissionsSetupModal } from './components/PermissionsSetupModal';
 import { ZoniSettingsModal, BackendHealthSnapshot } from './components/ZoniSettingsModal';
 import { SimCallingModal } from './components/SimCallingModal';
 import { ActionConfirmationCard, PendingActionDraftState } from './components/ActionConfirmationCard';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { AlertTriangle, PhoneIncoming, PhoneOff, RefreshCw, Settings2, X } from 'lucide-react';
 import { OfflineIndicator } from './components/PWAInstallButton';
 import {
@@ -50,6 +51,7 @@ import {
   detectAndroidRuntimeMode,
   getNativePermissionsSnapshot,
   getNativeRuntimeDiagnostics,
+  formatInstalledAppDiscoveryLabel,
   executeTypedActionViaNativeBridge,
   cancelPendingActionViaNativeBridge,
   listInstalledAppsViaNativeBridge,
@@ -693,52 +695,49 @@ export default function App() {
   }, []);
 
   const refreshDeviceDiagnostics = useCallback(() => {
-    const bridge = getNativeAndroidBridge();
-    const mode = detectAndroidRuntimeMode();
-    const nativeDiag = getNativeRuntimeDiagnostics();
-    const nativePerms = getNativePermissionsSnapshot();
-    const apps = bridge ? listInstalledAppsViaNativeBridge() : null;
+    try {
+      const bridge = getNativeAndroidBridge();
+      const mode = detectAndroidRuntimeMode();
+      const nativeDiag = getNativeRuntimeDiagnostics();
+      const nativePerms = getNativePermissionsSnapshot();
+      const apps = bridge ? listInstalledAppsViaNativeBridge() : null;
 
-    setDeviceDiagnostics((prev) => ({
-      ...prev,
-      bridgeConnected: Boolean(bridge),
-      runtimeMode: mode,
-      accessibilityEnabled: nativeDiag
-        ? nativeDiag.accessibilityEnabled
-        : nativePerms
-        ? nativePerms.accessibilityEnabled
-        : null,
-      contactsPermissionGranted: nativeDiag
-        ? nativeDiag.contactsPermissionGranted
-        : nativePerms
-        ? nativePerms.readContacts
-        : null,
-      callPhonePermissionGranted: nativeDiag?.callPhonePermissionGranted ?? nativePerms?.callPhone ?? null,
-      recordAudioPermissionGranted:
-        nativeDiag?.recordAudioPermissionGranted ?? nativePerms?.recordAudio ?? null,
-      notificationListenerEnabled:
-        nativeDiag?.notificationListenerEnabled ?? nativePerms?.notificationListenerEnabled ?? null,
-      installedAppDiscoveryStatus: nativeDiag
-        ? `${nativeDiag.installedAppDiscoveryStatus.toUpperCase()} (${nativeDiag.installedAppCount} APPS)`
-        : bridge
-        ? apps && apps.length > 0
-          ? `READY (${apps.length} APPS)`
-          : 'RESTRICTED OR EMPTY'
-        : 'WEB PREVIEW (APK REQUIRED)',
-      lastActionRequested:
-        nativeDiag?.lastActionRequested && nativeDiag.lastActionRequested !== 'none'
-          ? sanitizeDiagnosticMessage(nativeDiag.lastActionRequested)
-          : prev.lastActionRequested,
-      lastActionResult:
-        nativeDiag?.lastActionResult && nativeDiag.lastActionResult !== 'none'
-          ? sanitizeDiagnosticMessage(nativeDiag.lastActionResult)
-          : prev.lastActionResult,
-      lastFailureReason:
-        nativeDiag?.lastFailureReason && nativeDiag.lastFailureReason !== 'none'
-          ? sanitizeDiagnosticMessage(nativeDiag.lastFailureReason)
-          : prev.lastFailureReason,
-      updatedAtIso: new Date().toISOString(),
-    }));
+      setDeviceDiagnostics((prev) => ({
+        ...prev,
+        bridgeConnected: Boolean(bridge),
+        runtimeMode: mode,
+        accessibilityEnabled:
+          nativeDiag?.accessibilityEnabled ?? nativePerms?.accessibilityEnabled ?? null,
+        contactsPermissionGranted:
+          nativeDiag?.contactsPermissionGranted ?? nativePerms?.readContacts ?? null,
+        callPhonePermissionGranted:
+          nativeDiag?.callPhonePermissionGranted ?? nativePerms?.callPhone ?? null,
+        recordAudioPermissionGranted:
+          nativeDiag?.recordAudioPermissionGranted ?? nativePerms?.recordAudio ?? null,
+        notificationListenerEnabled:
+          nativeDiag?.notificationListenerEnabled ?? nativePerms?.notificationListenerEnabled ?? null,
+        installedAppDiscoveryStatus: formatInstalledAppDiscoveryLabel(
+          nativeDiag,
+          apps ? apps.length : null,
+          Boolean(bridge)
+        ),
+        lastActionRequested:
+          nativeDiag?.lastActionRequested && nativeDiag.lastActionRequested !== 'none'
+            ? sanitizeDiagnosticMessage(nativeDiag.lastActionRequested)
+            : prev.lastActionRequested,
+        lastActionResult:
+          nativeDiag?.lastActionResult && nativeDiag.lastActionResult !== 'none'
+            ? sanitizeDiagnosticMessage(nativeDiag.lastActionResult)
+            : prev.lastActionResult,
+        lastFailureReason:
+          nativeDiag?.lastFailureReason && nativeDiag.lastFailureReason !== 'none'
+            ? sanitizeDiagnosticMessage(nativeDiag.lastFailureReason)
+            : prev.lastFailureReason,
+        updatedAtIso: new Date().toISOString(),
+      }));
+    } catch (err) {
+      console.error('[ZONI] Failed to refresh device diagnostics:', err);
+    }
   }, []);
 
   const recordActionDiagnostic = useCallback(
@@ -909,9 +908,10 @@ export default function App() {
         const digitsOnly = recipient.replace(/[^\d+]/g, '');
         const isNumeric = digitsOnly.length >= 7;
         const displayRecipientName = String(req.arguments.recipient_name || recipient).trim() || recipient;
+        const safeAppName = typeof rawAppName === 'string' ? rawAppName.trim() : '';
         const displayAppName =
-          req.actionType === 'prepare_app_chat_message'
-            ? rawAppName.charAt(0).toUpperCase() + rawAppName.slice(1).toLowerCase()
+          req.actionType === 'prepare_app_chat_message' && safeAppName
+            ? safeAppName.charAt(0).toUpperCase() + safeAppName.slice(1).toLowerCase()
             : undefined;
 
         if (req.actionType === 'prepare_app_chat_message') {
@@ -3792,58 +3792,64 @@ export default function App() {
       />
 
       {/* Clean Zoni Jarvis Settings Modal (Soul Core, Personality Matrix, Voice Modulator, Wake Word, Telemetry, Device Action Diagnostics) */}
-      <ZoniSettingsModal
-        isOpen={isSettingsModalOpen}
-        onClose={() => setIsSettingsModalOpen(false)}
-        vitals={vitals}
-        selectedAffectionName={selectedAffectionName}
-        isLiveActive={isLiveActive}
-        wsStatus={wsStatus}
-        backendHealth={backendHealth}
-        deviceDiagnostics={deviceDiagnostics}
-        wakeWordStatus={wakeWordStatus}
-        voiceLifecycleState={voiceLifecycleState}
-        onStartBackgroundWakeWord={handleStartBackgroundWakeWord}
-        onStopBackgroundWakeWord={handleStopBackgroundWakeWord}
-        onUpdateWakePhrase={handleUpdateWakePhrase}
-        onToggleLiveMode={handleToggleLiveMode}
-        onOpenBatterySettings={() => {
-          const bridge = getNativeAndroidBridge();
-          if (bridge?.openSystemSettings) {
-            bridge.openSystemSettings('battery');
-          } else {
+      <ErrorBoundary
+        variant="modal"
+        title="SETTINGS INTERFACE RECOVERY"
+        onDismiss={() => setIsSettingsModalOpen(false)}
+      >
+        <ZoniSettingsModal
+          isOpen={isSettingsModalOpen}
+          onClose={() => setIsSettingsModalOpen(false)}
+          vitals={vitals}
+          selectedAffectionName={selectedAffectionName}
+          isLiveActive={isLiveActive}
+          wsStatus={wsStatus}
+          backendHealth={backendHealth}
+          deviceDiagnostics={deviceDiagnostics}
+          wakeWordStatus={wakeWordStatus}
+          voiceLifecycleState={voiceLifecycleState}
+          onStartBackgroundWakeWord={handleStartBackgroundWakeWord}
+          onStopBackgroundWakeWord={handleStopBackgroundWakeWord}
+          onUpdateWakePhrase={handleUpdateWakePhrase}
+          onToggleLiveMode={handleToggleLiveMode}
+          onOpenBatterySettings={() => {
+            const bridge = getNativeAndroidBridge();
+            if (bridge?.openSystemSettings) {
+              bridge.openSystemSettings('battery');
+            } else {
+              setIsSettingsModalOpen(false);
+              setIsPermissionsModalOpen(true);
+            }
+          }}
+          onRequestMicPermission={() => {
+            const bridge = getNativeAndroidBridge();
+            if (bridge?.requestRuntimePermission) {
+              bridge.requestRuntimePermission('microphone');
+            } else {
+              void requestMicrophoneAccess();
+            }
+          }}
+          onSelectMode={handleSelectMode}
+          onUpdateAffectionName={handleUpdateAffectionName}
+          onSelectVoice={handleSelectVoice}
+          onToggleSoundFx={handleToggleSoundFx}
+          onReconnectLive={handleManualReconnectLive}
+          onRefreshDiagnostics={refreshDeviceDiagnostics}
+          onOpenAccessibilitySettings={() => {
+            const bridge = getNativeAndroidBridge();
+            if (bridge?.openSystemSettings) {
+              bridge.openSystemSettings('accessibility');
+            } else {
+              setIsSettingsModalOpen(false);
+              setIsPermissionsModalOpen(true);
+            }
+          }}
+          onOpenBackendSetup={() => {
             setIsSettingsModalOpen(false);
             setIsPermissionsModalOpen(true);
-          }
-        }}
-        onRequestMicPermission={() => {
-          const bridge = getNativeAndroidBridge();
-          if (bridge?.requestRuntimePermission) {
-            bridge.requestRuntimePermission('microphone');
-          } else {
-            void requestMicrophoneAccess();
-          }
-        }}
-        onSelectMode={handleSelectMode}
-        onUpdateAffectionName={handleUpdateAffectionName}
-        onSelectVoice={handleSelectVoice}
-        onToggleSoundFx={handleToggleSoundFx}
-        onReconnectLive={handleManualReconnectLive}
-        onRefreshDiagnostics={refreshDeviceDiagnostics}
-        onOpenAccessibilitySettings={() => {
-          const bridge = getNativeAndroidBridge();
-          if (bridge?.openSystemSettings) {
-            bridge.openSystemSettings('accessibility');
-          } else {
-            setIsSettingsModalOpen(false);
-            setIsPermissionsModalOpen(true);
-          }
-        }}
-        onOpenBackendSetup={() => {
-          setIsSettingsModalOpen(false);
-          setIsPermissionsModalOpen(true);
-        }}
-      />
+          }}
+        />
+      </ErrorBoundary>
 
       {/* Backend Health, Permissions & Background Setup Wizard Modal */}
       <PermissionsSetupModal

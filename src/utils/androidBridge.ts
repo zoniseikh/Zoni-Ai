@@ -360,17 +360,182 @@ export function listInstalledAppsViaNativeBridge(): InstalledAppEntry[] | null {
 
 export interface NativeRuntimeDiagnostics {
   bridgeConnected: boolean;
-  accessibilityEnabled: boolean;
-  contactsPermissionGranted: boolean;
-  callPhonePermissionGranted?: boolean;
-  recordAudioPermissionGranted?: boolean;
-  notificationsPermissionGranted?: boolean;
-  notificationListenerEnabled?: boolean;
+  accessibilityEnabled: boolean | null;
+  contactsPermissionGranted: boolean | null;
+  callPhonePermissionGranted?: boolean | null;
+  recordAudioPermissionGranted?: boolean | null;
+  notificationsPermissionGranted?: boolean | null;
+  notificationListenerEnabled?: boolean | null;
   installedAppDiscoveryStatus: string;
-  installedAppCount: number;
+  installedAppCount: number | null;
   lastActionRequested: string;
   lastActionResult: string;
   lastFailureReason: string;
+}
+
+function readOptionalBoolean(
+  obj: Record<string, unknown>,
+  ...keys: string[]
+): boolean | null {
+  for (const key of keys) {
+    if (typeof obj[key] === 'boolean') {
+      return obj[key] as boolean;
+    }
+  }
+  return null;
+}
+
+function readOptionalFiniteNumber(
+  obj: Record<string, unknown>,
+  ...keys: string[]
+): number | null {
+  for (const key of keys) {
+    const val = obj[key];
+    if (typeof val === 'number' && Number.isFinite(val)) {
+      return val;
+    }
+  }
+  return null;
+}
+
+function readOptionalString(
+  obj: Record<string, unknown>,
+  ...keys: string[]
+): string {
+  for (const key of keys) {
+    const val = obj[key];
+    if (typeof val === 'string' && val.trim().length > 0) {
+      return val.trim();
+    }
+  }
+  return '';
+}
+
+/**
+ * Validates and normalizes JSON returned by Android's `getRuntimeDiagnosticsJson()`.
+ * Handles both the canonical schema (`accessibilityEnabled`, `installedAppDiscoveryStatus`, `installedAppCount`)
+ * and legacy Android APK payloads (`accessibilityConnected`, `readContactsGranted`, `installedAppsCount`, `packageVisibilityOk`)
+ * without fabricating missing values or throwing on omitted optional keys.
+ */
+export function parseNativeRuntimeDiagnosticsJson(
+  rawJson: string | undefined | null
+): NativeRuntimeDiagnostics | null {
+  if (!rawJson || typeof rawJson !== 'string') return null;
+  try {
+    const parsed = JSON.parse(rawJson);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    const record = parsed as Record<string, unknown>;
+
+    const installedCount = readOptionalFiniteNumber(
+      record,
+      'installedAppCount',
+      'installedAppsCount'
+    );
+    const packageVisibilityOk = readOptionalBoolean(record, 'packageVisibilityOk');
+    const explicitDiscoveryStatus = readOptionalString(
+      record,
+      'installedAppDiscoveryStatus'
+    );
+
+    const installedAppDiscoveryStatus =
+      explicitDiscoveryStatus ||
+      (installedCount !== null && installedCount < 0
+        ? 'error'
+        : packageVisibilityOk === true || (installedCount !== null && installedCount > 0)
+        ? 'ready'
+        : packageVisibilityOk === false || installedCount === 0
+        ? 'restricted_or_empty'
+        : 'unavailable');
+
+    return {
+      bridgeConnected: readOptionalBoolean(record, 'bridgeConnected') ?? true,
+      accessibilityEnabled: readOptionalBoolean(
+        record,
+        'accessibilityEnabled',
+        'accessibilityConnected'
+      ),
+      contactsPermissionGranted: readOptionalBoolean(
+        record,
+        'contactsPermissionGranted',
+        'readContactsGranted'
+      ),
+      callPhonePermissionGranted: readOptionalBoolean(
+        record,
+        'callPhonePermissionGranted',
+        'callPhoneGranted'
+      ),
+      recordAudioPermissionGranted: readOptionalBoolean(
+        record,
+        'recordAudioPermissionGranted',
+        'recordAudioGranted'
+      ),
+      notificationsPermissionGranted: readOptionalBoolean(
+        record,
+        'notificationsPermissionGranted',
+        'postNotificationsGranted'
+      ),
+      notificationListenerEnabled: readOptionalBoolean(
+        record,
+        'notificationListenerEnabled'
+      ),
+      installedAppDiscoveryStatus,
+      installedAppCount: installedCount,
+      lastActionRequested: readOptionalString(record, 'lastActionRequested') || 'none',
+      lastActionResult: readOptionalString(record, 'lastActionResult') || 'idle',
+      lastFailureReason: readOptionalString(record, 'lastFailureReason'),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Formats the Settings Diagnostics "APP DISCOVERY" status label safely without ever calling
+ * `.toUpperCase()` on undefined or printing `undefined APPS`.
+ */
+export function formatInstalledAppDiscoveryLabel(
+  nativeDiag: Partial<NativeRuntimeDiagnostics> | null | undefined,
+  fallbackAppCount: number | null,
+  hasBridge: boolean
+): string {
+  if (nativeDiag) {
+    const rawStatus =
+      typeof nativeDiag.installedAppDiscoveryStatus === 'string'
+        ? nativeDiag.installedAppDiscoveryStatus.trim()
+        : '';
+    const count =
+      typeof nativeDiag.installedAppCount === 'number' &&
+      Number.isFinite(nativeDiag.installedAppCount)
+        ? nativeDiag.installedAppCount
+        : fallbackAppCount;
+
+    const statusLabel = (
+      rawStatus ||
+      (count !== null && count < 0
+        ? 'error'
+        : count !== null && count > 0
+        ? 'ready'
+        : count === 0
+        ? 'restricted_or_empty'
+        : 'unavailable')
+    )
+      .replace(/_/g, ' ')
+      .toUpperCase();
+
+    return count !== null && count >= 0
+      ? `${statusLabel} (${count} APPS)`
+      : statusLabel;
+  }
+
+  if (hasBridge) {
+    return fallbackAppCount !== null && fallbackAppCount > 0
+      ? `READY (${fallbackAppCount} APPS)`
+      : 'RESTRICTED OR EMPTY';
+  }
+
+  return 'WEB PREVIEW (APK REQUIRED)';
 }
 
 export function getNativeRuntimeDiagnostics(): NativeRuntimeDiagnostics | null {
@@ -378,8 +543,7 @@ export function getNativeRuntimeDiagnostics(): NativeRuntimeDiagnostics | null {
   if (!bridge?.getRuntimeDiagnosticsJson) return null;
   try {
     const raw = bridge.getRuntimeDiagnosticsJson();
-    if (!raw) return null;
-    return JSON.parse(raw) as NativeRuntimeDiagnostics;
+    return parseNativeRuntimeDiagnosticsJson(raw);
   } catch {
     return null;
   }
