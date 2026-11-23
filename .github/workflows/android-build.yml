@@ -43,8 +43,6 @@ jobs:
           npm run lint
 
       - name: Build React Dashboard & Sync into Android Assets
-        env:
-          VITE_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: npm run android:sync
 
       # 3. Java 17 (compatible with AGP 8.5.2 & Gradle 8.7)
@@ -78,8 +76,6 @@ jobs:
 
       # 7. Run Android Unit Tests (always enabled — prints JUnit failure details on error)
       - name: Run Android Unit Tests
-        env:
-          ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: |
           set +e
           ./android/gradlew -p android --no-daemon :app:testDebugUnitTest --stacktrace
@@ -108,8 +104,6 @@ jobs:
 
       # 8. Build & Validate Debug APK (never requires signing secrets)
       - name: Build Debug APK
-        env:
-          ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: |
           ./android/gradlew -p android --no-daemon :app:assembleDebug --stacktrace
           DEBUG_APK="android/app/build/outputs/apk/debug/app-debug.apk"
@@ -119,8 +113,6 @@ jobs:
 
       # 9. Build & Validate Release APK
       - name: Build Release APK
-        env:
-          ZONI_BACKEND_URL: ${{ vars.ZONI_BACKEND_URL || 'https://zoni-ai-675435111499.asia-southeast1.run.app' }}
         run: |
           ./android/gradlew -p android --no-daemon :app:assembleRelease --stacktrace
           ls -lh android/app/build/outputs/apk/release/

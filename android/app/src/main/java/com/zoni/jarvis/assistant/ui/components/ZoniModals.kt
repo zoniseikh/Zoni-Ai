@@ -51,6 +51,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -72,10 +73,12 @@ fun ZoniSettingsDialog(
     onUpdateAffectionName: (String) -> Unit,
     onSelectMode: (CompanionMode) -> Unit,
     onSelectVoice: (VoiceProfile) -> Unit,
-    onUpdateBackendUrl: (String) -> Unit
+    onSaveGeminiApiKey: (String) -> Boolean,
+    onDeleteGeminiApiKey: () -> Unit
 ) {
     var customName by remember { mutableStateOf(uiState.settings.selectedAffectionName) }
-    var serverUrlInput by remember { mutableStateOf(uiState.settings.backendServerUrl) }
+    var apiKeyDraft by remember { mutableStateOf("") }
+    var keyFeedback by remember { mutableStateOf<String?>(null) }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -249,21 +252,41 @@ fun ZoniSettingsDialog(
                         }
                     }
 
-                    // 4. Gemini Live Server Link & Protocol Telemetry
-                    SectionCard(title = "4. ANDROID BACKEND SERVER & PROTOCOL", accent = ZoniColors.Cyan400) {
+                    // 4. Gemini API Key & Direct Live Connection (BYOK)
+                    SectionCard(title = "4. GEMINI API KEY & DIRECT LIVE (BYOK)", accent = ZoniColors.Cyan400) {
                         Text(
-                            text = "PROTOCOL: WSS // GEMINI-3.8-LIVE (16kHz PCM ⇄ 24kHz PCM)",
+                            text = "PROTOCOL: DIRECT GOOGLE GEMINI LIVE WSS (16kHz PCM ⇄ 24kHz PCM)",
                             color = ZoniColors.Cyan300,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.SemiBold
                         )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = if (uiState.geminiKeyConfigured && !uiState.geminiKeyMasked.isNullOrBlank()) {
+                                "STATUS: CONFIGURED (${uiState.geminiKeyMasked}) • ${if (uiState.isKeystoreBacked) "ANDROID KEYSTORE" else "ENCRYPTED PREFS"}"
+                            } else {
+                                "STATUS: NOT CONFIGURED — ENTER YOUR OWN GEMINI API KEY"
+                            },
+                            color = if (uiState.geminiKeyConfigured) ZoniColors.Emerald300 else ZoniColors.Amber400,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
                         Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
-                            value = serverUrlInput,
-                            onValueChange = { serverUrlInput = it },
+                            value = apiKeyDraft,
+                            onValueChange = {
+                                apiKeyDraft = it
+                                keyFeedback = null
+                            },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            label = { Text("Zoni Server URL (https://...)", fontSize = 11.sp) },
+                            visualTransformation = PasswordVisualTransformation(),
+                            label = {
+                                Text(
+                                    if (uiState.geminiKeyConfigured) "Replace Gemini API Key (AIza...)" else "Gemini API Key (AIza...)",
+                                    fontSize = 11.sp
+                                )
+                            },
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedBorderColor = ZoniColors.Cyan400,
                                 unfocusedBorderColor = ZoniColors.Slate800,
@@ -271,13 +294,38 @@ fun ZoniSettingsDialog(
                                 unfocusedTextColor = ZoniColors.Cyan50
                             )
                         )
-                        Spacer(Modifier.height(6.dp))
-                        Button(
-                            onClick = { onUpdateBackendUrl(serverUrlInput) },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = ZoniColors.Cyan500)
-                        ) {
-                            Text("RECONNECT SERVER", color = ZoniColors.Slate950, fontWeight = FontWeight.Bold)
+                        if (keyFeedback != null) {
+                            Spacer(Modifier.height(4.dp))
+                            Text(text = keyFeedback ?: "", color = ZoniColors.Rose400, fontSize = 11.sp)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = {
+                                    if (onSaveGeminiApiKey(apiKeyDraft)) {
+                                        apiKeyDraft = ""
+                                        keyFeedback = null
+                                    } else {
+                                        keyFeedback = "Invalid Gemini API Key format."
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = ZoniColors.Cyan500)
+                            ) {
+                                Text("SAVE & CONNECT", color = ZoniColors.Slate950, fontWeight = FontWeight.Bold)
+                            }
+                            if (uiState.geminiKeyConfigured) {
+                                Button(
+                                    onClick = {
+                                        onDeleteGeminiApiKey()
+                                        apiKeyDraft = ""
+                                        keyFeedback = null
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = ZoniColors.Rose400)
+                                ) {
+                                    Text("DELETE", color = ZoniColors.Slate950, fontWeight = FontWeight.Bold)
+                                }
+                            }
                         }
                     }
                 }

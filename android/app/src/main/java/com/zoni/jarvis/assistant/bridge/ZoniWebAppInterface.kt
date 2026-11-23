@@ -8,7 +8,6 @@ import android.webkit.JavascriptInterface
 import com.zoni.jarvis.assistant.BuildConfig
 import com.zoni.jarvis.assistant.calling.SimCallManager
 import com.zoni.jarvis.assistant.data.SecureKeyManager
-import com.zoni.jarvis.assistant.data.ZoniUserSettings
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
 import com.zoni.jarvis.assistant.screen.ScreenCaptureManager
 import com.zoni.jarvis.assistant.service.AutoReplyRuleManager
@@ -422,7 +421,7 @@ class ZoniWebAppInterface(
         return true
     }
 
-    // --- Onboarding, Backend Config, Floating Orb & System Status ---
+    // --- Onboarding, Gemini API Key (BYOK Keystore), Floating Orb & System Status ---
 
     @JavascriptInterface
     fun openOnboardingWizard(): Boolean {
@@ -438,17 +437,31 @@ class ZoniWebAppInterface(
     }
 
     @JavascriptInterface
-    fun getBackendUrl(): String = keyManager.getBackendUrl()
+    fun saveGeminiApiKey(apiKey: String): Boolean = keyManager.saveApiKey(apiKey)
 
     @JavascriptInterface
-    fun setBackendUrl(url: String): Boolean {
-        val clean = url.trim().trimEnd('/')
-        if (!ZoniUserSettings.isValidProductionBackendUrl(clean)) {
-            return false
-        }
-        keyManager.saveBackendUrl(clean)
-        return true
+    fun deleteGeminiApiKey(): Boolean = keyManager.deleteApiKey()
+
+    @JavascriptInterface
+    fun getGeminiApiKeyStatusJson(): String {
+        val configured = keyManager.hasApiKey()
+        val masked = keyManager.getMaskedApiKeyPreview()
+        val keystoreBacked = keyManager.isUsingAndroidKeystore()
+        return JSONObject()
+            .put("configured", configured)
+            .put("maskedPreview", masked ?: JSONObject.NULL)
+            .put(
+                "storageKind",
+                if (keystoreBacked) "android_keystore" else "android_private_prefs"
+            )
+            .put("keystoreBacked", keystoreBacked)
+            .put("isKeystoreBacked", keystoreBacked)
+            .put("isNativeAndroid", true)
+            .toString()
     }
+
+    @JavascriptInterface
+    fun getGeminiApiKeyForRequest(): String = keyManager.getApiKey().orEmpty()
 
     @JavascriptInterface
     fun setFloatingOrbEnabled(enable: Boolean): Boolean {

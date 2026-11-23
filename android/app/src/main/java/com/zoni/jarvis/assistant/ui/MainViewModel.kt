@@ -52,7 +52,10 @@ data class ZoniUiState(
     val isTorchOn: Boolean = false,
     val isFloatingOrbRunning: Boolean = false,
     val battery: BatterySnapshot = BatterySnapshot(100, false),
-    val permissions: AndroidPermissionsSnapshot? = null
+    val permissions: AndroidPermissionsSnapshot? = null,
+    val geminiKeyConfigured: Boolean = false,
+    val geminiKeyMasked: String? = null,
+    val isKeystoreBacked: Boolean = false
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -100,15 +103,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     state.copy(
                         settings = userSettings,
-                        latestTranscript = updatedWelcome
+                        latestTranscript = updatedWelcome,
+                        geminiKeyConfigured = preferences.hasGeminiApiKey(),
+                        geminiKeyMasked = preferences.getMaskedGeminiApiKeyPreview(),
+                        isKeystoreBacked = preferences.isKeystoreBacked()
                     )
                 }
                 if (!initializedConnection) {
                     initializedConnection = true
-                    val backend = userSettings.backendServerUrl.trim()
-                    if (ZoniUserSettings.isValidProductionBackendUrl(backend)) {
+                    val apiKey = preferences.getGeminiApiKey()
+                    if (apiKey.isNotBlank()) {
                         liveClient.connect(
-                            backendBaseUrl = backend,
+                            apiKey = apiKey,
                             mode = userSettings.activeMode,
                             affectionName = userSettings.selectedAffectionName,
                             voice = userSettings.selectedVoice,
@@ -117,8 +123,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     } else {
                         _uiState.update {
                             it.copy(
-                                wsStatus = WsConnectionStatus.ERROR,
-                                latestTranscript = "Backend server URL is not configured. Open Setup or Settings to enter your deployed Zoni backend URL."
+                                wsStatus = WsConnectionStatus.DISCONNECTED,
+                                latestTranscript = "Gemini API Key is not configured yet. Open Setup or Settings to add your own Gemini API Key."
                             )
                         }
                     }
@@ -154,7 +160,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 battery = hardware.getBatteryStatus(),
                 permissions = hardware.getPermissionsSnapshot(),
-                isFloatingOrbRunning = FloatingOrbService.isRunning
+                isFloatingOrbRunning = FloatingOrbService.isRunning,
+                geminiKeyConfigured = preferences.hasGeminiApiKey(),
+                geminiKeyMasked = preferences.getMaskedGeminiApiKeyPreview(),
+                isKeystoreBacked = preferences.isKeystoreBacked()
             )
         }
     }
@@ -349,13 +358,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val s = _uiState.value.settings
-        if (!ZoniUserSettings.isValidProductionBackendUrl(s.backendServerUrl)) {
+        val apiKey = preferences.getGeminiApiKey()
+        if (apiKey.isBlank()) {
             _uiState.update {
                 it.copy(
                     isLiveActive = false,
                     wsStatus = WsConnectionStatus.ERROR,
                     assistantState = AssistantState.ERROR,
-                    latestTranscript = "Backend server URL is invalid or unconfigured."
+                    latestTranscript = "Gemini API Key is not configured. Open Setup or Settings to enter your own Gemini API Key."
                 )
             }
             return false
@@ -378,14 +388,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isLiveActive = false,
                 assistantState = AssistantState.CONNECTING,
                 latestTranscript = if (s.activeLanguage == SupportedLanguage.BENGALI) {
-                    "Gemini Live সার্ভারের সাথে সংযোগ করা হচ্ছে ${s.selectedAffectionName}..."
+                    "Google Gemini Live-এর সাথে সরাসরি সংযোগ করা হচ্ছে ${s.selectedAffectionName}..."
                 } else {
-                    "Connecting to Gemini Live server, ${s.selectedAffectionName}..."
+                    "Connecting directly to Google Gemini Live, ${s.selectedAffectionName}..."
                 }
             )
         }
         liveClient.connect(
-            backendBaseUrl = s.backendServerUrl,
+            apiKey = apiKey,
             mode = s.activeMode,
             affectionName = s.selectedAffectionName,
             voice = s.selectedVoice,
@@ -531,14 +541,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val s = _uiState.value.settings
         _uiState.update { it.copy(latestTranscript = "${voice.id} ভয়েস সক্রিয় করা হয়েছে।") }
         audioEngine.stopAllPlayback()
-        liveClient.connect(
-            backendBaseUrl = s.backendServerUrl,
-            mode = s.activeMode,
-            affectionName = s.selectedAffectionName,
-            voice = voice,
-            language = s.activeLanguage,
-            forceReconnect = true
-        )
+        val apiKey = preferences.getGeminiApiKey()
+        if (apiKey.isNotBlank()) {
+            liveClient.connect(
+                apiKey = apiKey,
+                mode = s.activeMode,
+                affectionName = s.selectedAffectionName,
+                voice = voice,
+                language = s.activeLanguage,
+                forceReconnect = true
+            )
+        }
     }
 
     fun toggleAutoPlay() {
@@ -553,17 +566,43 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { preferences.setVoiceMuted(next) }
     }
 
-    fun updateBackendUrl(url: String) {
-        viewModelScope.launch {
-            preferences.setBackendServerUrl(url)
-            val s = _uiState.value.settings
+    fun saveGeminiApiKey(rawKey: String): Boolean {
+        val saved = preferences.saveGeminiApiKey(rawKey)
+        if (!saved) return false
+        val s = _uiState.value.settings
+        val cleanKey = preferences.getGeminiApiKey()
+        _uiState.update {
+            it.copy(
+                geminiKeyConfigured = true,
+                geminiKeyMasked = preferences.getMaskedGeminiApiKeyPreview(),
+                isKeystoreBacked = preferences.isKeystoreBacked(),
+                latestTranscript = "Gemini API Key saved securely. Connecting directly to Google Gemini Live..."
+            )
+        }
+        if (cleanKey.isNotBlank()) {
             liveClient.connect(
-                backendBaseUrl = url.trim().trimEnd('/'),
+                apiKey = cleanKey,
                 mode = s.activeMode,
                 affectionName = s.selectedAffectionName,
                 voice = s.selectedVoice,
                 language = s.activeLanguage,
                 forceReconnect = true
+            )
+        }
+        return true
+    }
+
+    fun deleteGeminiApiKey() {
+        stopLiveVoice()
+        liveClient.disconnect(clearApiKey = true)
+        preferences.deleteGeminiApiKey()
+        _uiState.update {
+            it.copy(
+                geminiKeyConfigured = false,
+                geminiKeyMasked = null,
+                wsStatus = WsConnectionStatus.DISCONNECTED,
+                assistantState = AssistantState.IDLE,
+                latestTranscript = "Saved Gemini API Key deleted. Add your own Gemini API Key in Setup or Settings to resume AI chat and voice."
             )
         }
     }

@@ -920,8 +920,18 @@ wss.on('error', (err: any) => {
 });
 
 // Sanitize error strings so API keys or internal credentials are never exposed
-function sanitizeErrorMessage(err: any): string {
-  const raw = String(err?.message || err || 'Unknown Live API error');
+function sanitizeErrorMessage(err: any, fallback: string = 'Unknown Live API error'): string {
+  const extracted =
+    err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+      ? err
+      : err && typeof err === 'object' && 'message' in err
+      ? String(err.message ?? '')
+      : err != null
+      ? String(err)
+      : '';
+  const raw = extracted.trim() || fallback;
   const apiKey = process.env.GEMINI_API_KEY;
   let cleaned = raw;
   if (apiKey && apiKey.length > 4) {
@@ -1401,10 +1411,19 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
           },
           onclose: (closeEvt?: any) => {
             const closeCode = typeof closeEvt?.code === 'number' ? closeEvt.code : undefined;
-            const closeReason = sanitizeErrorMessage(closeEvt?.reason || '');
+            const rawReason = typeof closeEvt?.reason === 'string' ? closeEvt.reason.trim() : '';
+            const closeReason = rawReason
+              ? sanitizeErrorMessage(rawReason, '')
+              : closeCode === 1000
+              ? 'Normal closure'
+              : '';
+            const wasClientAlive = isAlive;
             upstreamClosed = true;
             liveSession = null;
             toolRelay.dispose('upstream_closed');
+            if (!wasClientAlive && closeCode === 1000) {
+              return;
+            }
             console.log(
               `[ZONI-LIVE] Upstream Gemini Live session closed (code=${closeCode ?? 'unknown'}${
                 closeReason ? `, reason=${closeReason}` : ''
@@ -1414,10 +1433,10 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
               type: 'session_closed',
               code: closeCode ? String(closeCode) : 'UPSTREAM_CLOSED',
               reason: closeReason || 'Upstream Gemini Live session closed.',
-              retryable: true,
+              retryable: closeCode !== 1008 && closeCode !== 4001 && closeCode !== 4003,
             });
             // Proactively close client WebSocket with 1012 so client never stays stuck on a zombie socket
-            if (isAlive && clientWs.readyState === WebSocket.OPEN) {
+            if (wasClientAlive && clientWs.readyState === WebSocket.OPEN) {
               setTimeout(() => {
                 if (clientWs.readyState === WebSocket.OPEN) {
                   try {

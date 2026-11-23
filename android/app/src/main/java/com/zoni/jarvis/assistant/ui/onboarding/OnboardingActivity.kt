@@ -40,6 +40,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
@@ -52,7 +53,7 @@ import kotlinx.coroutines.launch
 
 /**
  * Genuine 3-Step Native Android Setup Wizard aligned with PermissionsSetupModal.tsx:
- * - Step 1: Zoni Backend Server URL Configuration (Gemini API credentials stay strictly server-side)
+ * - Step 1: User's Own Gemini API Key (BYOK, stored encrypted via Android Keystore)
  * - Step 2: Real Android Runtime Permissions (RECORD_AUDIO required + optional phone permissions)
  * - Step 3: Real Android Background Availability System Screens (Battery, Overlay, Notification Listener, Accessibility, Default Assistant)
  */
@@ -61,6 +62,8 @@ class OnboardingActivity : ComponentActivity() {
     private lateinit var app: ZoniApplication
     private lateinit var keyManager: SecureKeyManager
     private var permissionsState by mutableStateOf<AndroidPermissionsSnapshot?>(null)
+    private var maskedKeyState by mutableStateOf<String?>(null)
+    private var keystoreBackedState by mutableStateOf(false)
 
     private val requestPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -79,29 +82,33 @@ class OnboardingActivity : ComponentActivity() {
         app = application as ZoniApplication
         keyManager = SecureKeyManager(applicationContext)
         permissionsState = app.hardwareController.getPermissionsSnapshot()
+        maskedKeyState = keyManager.getMaskedApiKeyPreview()
+        keystoreBackedState = keyManager.isUsingAndroidKeystore()
 
         setContent {
             ZoniTheme {
                 OnboardingScreen(
-                    initialBackendUrl = keyManager.getBackendUrl(),
+                    maskedSavedKey = maskedKeyState,
+                    isKeystoreBacked = keystoreBackedState,
                     permissions = permissionsState ?: app.hardwareController.getPermissionsSnapshot(),
                     onReadClipboard = {
                         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                         cm?.primaryClip?.getItemAt(0)?.text?.toString()?.trim().orEmpty()
                     },
-                    onSaveBackendUrl = { url ->
-                        val clean = url.trim().trimEnd('/')
-                        if ((clean.startsWith("http://") || clean.startsWith("https://")) &&
-                            !clean.contains("appassets.androidplatform.net", ignoreCase = true)
-                        ) {
-                            keyManager.saveBackendUrl(clean)
-                            lifecycleScope.launch {
-                                app.preferences.setBackendServerUrl(clean)
-                            }
-                            true
+                    onSaveGeminiApiKey = { rawKey ->
+                        val validation = SecureKeyManager.validateApiKeyFormat(rawKey)
+                        if (!validation.valid) {
+                            validation.error ?: "Invalid Gemini API Key format."
+                        } else if (keyManager.saveApiKey(validation.normalizedKey)) {
+                            maskedKeyState = keyManager.getMaskedApiKeyPreview()
+                            null
                         } else {
-                            false
+                            "Could not save Gemini API Key."
                         }
+                    },
+                    onDeleteGeminiApiKey = {
+                        keyManager.deleteApiKey()
+                        maskedKeyState = null
                     },
                     onRequestPermission = { perms ->
                         requestPermissionsLauncher.launch(perms)
@@ -135,6 +142,7 @@ class OnboardingActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         permissionsState = app.hardwareController.getPermissionsSnapshot()
+        maskedKeyState = keyManager.getMaskedApiKeyPreview()
     }
 
     private fun buildAllRuntimePermissions(): Array<String> {
@@ -163,18 +171,20 @@ class OnboardingActivity : ComponentActivity() {
 
 @Composable
 private fun OnboardingScreen(
-    initialBackendUrl: String,
+    maskedSavedKey: String?,
+    isKeystoreBacked: Boolean,
     permissions: AndroidPermissionsSnapshot,
     onReadClipboard: () -> String,
-    onSaveBackendUrl: (String) -> Boolean,
+    onSaveGeminiApiKey: (String) -> String?,
+    onDeleteGeminiApiKey: () -> Unit,
     onRequestPermission: (Array<String>) -> Unit,
     onRequestAllPermissions: () -> Unit,
     onOpenSystemScreen: (String) -> Unit,
     onFinish: () -> Unit
 ) {
     var step by remember { mutableIntStateOf(1) }
-    var backendUrl by remember { mutableStateOf(initialBackendUrl) }
-    var urlError by remember { mutableStateOf<String?>(null) }
+    var apiKeyDraft by remember { mutableStateOf("") }
+    var keyError by remember { mutableStateOf<String?>(null) }
 
     Column(
         modifier = Modifier
@@ -201,26 +211,49 @@ private fun OnboardingScreen(
             when (step) {
                 1 -> {
                     Text(
-                        "Connect Zoni Backend Server",
+                        "Connect Your Gemini API Key",
                         color = ZoniColors.Cyan50,
                         fontSize = 20.sp,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        "Zoni AI connects to your hosted Express + WebSocket backend server. Gemini API credentials (GEMINI_API_KEY) remain strictly on the backend server and are never stored in this APK.",
+                        "Zoni AI connects directly to Google Gemini using your own API key (BYOK). No custom backend URL is required. Your key is stored locally using ${if (isKeystoreBacked) "Android Keystore EncryptedSharedPreferences" else "Android private encrypted preferences"} and is never revealed after saving.",
                         color = ZoniColors.Slate400,
                         fontSize = 13.sp
                     )
+                    if (!maskedSavedKey.isNullOrBlank()) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = ZoniColors.Emerald950,
+                            border = BorderStroke(1.dp, ZoniColors.Emerald400.copy(alpha = 0.6f))
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Text(
+                                    text = "SAVED KEY: $maskedSavedKey",
+                                    color = ZoniColors.Emerald300,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "Paste a new key below to replace it, or delete it at any time.",
+                                    color = ZoniColors.Slate400,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+                    }
                     OutlinedTextField(
-                        value = backendUrl,
+                        value = apiKeyDraft,
                         onValueChange = {
-                            backendUrl = it
-                            urlError = null
+                            apiKeyDraft = it
+                            keyError = null
                         },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
-                        label = { Text("Backend Server URL (https://...)") },
-                        placeholder = { Text("https://your-zoni-backend.run.app") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        label = { Text(if (maskedSavedKey != null) "Replace Gemini API Key (AIza...)" else "Gemini API Key (AIza...)") },
+                        placeholder = { Text("AIzaSy...") },
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = ZoniColors.Cyan400,
                             unfocusedBorderColor = ZoniColors.Slate800,
@@ -228,34 +261,58 @@ private fun OnboardingScreen(
                             unfocusedTextColor = ZoniColors.Cyan50
                         )
                     )
-                    if (urlError != null) {
+                    if (keyError != null) {
                         Text(
-                            text = urlError ?: "",
+                            text = keyError ?: "",
                             color = ZoniColors.Rose400,
                             fontSize = 12.sp
                         )
                     }
-                    OutlinedButton(onClick = {
-                        backendUrl = onReadClipboard()
-                        urlError = null
-                    }) {
-                        Text("PASTE SERVER URL", color = ZoniColors.Pink300)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = {
+                            apiKeyDraft = onReadClipboard()
+                            keyError = null
+                        }) {
+                            Text("PASTE API KEY", color = ZoniColors.Pink300)
+                        }
+                        if (!maskedSavedKey.isNullOrBlank()) {
+                            OutlinedButton(onClick = {
+                                onDeleteGeminiApiKey()
+                                apiKeyDraft = ""
+                                keyError = null
+                            }) {
+                                Text("DELETE SAVED KEY", color = ZoniColors.Rose400)
+                            }
+                        }
                     }
                     Spacer(Modifier.height(10.dp))
                     Button(
                         onClick = {
-                            if (backendUrl.isBlank()) {
-                                urlError = "Please enter your deployed Zoni backend URL (https://...) or tap Skip to configure later."
-                            } else if (onSaveBackendUrl(backendUrl)) {
+                            if (apiKeyDraft.isBlank() && !maskedSavedKey.isNullOrBlank()) {
                                 step = 2
                             } else {
-                                urlError = "Invalid URL. Use https:// or http:// (cannot be appassets.androidplatform.net)."
+                                val err = onSaveGeminiApiKey(apiKeyDraft)
+                                if (err == null) {
+                                    apiKeyDraft = ""
+                                    keyError = null
+                                    step = 2
+                                } else {
+                                    keyError = err
+                                }
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = ZoniColors.Pink500)
                     ) {
-                        Text("SAVE BACKEND URL & CONTINUE", color = Color.White, fontWeight = FontWeight.Bold)
+                        Text(
+                            if (apiKeyDraft.isBlank() && !maskedSavedKey.isNullOrBlank()) {
+                                "KEEP SAVED KEY & CONTINUE"
+                            } else {
+                                "SAVE GEMINI API KEY & CONTINUE"
+                            },
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                     OutlinedButton(
                         onClick = { step = 2 },

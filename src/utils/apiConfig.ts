@@ -1,269 +1,429 @@
 /**
- * Configuration helper for API endpoints and Gemini Live WebSocket connection.
+ * Zoni AI — Pure Gemini BYOK (Bring Your Own Key) Configuration & Storage
  *
- * Security & Reliability Rules:
- * - Gemini API keys remain strictly on the backend server (never in browser/APK bundles).
- * - In normal web browsers, API and WebSocket requests target the same origin unless overridden.
- * - Inside Android WebViewAssetLoader (`https://appassets.androidplatform.net`) or Capacitor shells,
- *   a valid remote `http(s)://` backend URL MUST be configured; we NEVER silently fall back to
- *   `appassets.androidplatform.net` as a Gemini API or WebSocket backend.
+ * Removes all mandatory ZONI backend server URL configuration.
+ * Each user provides their own Google Gemini API key directly:
+ * - On Android APK: stored in Android Keystore-backed EncryptedSharedPreferences
+ *   via `window.ZoniAndroidBridge` (never duplicated to WebView localStorage).
+ * - In Browser Preview: stored in a clearly separated local development storage
+ *   slot with an explicit notice that browser storage is not equivalent to
+ *   Android Keystore security.
+ *
+ * Security invariants:
+ * - Never embeds any developer Gemini API key.
+ * - Never falls back to any developer-owned backend server URL.
+ * - Never exposes the full saved API key in status snapshots, diagnostics,
+ *   chat history, console logs, or error messages.
  */
 
-export const ANDROID_LOCAL_ASSET_HOST = 'appassets.androidplatform.net';
-export const PRODUCTION_BACKEND_URL = 'https://zoni-ai-675435111499.asia-southeast1.run.app';
+import {
+  deleteNativeGeminiApiKey,
+  getNativeAndroidBridge,
+  getNativeGeminiApiKeyForRequest,
+  getNativeGeminiApiKeyStatus,
+  saveNativeGeminiApiKey,
+} from './androidBridge';
 
-export function isLocalAndroidAssetHost(urlOrHost: string): boolean {
-  const trimmed = urlOrHost.trim().toLowerCase();
-  if (!trimmed) return false;
-  try {
-    const parsed = trimmed.includes('://') ? new URL(trimmed) : new URL(`https://${trimmed}`);
-    return parsed.hostname === ANDROID_LOCAL_ASSET_HOST;
-  } catch {
-    return trimmed.includes(ANDROID_LOCAL_ASSET_HOST);
-  }
+export const BROWSER_BYOK_STORAGE_KEY = 'zoni_byok_browser_gemini_api_key';
+export const LEGACY_USER_KEY_STORAGE = 'zoni_user_gemini_key';
+export const LEGACY_BACKEND_URL_STORAGE = 'zoni_backend_url';
+
+export type GeminiKeyStorageKind =
+  | 'android_keystore'
+  | 'android_encrypted_fallback'
+  | 'browser_preview_local_storage'
+  | 'none';
+
+export interface GeminiApiKeyStatus {
+  configured: boolean;
+  maskedPreview: string;
+  storageKind: GeminiKeyStorageKind;
+  storageLabel: string;
+  securityNotice: string;
+  isNativeAndroid: boolean;
 }
 
-export function isStaleOrLocalDeviceHost(urlOrHost: string): boolean {
-  const trimmed = urlOrHost.trim().toLowerCase();
-  if (!trimmed) return true;
-  if (trimmed.includes('ais-pre-')) return true;
-  try {
-    const parsed = trimmed.includes('://') ? new URL(trimmed) : new URL(`https://${trimmed}`);
-    const host = parsed.hostname.toLowerCase();
-    return (
-      host === ANDROID_LOCAL_ASSET_HOST ||
-      host === 'localhost' ||
-      host === '127.0.0.1' ||
-      host === '0.0.0.0' ||
-      host === '[::1]'
-    );
-  } catch {
-    return true;
-  }
+export interface SaveGeminiKeyResult {
+  ok: boolean;
+  error?: string;
+  status: GeminiApiKeyStatus;
 }
 
-export function isValidBackendUrl(
-  url: string | null | undefined,
-  options?: { allowLocalhost?: boolean }
-): boolean {
-  if (!url) return false;
-  const trimmed = url.trim();
-  if (!/^https?:\/\//i.test(trimmed)) return false;
-  try {
-    const parsed = new URL(trimmed);
-    const host = parsed.hostname.toLowerCase();
-    if (!host || host === ANDROID_LOCAL_ASSET_HOST) {
-      return false;
-    }
-    if (host.includes('ais-pre-')) {
-      return false;
-    }
-    if (
-      !options?.allowLocalhost &&
-      (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '[::1]')
-    ) {
-      return false;
-    }
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-  } catch {
-    return false;
-  }
-}
-
-export function normalizeBackendUrl(url: string): string {
-  return url.trim().replace(/\/+$/, '');
-}
-
+/**
+ * Detects whether the React dashboard is running inside the packaged Android APK
+ * WebView shell (WebViewAssetLoader / Capacitor / native bridge).
+ */
 export function isNativeAndroidWebShell(
   win: Window | undefined = typeof window !== 'undefined' ? window : undefined
 ): boolean {
   if (!win) return false;
+  const host = (win.location?.hostname || '').toLowerCase();
+  const protocol = (win.location?.protocol || '').toLowerCase();
   return (
-    Boolean(win.ZoniAndroidBridge) ||
+    Boolean((win as any).ZoniAndroidBridge) ||
     Boolean((win as any).__ZONI_ANDROID_NATIVE__) ||
-    win.location?.hostname === ANDROID_LOCAL_ASSET_HOST ||
-    Boolean(win.Capacitor?.isNativePlatform?.()) ||
-    win.location?.protocol === 'capacitor:' ||
-    win.location?.protocol === 'ionic:' ||
-    (win.location?.hostname === 'localhost' && (!win.location?.port || win.location?.port === '80'))
+    host === 'appassets.androidplatform.net' ||
+    protocol === 'capacitor:' ||
+    protocol === 'ionic:' ||
+    protocol === 'file:'
   );
 }
 
-export function resolveNativeBackendUrl(win: Window): string {
-  try {
-    const bridgeUrl = win.ZoniAndroidBridge?.getBackendUrl?.()?.trim();
-    if (isValidBackendUrl(bridgeUrl)) {
-      return normalizeBackendUrl(bridgeUrl!);
-    }
-  } catch {
-    // ignore bridge access issues
-  }
-  try {
-    const storedUrl = win.localStorage?.getItem('zoni_backend_url')?.trim();
-    if (isValidBackendUrl(storedUrl)) {
-      return normalizeBackendUrl(storedUrl!);
-    }
-    if (storedUrl && isStaleOrLocalDeviceHost(storedUrl)) {
-      win.localStorage?.removeItem('zoni_backend_url');
-    }
-  } catch {
-    // ignore storage access issues
-  }
-  const envUrl = (import.meta as any).env?.VITE_BACKEND_URL?.trim();
-  if (isValidBackendUrl(envUrl)) {
-    return normalizeBackendUrl(envUrl);
-  }
-  return PRODUCTION_BACKEND_URL;
-}
-
-export function saveCustomBackendUrl(
-  rawUrl: string,
-  win: Window | undefined = typeof window !== 'undefined' ? window : undefined
-): { ok: boolean; normalizedUrl?: string; error?: string } {
-  const trimmed = rawUrl.trim();
+/**
+ * Validates the syntax/shape of a user-provided Google Gemini API key before saving.
+ * Does NOT call the network; network verification happens in `verifyDirectGeminiApiKey`.
+ */
+export function validateGeminiApiKeyFormat(rawKey: string | null | undefined): {
+  valid: boolean;
+  normalizedKey?: string;
+  error?: string;
+} {
+  const trimmed = String(rawKey || '').trim();
   if (!trimmed) {
-    return { ok: false, error: 'Please enter a valid backend server URL starting with https:// or http://.' };
-  }
-  if (isLocalAndroidAssetHost(trimmed)) {
     return {
-      ok: false,
-      error: `Cannot use ${ANDROID_LOCAL_ASSET_HOST} as a Gemini backend. Enter your deployed Zoni backend server URL.`,
+      valid: false,
+      error: 'Please enter your Gemini API key.',
     };
   }
-  const allowLocalhost = win ? !isNativeAndroidWebShell(win) : true;
-  if (!isValidBackendUrl(trimmed, { allowLocalhost })) {
+  if (/\s/.test(trimmed)) {
     return {
-      ok: false,
-      error: isStaleOrLocalDeviceHost(trimmed)
-        ? `Invalid or unreachable device/legacy host. Use your production Cloud Run URL (${PRODUCTION_BACKEND_URL}).`
-        : `Invalid backend URL. Use a full URL like ${PRODUCTION_BACKEND_URL}.`,
+      valid: false,
+      error: 'Gemini API keys cannot contain spaces or line breaks.',
     };
   }
-  const normalized = normalizeBackendUrl(trimmed);
-  if (win) {
-    try {
-      win.localStorage?.setItem('zoni_backend_url', normalized);
-    } catch {
-      // ignore storage errors
-    }
-    try {
-      win.ZoniAndroidBridge?.setBackendUrl?.(normalized);
-    } catch {
-      // ignore native bridge errors
-    }
+  if (trimmed.length < 20 || trimmed.length > 256) {
+    return {
+      valid: false,
+      error: 'Gemini API key length looks invalid. Paste the full key from Google AI Studio.',
+    };
   }
-  return { ok: true, normalizedUrl: normalized };
+  if (!/^[A-Za-z0-9_\-]+$/.test(trimmed)) {
+    return {
+      valid: false,
+      error: 'Gemini API key contains invalid characters.',
+    };
+  }
+  if (!trimmed.startsWith('AIza')) {
+    return {
+      valid: false,
+      error: 'Google Gemini API keys typically start with "AIza". Please check your key.',
+    };
+  }
+  return {
+    valid: true,
+    normalizedKey: trimmed,
+  };
 }
 
-export function clearCustomBackendUrl(
+/**
+ * Produces a non-reversible masked preview (e.g. `AIza••••••9aBc`) so the full
+ * saved API key is never shown in UI, diagnostics, or logs after saving.
+ */
+export function maskGeminiApiKey(rawKey: string | null | undefined): string {
+  const clean = String(rawKey || '').trim();
+  if (!clean) return '';
+  if (clean.length <= 8) {
+    return `${clean.slice(0, 2)}••••`;
+  }
+  return `${clean.slice(0, 4)}••••••••${clean.slice(-4)}`;
+}
+
+/**
+ * Redacts Gemini API keys and query credentials from any error message, log line,
+ * or diagnostic payload so user secrets can never leak.
+ */
+export function sanitizeGeminiSecret(
+  input: unknown,
+  explicitKey?: string | null
+): string {
+  let text =
+    input instanceof Error
+      ? input.message || String(input)
+      : typeof input === 'string'
+      ? input
+      : input && typeof input === 'object' && 'message' in (input as any)
+      ? String((input as any).message || '')
+      : String(input ?? '');
+
+  if (explicitKey && explicitKey.trim().length >= 8) {
+    text = text.split(explicitKey.trim()).join('[REDACTED_API_KEY]');
+  }
+
+  // Redact any Google AIza... API key pattern
+  text = text.replace(/AIza[0-9A-Za-z_\-]{12,}/g, '[REDACTED_API_KEY]');
+  // Redact key=... query parameter values
+  text = text.replace(/([?&]key=)[^&\s"'`]+/gi, '$1[REDACTED_API_KEY]');
+  // Redact x-goog-api-key headers if ever echoed
+  text = text.replace(/(x-goog-api-key\s*[:=]\s*)[^\s,;'"`]+/gi, '$1[REDACTED_API_KEY]');
+
+  return text;
+}
+
+/**
+ * Cleans up obsolete backend URL storage left over from pre-BYOK builds.
+ */
+export function cleanupLegacyBackendStorage(
   win: Window | undefined = typeof window !== 'undefined' ? window : undefined
 ): void {
   if (!win) return;
   try {
-    win.localStorage?.removeItem('zoni_backend_url');
+    win.localStorage?.removeItem(LEGACY_BACKEND_URL_STORAGE);
   } catch {
-    // ignore
+    // ignore storage restrictions
   }
 }
 
-/**
- * Returns an explicit configuration error message when running in an Android WebView/Capacitor
- * shell without a valid backend server URL, or null when the backend target is properly configured.
- */
-export function getBackendConfigError(
-  win: Window | undefined = typeof window !== 'undefined' ? window : undefined
-): string | null {
-  if (!win) return null;
-  if (isNativeAndroidWebShell(win)) {
-    const resolved = resolveNativeBackendUrl(win);
-    if (!isValidBackendUrl(resolved)) {
-      return `Android backend server URL is not configured. Open Zoni Setup → Step 1 (Backend Link) and set ${PRODUCTION_BACKEND_URL}.`;
-    }
-  }
-  return null;
-}
-
-/**
- * Returns the displayable active backend base URL (origin in web browser, configured remote URL in Android APK).
- */
-export function getDisplayBackendUrl(
-  win: Window | undefined = typeof window !== 'undefined' ? window : undefined
-): string {
-  if (!win) return PRODUCTION_BACKEND_URL;
-  if (isNativeAndroidWebShell(win)) {
-    return resolveNativeBackendUrl(win);
-  }
-  try {
-    const stored = win.localStorage?.getItem('zoni_backend_url')?.trim();
-    if (isValidBackendUrl(stored, { allowLocalhost: true })) {
-      return normalizeBackendUrl(stored!);
-    }
-  } catch {
-    // ignore
-  }
-  return win.location?.origin || '';
-}
-
-export function getApiBaseUrl(
-  win: Window | undefined = typeof window !== 'undefined' ? window : undefined
-): string {
+function readBrowserPreviewKey(win: Window | undefined): string {
   if (!win) return '';
-  if (isNativeAndroidWebShell(win)) {
-    // Never silently fall back to appassets.androidplatform.net or localhost
-    return resolveNativeBackendUrl(win);
-  }
   try {
-    const stored = win.localStorage?.getItem('zoni_backend_url')?.trim();
-    if (isValidBackendUrl(stored, { allowLocalhost: true })) {
-      return normalizeBackendUrl(stored!);
+    const primary = (win.localStorage?.getItem(BROWSER_BYOK_STORAGE_KEY) || '').trim();
+    if (primary) return primary;
+    // Migrate legacy key if present in browser preview
+    const legacy = (win.localStorage?.getItem(LEGACY_USER_KEY_STORAGE) || '').trim();
+    if (legacy && validateGeminiApiKeyFormat(legacy).valid) {
+      win.localStorage?.setItem(BROWSER_BYOK_STORAGE_KEY, legacy);
+      win.localStorage?.removeItem(LEGACY_USER_KEY_STORAGE);
+      return legacy;
     }
   } catch {
-    // ignore
+    // ignore storage errors
   }
   return '';
 }
 
-export function getLiveWsUrl(
-  mode: string,
-  nickname: string,
-  voice: string,
-  lang: string = 'bn-BD',
-  resumptionHandle?: string,
+function dispatchGeminiKeyUpdated(win: Window | undefined): void {
+  if (!win || typeof win.dispatchEvent !== 'function') return;
+  try {
+    win.dispatchEvent(new CustomEvent('zoni:gemini-key-updated'));
+  } catch {
+    // ignore in minimal mock window environments
+  }
+}
+
+/**
+ * Returns safe non-secret configuration metadata for UI & diagnostics.
+ * NEVER returns the raw saved API key.
+ */
+export function getGeminiApiKeyStatus(
+  win: Window | undefined = typeof window !== 'undefined' ? window : undefined
+): GeminiApiKeyStatus {
+  const isNative = isNativeAndroidWebShell(win);
+  const bridge =
+    win && (win as any).ZoniAndroidBridge
+      ? ((win as any).ZoniAndroidBridge as ReturnType<typeof getNativeAndroidBridge>)
+      : getNativeAndroidBridge();
+
+  if (bridge?.getGeminiApiKeyStatusJson) {
+    try {
+      const nativeStatus =
+        win === (typeof window !== 'undefined' ? window : undefined)
+          ? getNativeGeminiApiKeyStatus()
+          : JSON.parse(bridge.getGeminiApiKeyStatusJson());
+      if (nativeStatus && typeof nativeStatus === 'object') {
+        const configured = Boolean(nativeStatus.configured);
+        const keystoreBacked = nativeStatus.keystoreBacked !== false;
+        const storageKind: GeminiKeyStorageKind = !configured
+          ? 'none'
+          : keystoreBacked
+          ? 'android_keystore'
+          : 'android_encrypted_fallback';
+        return {
+          configured,
+          maskedPreview: configured
+            ? String(nativeStatus.maskedPreview || 'AIza••••••••')
+            : '',
+          storageKind,
+          storageLabel: configured
+            ? keystoreBacked
+              ? 'Android Keystore (EncryptedSharedPreferences)'
+              : 'Android Private App Storage'
+            : 'Not Configured',
+          securityNotice:
+            'Stored locally on this Android device using Android Keystore encryption. Never uploaded to any ZONI server.',
+          isNativeAndroid: true,
+        };
+      }
+    } catch {
+      // Fall through safely
+    }
+  }
+
+  const browserKey = readBrowserPreviewKey(win);
+  if (browserKey) {
+    return {
+      configured: true,
+      maskedPreview: maskGeminiApiKey(browserKey),
+      storageKind: 'browser_preview_local_storage',
+      storageLabel: 'Browser Preview Storage (Local Dev)',
+      securityNotice:
+        'Browser preview uses local browser storage for development convenience. It is NOT equivalent to Android Keystore hardware-backed encryption.',
+      isNativeAndroid: isNative,
+    };
+  }
+
+  return {
+    configured: false,
+    maskedPreview: '',
+    storageKind: 'none',
+    storageLabel: 'Not Configured',
+    securityNotice: isNative
+      ? 'Your Gemini API key will be encrypted on-device with Android Keystore. No backend server URL is required.'
+      : 'Browser preview stores your key in local browser storage only (not equivalent to Android Keystore security). Use your own Gemini API key with billing/quota controls.',
+    isNativeAndroid: isNative,
+  };
+}
+
+/**
+ * Retrieves the raw user-owned Gemini API key strictly for outbound requests
+ * to Google's official Gemini API endpoints.
+ * NEVER pass the return value into logs, UI text, chat messages, or diagnostics.
+ */
+export function getGeminiApiKeyForRequest(
   win: Window | undefined = typeof window !== 'undefined' ? window : undefined
 ): string {
-  const safeName = encodeURIComponent(nickname || 'Boss');
-  let query = `mode=${encodeURIComponent(mode)}&nickname=${safeName}&selectedAffectionName=${safeName}&voice=${encodeURIComponent(voice)}&lang=${encodeURIComponent(lang)}`;
-  if (resumptionHandle && resumptionHandle.trim()) {
-    query += `&handle=${encodeURIComponent(resumptionHandle.trim())}`;
-  }
-  if (win) {
-    if (isNativeAndroidWebShell(win)) {
-      const backend = resolveNativeBackendUrl(win);
-      if (!backend) {
-        // Explicit empty string signals missing backend URL instead of targeting appassets.androidplatform.net
-        return '';
-      }
-      const wsBase = backend.startsWith('http://')
-        ? `ws://${backend.replace(/^http:\/\//i, '')}`
-        : `wss://${backend.replace(/^https?:\/\//i, '')}`;
-      return `${wsBase.replace(/\/+$/, '')}/live?${query}`;
-    }
+  const bridge =
+    win && (win as any).ZoniAndroidBridge
+      ? ((win as any).ZoniAndroidBridge as ReturnType<typeof getNativeAndroidBridge>)
+      : getNativeAndroidBridge();
 
+  if (bridge?.getGeminiApiKeyForRequest) {
     try {
-      const stored = win.localStorage?.getItem('zoni_backend_url')?.trim();
-      if (isValidBackendUrl(stored)) {
-        const normalized = normalizeBackendUrl(stored!);
-        const wsBase = normalized.startsWith('http://')
-          ? `ws://${normalized.replace(/^http:\/\//i, '')}`
-          : `wss://${normalized.replace(/^https?:\/\//i, '')}`;
-        return `${wsBase}/live?${query}`;
-      }
+      const nativeKey =
+        win === (typeof window !== 'undefined' ? window : undefined)
+          ? getNativeGeminiApiKeyForRequest()
+          : String(bridge.getGeminiApiKeyForRequest() || '').trim();
+      if (nativeKey) return nativeKey;
+    } catch {
+      // Fall through
+    }
+  }
+
+  return readBrowserPreviewKey(win);
+}
+
+/**
+ * Validates and persists the user's own Gemini API key.
+ * On Android APK: persists via native Android Keystore bridge and purges any browser copy.
+ * On Web Browser: persists in clearly separated browser preview storage.
+ */
+export function saveGeminiApiKey(
+  rawKey: string,
+  win: Window | undefined = typeof window !== 'undefined' ? window : undefined
+): SaveGeminiKeyResult {
+  const validation = validateGeminiApiKeyFormat(rawKey);
+  if (!validation.valid || !validation.normalizedKey) {
+    return {
+      ok: false,
+      error: validation.error || 'Invalid Gemini API key.',
+      status: getGeminiApiKeyStatus(win),
+    };
+  }
+
+  const cleanKey = validation.normalizedKey;
+  cleanupLegacyBackendStorage(win);
+
+  const bridge =
+    win && (win as any).ZoniAndroidBridge
+      ? ((win as any).ZoniAndroidBridge as ReturnType<typeof getNativeAndroidBridge>)
+      : getNativeAndroidBridge();
+
+  if (bridge?.saveGeminiApiKey) {
+    const savedNatively =
+      win === (typeof window !== 'undefined' ? window : undefined)
+        ? saveNativeGeminiApiKey(cleanKey)
+        : Boolean(bridge.saveGeminiApiKey(cleanKey));
+    if (!savedNatively) {
+      return {
+        ok: false,
+        error: 'Android Keystore could not save the Gemini API key. Please try again.',
+        status: getGeminiApiKeyStatus(win),
+      };
+    }
+    // Ensure key is never duplicated into WebView localStorage when stored in Keystore
+    try {
+      win?.localStorage?.removeItem(BROWSER_BYOK_STORAGE_KEY);
+      win?.localStorage?.removeItem(LEGACY_USER_KEY_STORAGE);
     } catch {
       // ignore
     }
-
-    const protocol = win.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${protocol}//${win.location.host}/live?${query}`;
+    dispatchGeminiKeyUpdated(win);
+    return {
+      ok: true,
+      status: getGeminiApiKeyStatus(win),
+    };
   }
-  return `ws://localhost:3000/live?${query}`;
+
+  try {
+    win?.localStorage?.setItem(BROWSER_BYOK_STORAGE_KEY, cleanKey);
+    win?.localStorage?.removeItem(LEGACY_USER_KEY_STORAGE);
+  } catch {
+    return {
+      ok: false,
+      error: 'Unable to save Gemini API key in browser storage.',
+      status: getGeminiApiKeyStatus(win),
+    };
+  }
+
+  dispatchGeminiKeyUpdated(win);
+  return {
+    ok: true,
+    status: getGeminiApiKeyStatus(win),
+  };
+}
+
+/**
+ * Permanently deletes the user's saved Gemini API key from Android Keystore
+ * and/or browser preview storage.
+ */
+export function deleteGeminiApiKey(
+  win: Window | undefined = typeof window !== 'undefined' ? window : undefined
+): GeminiApiKeyStatus {
+  const bridge =
+    win && (win as any).ZoniAndroidBridge
+      ? ((win as any).ZoniAndroidBridge as ReturnType<typeof getNativeAndroidBridge>)
+      : getNativeAndroidBridge();
+
+  if (bridge?.deleteGeminiApiKey) {
+    try {
+      if (win === (typeof window !== 'undefined' ? window : undefined)) {
+        deleteNativeGeminiApiKey();
+      } else {
+        bridge.deleteGeminiApiKey();
+      }
+    } catch {
+      // continue clearing any fallback storage
+    }
+  }
+
+  try {
+    win?.localStorage?.removeItem(BROWSER_BYOK_STORAGE_KEY);
+    win?.localStorage?.removeItem(LEGACY_USER_KEY_STORAGE);
+    win?.localStorage?.removeItem(LEGACY_BACKEND_URL_STORAGE);
+  } catch {
+    // ignore
+  }
+
+  dispatchGeminiKeyUpdated(win);
+  return getGeminiApiKeyStatus(win);
+}
+
+/**
+ * Returns a helpful configuration message ONLY when the user has not saved their
+ * own Gemini API key yet. Never checks or requires any backend server URL.
+ */
+export function getGeminiConfigError(
+  win: Window | undefined = typeof window !== 'undefined' ? window : undefined,
+  lang: 'bn-BD' | 'hi-IN' | 'en-US' = 'en-US'
+): string | null {
+  const status = getGeminiApiKeyStatus(win);
+  if (status.configured) {
+    return null;
+  }
+  if (lang === 'bn-BD') {
+    return 'Gemini AI ব্যবহার করতে Setup বা Settings থেকে আপনার নিজের Gemini API Key দিন। কোনো ব্যাকএন্ড সার্ভার URL প্রয়োজন নেই।';
+  }
+  if (lang === 'hi-IN') {
+    return 'Gemini AI इस्तेमाल करने के लिए Setup या Settings में अपनी Gemini API Key दर्ज करें। किसी बैकएंड सर्वर URL की आवश्यकता नहीं है।';
+  }
+  return 'Enter your own Gemini API Key in Setup or Settings to activate ZONI AI. No backend server URL is required.';
 }

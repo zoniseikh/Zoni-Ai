@@ -41,11 +41,29 @@ import {
   requestMicrophoneAccess,
 } from './utils/permissionManager';
 import {
-  getApiBaseUrl,
-  getLiveWsUrl,
-  getBackendConfigError,
-  getDisplayBackendUrl,
+  cleanupLegacyBackendStorage,
+  getGeminiApiKeyForRequest,
+  getGeminiApiKeyStatus,
+  getGeminiConfigError,
+  sanitizeGeminiSecret,
 } from './utils/apiConfig';
+import {
+  DIRECT_CHAT_MODEL_CANDIDATES,
+  DIRECT_LIVE_MODEL_CANDIDATES,
+  analyzeScreenDirectGemini,
+  buildDirectLiveAudioMessage,
+  buildDirectLiveClientTextMessage,
+  buildDirectLiveSetupMessage,
+  buildDirectLiveToolResponseMessage,
+  buildDirectLiveWebSocketUrl,
+  buildZoniSystemInstruction,
+  decodeDirectLiveFrame,
+  parseDirectLiveServerMessage,
+  sendDirectGeminiChat,
+  sendDirectGeminiToolFeedback,
+  synthesizeDirectGeminiTts,
+  verifyDirectGeminiApiKey,
+} from './utils/geminiDirectClient';
 import {
   getNativeAndroidBridge,
   detectAndroidRuntimeMode,
@@ -524,6 +542,9 @@ export default function App() {
   const liveNonRetryableErrorRef = useRef<string | null>(null);
   const isSessionReadyRef = useRef<boolean>(false);
   const resumptionHandleRef = useRef<string | undefined>(undefined);
+  const preferredChatModelRef = useRef<string>(DIRECT_CHAT_MODEL_CANDIDATES[0]);
+  const preferredLiveModelRef = useRef<string>(DIRECT_LIVE_MODEL_CANDIDATES[0]);
+  const liveModelFallbackIdxRef = useRef<number>(0);
   const hadConnectedOnceRef = useRef<boolean>(false);
   const reconnectAttemptRef = useRef<number>(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -641,80 +662,74 @@ export default function App() {
     }
   }, []);
 
-  // Probe live backend health & server-side Gemini API key status
+  // Verify user-owned Gemini API key directly against Google Gemini API (no backend URL required)
   const checkBackendHealth = useCallback(async (): Promise<BackendHealthSnapshot> => {
-    const backendUrl = getDisplayBackendUrl();
-    const configError = getBackendConfigError();
-    if (configError) {
+    cleanupLegacyBackendStorage();
+    const keyStatus = getGeminiApiKeyStatus();
+    const rawKey = getGeminiApiKeyForRequest();
+
+    if (!keyStatus.configured || !rawKey) {
+      const configError = getGeminiConfigError(undefined, activeLanguageRef.current);
       const snap: BackendHealthSnapshot = {
         checked: true,
         reachable: false,
         geminiConfigured: false,
-        statusText: 'UNCONFIGURED',
+        statusText: 'API KEY REQUIRED',
         configurationError: configError,
-        backendUrl,
+        maskedKeyPreview: '',
+        storageLabel: keyStatus.storageLabel,
       };
       setBackendHealth(snap);
-      setConnectionError(configError);
-      setWsStatus('error');
+      setDeviceDiagnostics((prev) => ({
+        ...prev,
+        geminiToolCallingAvailable: false,
+        declaredToolsCount: ASSISTANT_TOOL_SPECS.length,
+        updatedAtIso: new Date().toISOString(),
+      }));
+      setWsStatus('disconnected');
       return snap;
     }
 
-    try {
-      const base = getApiBaseUrl();
-      const res = await fetch(`${base}/api/status`, { cache: 'no-store' });
-      const data = await res.json().catch(() => ({}));
-      const geminiConfigured =
-        typeof data.geminiConfigured === 'boolean'
-          ? data.geminiConfigured
-          : Boolean(data.geminiLiveSupported || data.status === 'online');
-      const errMsg =
-        data.configurationError ||
-        (!res.ok ? `Backend returned HTTP ${res.status}` : null);
-      const snap: BackendHealthSnapshot = {
-        checked: true,
-        reachable: res.ok,
-        geminiConfigured,
-        statusText: res.ok
-          ? geminiConfigured
-            ? 'ONLINE (READY)'
-            : 'DEGRADED (KEY MISSING)'
-          : 'OFFLINE',
-        configurationError: errMsg,
-        backendUrl,
-      };
-      setBackendHealth(snap);
-      const declaredCount =
-        Number(data.liveToolsCount || data.assistantToolsCount) || ASSISTANT_TOOL_SPECS.length;
-      setDeviceDiagnostics((prev) => ({
-        ...prev,
-        geminiToolCallingAvailable: Boolean(res.ok && geminiConfigured),
-        declaredToolsCount: declaredCount,
-        updatedAtIso: new Date().toISOString(),
-      }));
-      if (!snap.reachable || !snap.geminiConfigured) {
-        setConnectionError(errMsg || 'ZONI backend requires configuration.');
-      } else {
-        setConnectionError((prev) =>
-          prev && prev.includes('Backend') ? null : prev
-        );
-      }
-      return snap;
-    } catch (err: any) {
-      const message =
-        err?.message || 'Unable to reach the ZONI AI backend server.';
-      const snap: BackendHealthSnapshot = {
-        checked: true,
-        reachable: false,
-        geminiConfigured: false,
-        statusText: 'OFFLINE',
-        configurationError: message,
-        backendUrl,
-      };
-      setBackendHealth(snap);
-      setConnectionError(message);
-      return snap;
+    const verify = await verifyDirectGeminiApiKey(rawKey, fetch, activeLanguageRef.current);
+    if (verify.ok) {
+      preferredChatModelRef.current = verify.preferredChatModel;
+      preferredLiveModelRef.current = verify.preferredLiveModel;
+      liveModelFallbackIdxRef.current = Math.max(
+        0,
+        DIRECT_LIVE_MODEL_CANDIDATES.indexOf(verify.preferredLiveModel as any)
+      );
     }
+
+    const snap: BackendHealthSnapshot = {
+      checked: true,
+      reachable: verify.ok,
+      geminiConfigured: verify.ok,
+      statusText: verify.statusText,
+      configurationError: verify.ok ? null : verify.message,
+      maskedKeyPreview: keyStatus.maskedPreview,
+      storageLabel: keyStatus.storageLabel,
+      preferredChatModel: verify.preferredChatModel,
+      preferredLiveModel: verify.preferredLiveModel,
+    };
+    setBackendHealth(snap);
+    setDeviceDiagnostics((prev) => ({
+      ...prev,
+      geminiToolCallingAvailable: verify.ok,
+      declaredToolsCount: ASSISTANT_TOOL_SPECS.length,
+      updatedAtIso: new Date().toISOString(),
+    }));
+    if (!verify.ok) {
+      setConnectionError(verify.message);
+      if (verify.code === 'GEMINI_KEY_INVALID') {
+        liveNonRetryableErrorRef.current = verify.message;
+      }
+    } else {
+      liveNonRetryableErrorRef.current = null;
+      setConnectionError((prev) =>
+        prev && /api key|backend|gemini/i.test(prev) ? null : prev
+      );
+    }
+    return snap;
   }, []);
 
   const refreshDeviceDiagnostics = useCallback(() => {
@@ -1145,52 +1160,52 @@ export default function App() {
         };
       }
 
-      // 4. Read Visible Screen (with multimodal Gemini screen analysis when available)
+      // 4. Read Visible Screen (direct multimodal Gemini screen analysis using user's BYOK key)
       if (req.actionType === 'read_visible_screen') {
         const snap = captureNativeScreenSnapshot();
         const visibleText =
           snap.visibleText ||
           (typeof document !== 'undefined' ? document.body?.innerText?.slice(0, 1800) || '' : '');
         const question = String(req.arguments.question || '').trim();
-        try {
-          const res = await fetch(`${getApiBaseUrl()}/api/screen/analyze`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              imageBase64: snap.imageBase64,
-              visibleText,
-              question,
-              lang,
-              affectionName: selectedAffectionNameRef.current,
-            }),
-          });
-          const data = await res.json().catch(() => ({}));
-          if (res.ok && data.explanation) {
-            return {
-              actionId: req.actionId,
-              actionType: 'read_visible_screen',
-              success: true,
-              verified: true,
-              status: 'screen_read',
-              message: data.explanation,
-            };
-          }
+        const apiKey = getGeminiApiKeyForRequest();
+        if (!apiKey) {
           return {
             actionId: req.actionId,
             actionType: 'read_visible_screen',
             success: false,
             verified: true,
-            status: 'failed',
-            message: data.error || 'Could not analyze the current screen.',
+            status: 'gemini_key_missing',
+            message:
+              getGeminiConfigError(undefined, lang) ||
+              'Configure your Gemini API Key in Setup or Settings to analyze screen content.',
           };
-        } catch {
+        }
+        try {
+          const explanation = await analyzeScreenDirectGemini({
+            apiKey,
+            imageBase64: snap.imageBase64,
+            visibleText,
+            question,
+            lang,
+            affectionName: selectedAffectionNameRef.current,
+            preferredModel: preferredChatModelRef.current,
+          });
+          return {
+            actionId: req.actionId,
+            actionType: 'read_visible_screen',
+            success: true,
+            verified: true,
+            status: 'screen_read',
+            message: explanation,
+          };
+        } catch (err: any) {
           return {
             actionId: req.actionId,
             actionType: 'read_visible_screen',
             success: false,
             verified: false,
             status: 'failed',
-            message: 'Network error while analyzing screen text.',
+            message: sanitizeGeminiSecret(err, apiKey) || 'Could not analyze the current screen.',
           };
         }
       }
@@ -1672,7 +1687,7 @@ export default function App() {
     setAssistantState('idle');
   }, []);
 
-  // Reliable HTTP /api/chat fallback (with Real Gemini Function Calling & /api/chat/tool-result round-trip)
+  // Reliable Direct Gemini REST Chat (with full 36-tool Gemini Function Calling & verified tool feedback)
   const sendViaHttpChatFallback = useCallback(
     async (
       cleanText: string,
@@ -1686,7 +1701,8 @@ export default function App() {
         pending.fallbackStarted = true;
       }
 
-      const configError = getBackendConfigError();
+      const apiKey = getGeminiApiKeyForRequest();
+      const configError = !apiKey ? getGeminiConfigError(undefined, activeLanguageRef.current) : null;
       if (configError) {
         setConnectionError(configError);
         setLatestTranscript(configError);
@@ -1708,45 +1724,17 @@ export default function App() {
       }
 
       try {
-        const base = getApiBaseUrl();
-        const res = await fetch(`${base}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: cleanText,
-            history: historySnapshot,
-            mode: activeModeRef.current,
-            nickname: selectedAffectionNameRef.current,
-            selectedAffectionName: selectedAffectionNameRef.current,
-            lang: activeLanguageRef.current,
-          }),
+        const data = await sendDirectGeminiChat({
+          apiKey,
+          message: cleanText,
+          history: historySnapshot,
+          mode: activeModeRef.current,
+          selectedAffectionName: selectedAffectionNameRef.current,
+          lang: activeLanguageRef.current,
+          preferredModel: preferredChatModelRef.current,
         });
 
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          const errMessage =
-            data?.error ||
-            `ZONI AI backend error (HTTP ${res.status}). Check server GEMINI_API_KEY configuration.`;
-          setConnectionError(errMessage);
-          setLatestTranscript(errMessage);
-          setAssistantState('error');
-          setMessages((prev) => {
-            if (prev.some((m) => m.id === `${clientMsgId}-error`)) return prev;
-            return [
-              ...prev,
-              {
-                id: `${clientMsgId}-error`,
-                role: 'assistant',
-                text: `Error: ${errMessage}`,
-                timestamp: new Date(),
-                lang: activeLanguageRef.current,
-              },
-            ];
-          });
-          return;
-        }
-
-        // Execute any validated Gemini Function Calls returned by /api/chat
+        // Execute any validated Gemini Function Calls returned directly by Gemini
         const serverToolCalls: ValidatedActionRequest[] = Array.isArray(data.toolCalls)
           ? data.toolCalls
           : [];
@@ -1779,34 +1767,17 @@ export default function App() {
               )
               .join(' ');
           } else {
-            // Send real verified execution results back to Gemini for an accurate localized reply
+            // Send real verified execution results back to Gemini directly for an accurate localized reply
             try {
-              const feedbackRes = await fetch(`${base}/api/chat/tool-result`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  originalMessage: cleanText,
-                  toolResults,
-                  mode: activeModeRef.current,
-                  nickname: selectedAffectionNameRef.current,
-                  selectedAffectionName: selectedAffectionNameRef.current,
-                  lang: activeLanguageRef.current,
-                }),
+              finalReply = await sendDirectGeminiToolFeedback({
+                apiKey,
+                originalMessage: cleanText,
+                toolResults,
+                mode: activeModeRef.current,
+                selectedAffectionName: selectedAffectionNameRef.current,
+                lang: activeLanguageRef.current,
+                preferredModel: preferredChatModelRef.current,
               });
-              const feedbackData = await feedbackRes.json().catch(() => ({}));
-              if (feedbackRes.ok && typeof feedbackData.reply === 'string' && feedbackData.reply.trim()) {
-                finalReply = feedbackData.reply.trim();
-              } else {
-                finalReply = toolResults
-                  .map((r) =>
-                    formatLocalizedActionOutcome(
-                      r,
-                      activeLanguageRef.current,
-                      selectedAffectionNameRef.current
-                    )
-                  )
-                  .join(' ');
-              }
             } catch {
               finalReply = toolResults
                 .map((r) =>
@@ -1821,7 +1792,7 @@ export default function App() {
           }
         } else {
           if (!finalReply) {
-            throw new Error('Empty response returned by /api/chat.');
+            throw new Error('Empty response returned by Google Gemini.');
           }
           const { cleanText: replyClean, action } = extractActionTagFromText(finalReply);
           if (action) {
@@ -1859,8 +1830,11 @@ export default function App() {
         setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
       } catch (err: any) {
         const errMessage =
-          err?.message ||
-          'Failed to reach ZONI AI backend (/api/chat). Please verify your server connection.';
+          sanitizeGeminiSecret(err, apiKey) ||
+          'Failed to contact Google Gemini API. Please check your Gemini API Key and internet connection.';
+        if (err?.code === 'GEMINI_KEY_INVALID') {
+          liveNonRetryableErrorRef.current = errMessage;
+        }
         setConnectionError(errMessage);
         setLatestTranscript(errMessage);
         setAssistantState('error');
@@ -1882,20 +1856,24 @@ export default function App() {
     [clearTurnTimeout, executeValidatedAssistantTool, recordActionDiagnostic]
   );
 
-  // Connect or reuse the single shared Gemini Live WebSocket session, resolving ONLY after server 'connected' handshake
+  // Connect or reuse the single shared direct Google Gemini Live WebSocket session
+  // Resolves ONLY after Google's BidiGenerateContent returns 'setupComplete'
   const connectSharedLiveWs = useCallback(
     (forceReconnect = false): Promise<void> => {
       if (isUnmountedRef.current) {
         return Promise.reject(new Error('Component unmounted'));
       }
 
-      const configError = getBackendConfigError();
-      if (configError) {
-        setWsStatus('error');
-        setConnectionError(configError);
+      const apiKey = getGeminiApiKeyForRequest();
+      if (!apiKey) {
+        const configError =
+          getGeminiConfigError(undefined, activeLanguageRef.current) ||
+          'Enter your Gemini API Key in Setup or Settings.';
+        setWsStatus('disconnected');
         if (isLiveActiveRef.current) {
           stopVoiceCapture(true);
           setAssistantState('error');
+          setConnectionError(configError);
         }
         return Promise.reject(new Error(configError));
       }
@@ -1940,27 +1918,24 @@ export default function App() {
       isSessionReadyRef.current = false;
       setWsStatus(reconnectAttemptRef.current > 0 || goAwayRotatingRef.current ? 'reconnecting' : 'connecting');
 
-      const wsUrl = getLiveWsUrl(
-        activeModeRef.current,
-        selectedAffectionNameRef.current,
-        selectedVoiceRef.current,
-        activeLanguageRef.current,
-        resumptionHandleRef.current
-      );
-
+      const wsUrl = buildDirectLiveWebSocketUrl(apiKey);
       if (!wsUrl) {
-        const errText =
-          getBackendConfigError() || 'Backend WebSocket URL is not configured.';
+        const errText = getGeminiConfigError(undefined, activeLanguageRef.current) || 'Gemini API Key is missing.';
         setWsStatus('error');
         setConnectionError(errText);
         return Promise.reject(new Error(errText));
       }
 
+      const activeLiveModel =
+        DIRECT_LIVE_MODEL_CANDIDATES[liveModelFallbackIdxRef.current] ||
+        preferredLiveModelRef.current ||
+        DIRECT_LIVE_MODEL_CANDIDATES[0];
+
       const connectPromise = new Promise<void>((resolve, reject) => {
         const handshakeTimer = setTimeout(() => {
           if (wsHandshakeResolverRef.current) {
             const timeoutErr = new Error(
-              'Timed out waiting for Gemini Live server handshake (/live).'
+              'Timed out waiting for Google Gemini Live setup handshake.'
             );
             setWsStatus('error');
             setConnectionError(timeoutErr.message);
@@ -1980,520 +1955,455 @@ export default function App() {
 
           ws.onopen = () => {
             if (isUnmountedRef.current || wsRef.current !== ws) return;
-            // Wait for server 'connected' event confirming Gemini Live upstream handshake
+            try {
+              const systemInstruction = buildZoniSystemInstruction(
+                activeModeRef.current,
+                selectedAffectionNameRef.current,
+                undefined,
+                activeLanguageRef.current
+              );
+              const setupPayload = buildDirectLiveSetupMessage({
+                model: activeLiveModel,
+                voice: selectedVoiceRef.current,
+                systemInstruction,
+                resumptionHandle: resumptionHandleRef.current,
+                includeTools: true,
+              });
+              ws.send(JSON.stringify(setupPayload));
+            } catch (setupErr) {
+              const cleanErr = sanitizeGeminiSecret(setupErr, apiKey);
+              setWsStatus('error');
+              setConnectionError(cleanErr || 'Failed to send Gemini Live setup payload.');
+              settlePendingHandshake(new Error(cleanErr || 'Gemini Live setup failed.'));
+            }
           };
 
-          ws.onmessage = (event) => {
+          ws.onmessage = async (event) => {
             if (isUnmountedRef.current || wsRef.current !== ws) return;
             wsLastActivityAtRef.current = Date.now();
             try {
-              const msg = JSON.parse(event.data);
+              const rawMsg = await decodeDirectLiveFrame(event.data);
+              if (!rawMsg) return;
 
-              if (msg.type === 'pong') {
-                return;
-              }
+              const parsedEvents = parseDirectLiveServerMessage(rawMsg);
+              for (const ev of parsedEvents) {
+                if (ev.type === 'setup_complete') {
+                  isSessionReadyRef.current = true;
+                  liveToolsReadyRef.current = true;
+                  goAwayRotatingRef.current = false;
+                  liveNonRetryableErrorRef.current = null;
+                  preferredLiveModelRef.current = activeLiveModel;
+                  setWsStatus('connected');
+                  setConnectionError(null);
+                  const wasResumed = Boolean(resumptionHandleRef.current);
+                  setSessionResumed(wasResumed);
+                  setDeviceDiagnostics((prev) => ({
+                    ...prev,
+                    geminiToolCallingAvailable: true,
+                    declaredToolsCount: ASSISTANT_TOOL_SPECS.length,
+                    updatedAtIso: new Date().toISOString(),
+                  }));
+                  settlePendingHandshake();
 
-              if (msg.type === 'connected') {
-                isSessionReadyRef.current = true;
-                liveToolsReadyRef.current = msg.liveToolCallingSupported !== false;
-                goAwayRotatingRef.current = false;
-                liveNonRetryableErrorRef.current = null;
-                setWsStatus('connected');
-                setConnectionError(null);
-                const wasResumed = Boolean(msg.resumed);
-                setSessionResumed(wasResumed);
-                setDeviceDiagnostics((prev) => ({
-                  ...prev,
-                  geminiToolCallingAvailable: true,
-                  declaredToolsCount:
-                    Number(msg.declaredToolsCount) || ASSISTANT_TOOL_SPECS.length,
-                  updatedAtIso: new Date().toISOString(),
-                }));
-                settlePendingHandshake();
-
-                // Reset reconnect backoff only after the session stays healthy for HEALTHY_SESSION_RESET_MS
-                clearWsConnectionTimers();
-                wsHealthyResetTimerRef.current = setTimeout(() => {
-                  if (wsRef.current === ws && isSessionReadyRef.current) {
-                    reconnectAttemptRef.current = 0;
-                  }
-                }, HEALTHY_SESSION_RESET_MS);
-
-                // Client application-level heartbeat to detect silent NAT/WebView half-open drops
-                wsLastActivityAtRef.current = Date.now();
-                wsClientPingTimerRef.current = setInterval(() => {
-                  if (isUnmountedRef.current || wsRef.current !== ws) {
-                    clearWsConnectionTimers();
-                    return;
-                  }
-                  if (ws.readyState !== WebSocket.OPEN) return;
-                  const silenceMs = Date.now() - wsLastActivityAtRef.current;
-                  if (silenceMs >= CLIENT_WS_STALE_TIMEOUT_MS) {
-                    console.warn('[ZONI-LIVE] Stale WebSocket detected (no pong/traffic); forcing clean reconnect.');
-                    try {
-                      ws.close(4000, 'Client heartbeat timeout');
-                    } catch {
-                      // ignore
+                  clearWsConnectionTimers();
+                  wsHealthyResetTimerRef.current = setTimeout(() => {
+                    if (wsRef.current === ws && isSessionReadyRef.current) {
+                      reconnectAttemptRef.current = 0;
                     }
-                    return;
-                  }
-                  try {
-                    ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
-                  } catch {
-                    // ignore
-                  }
-                }, CLIENT_WS_PING_INTERVAL_MS);
+                  }, HEALTHY_SESSION_RESET_MS);
 
-                if (
-                  hadConnectedOnceRef.current &&
-                  !wasResumed &&
-                  outgoingQueueRef.current.length === 0
-                ) {
-                  const freshNotice =
-                    activeLanguageRef.current === 'bn-BD'
-                      ? `নতুন Gemini Live সেশন সংযুক্ত হয়েছে ${selectedAffectionNameRef.current}!`
-                      : `Connected to a new Gemini Live session, ${selectedAffectionNameRef.current}!`;
-                  setLatestTranscript(freshNotice);
-                }
-                hadConnectedOnceRef.current = true;
-
-                // Flush queued messages with clientMsgId deduplication so reconnect never sends duplicates
-                const flushedMsgIds = new Set<string>();
-                while (
-                  outgoingQueueRef.current.length > 0 &&
-                  ws.readyState === WebSocket.OPEN
-                ) {
-                  const queuedPayload = outgoingQueueRef.current.shift();
-                  if (!queuedPayload) continue;
-                  try {
-                    const parsedQueued = JSON.parse(queuedPayload);
-                    if (typeof parsedQueued?.clientMsgId === 'string') {
-                      if (flushedMsgIds.has(parsedQueued.clientMsgId)) continue;
-                      flushedMsgIds.add(parsedQueued.clientMsgId);
-                    }
-                  } catch {
-                    // Send raw payload if not JSON
-                  }
-                  ws.send(queuedPayload);
-                }
-                return;
-              }
-
-              if (msg.type === 'session_resumption') {
-                if (msg.resumable === false) {
-                  resumptionHandleRef.current = undefined;
-                } else if (msg.newHandle && typeof msg.newHandle === 'string') {
-                  resumptionHandleRef.current = msg.newHandle;
-                }
-                return;
-              }
-
-              // Proactive graceful rotation before Gemini upstream closes the session
-              if (msg.type === 'go_away') {
-                if (!goAwayRotatingRef.current) {
-                  goAwayRotatingRef.current = true;
-                  setWsStatus('reconnecting');
-                  console.log(
-                    `[ZONI-LIVE] Received go_away (timeLeft=${msg.timeLeft || 'soon'}); rotating session gracefully.`
-                  );
-                  if (reconnectTimerRef.current) {
-                    clearTimeout(reconnectTimerRef.current);
-                  }
-                  reconnectTimerRef.current = setTimeout(() => {
-                    if (!isUnmountedRef.current) {
-                      connectSharedLiveWs(true).catch(() => {
-                        goAwayRotatingRef.current = false;
-                      });
-                    }
-                  }, 300);
-                }
-                return;
-              }
-
-              // Upstream Gemini session closed cleanly -> reconnect using saved resumption handle
-              if (msg.type === 'session_closed') {
-                isSessionReadyRef.current = false;
-                clearWsConnectionTimers();
-                if (
-                  !liveNonRetryableErrorRef.current &&
-                  !goAwayRotatingRef.current &&
-                  shouldAutoReconnectLiveWs(msg.code, msg.retryable !== false, reconnectAttemptRef.current)
-                ) {
-                  goAwayRotatingRef.current = true;
-                  setWsStatus('reconnecting');
-                  const delay = getReconnectDelayMs(reconnectAttemptRef.current, 1500, 15000, 0.2);
-                  reconnectAttemptRef.current += 1;
-                  if (reconnectTimerRef.current) {
-                    clearTimeout(reconnectTimerRef.current);
-                  }
-                  reconnectTimerRef.current = setTimeout(() => {
-                    if (!isUnmountedRef.current) {
-                      connectSharedLiveWs(false).catch(() => {
-                        goAwayRotatingRef.current = false;
-                      });
-                    }
-                  }, delay);
-                }
-                return;
-              }
-
-              // Bidirectional Gemini Live Native Tool Call Relay (Root Cause 1 & 2)
-              if (msg.type === 'native_tool_call' && msg.toolCallId && msg.actionType) {
-                clearTurnTimeout();
-                liveToolExecutedInTurnRef.current = true;
-                if (pendingChatFallbackRef.current) {
-                  pendingChatFallbackRef.current.answered = true;
-                }
-                const toolCallId = String(msg.toolCallId);
-                const actionType = String(msg.actionType);
-                const rawArgs =
-                  msg.arguments && typeof msg.arguments === 'object'
-                    ? (msg.arguments as Record<string, unknown>)
-                    : {};
-
-                recentActionDeduplicatorRef.current.markExecuted(actionType, rawArgs);
-
-                void executeValidatedAssistantTool(actionType, rawArgs, toolCallId)
-                  .then((report) => {
-                    recordActionDiagnostic('live_ws', actionType, rawArgs, report);
-                    if (ws.readyState === WebSocket.OPEN) {
-                      ws.send(
-                        JSON.stringify({
-                          type: 'native_tool_result',
-                          toolCallId,
-                          actionType,
-                          result: {
-                            success: report.success,
-                            verified: report.verified,
-                            awaitingConfirmation: Boolean(report.awaitingConfirmation),
-                            status: report.status,
-                            message: report.message,
-                            failureReason:
-                              !report.success
-                                ? String(
-                                    (report.data as Record<string, unknown> | undefined)
-                                      ?.failureReason || report.status
-                                  )
-                                : undefined,
-                            requiredPermissions: report.requiredPermissions,
-                            data: report.data,
-                          },
-                        })
-                      );
-                    }
-                    if (report.awaitingConfirmation || !report.success) {
-                      const localized = formatLocalizedActionOutcome(
-                        report,
-                        activeLanguageRef.current,
-                        selectedAffectionNameRef.current
-                      );
-                      setLatestTranscript(localized);
-                    }
-                  })
-                  .catch((err) => {
-                    const failReport: ToolExecutionReport = {
-                      actionId: toolCallId,
-                      actionType,
-                      success: false,
-                      verified: false,
-                      status: 'failed',
-                      message:
-                        err?.message || 'Native action execution threw an unexpected error.',
-                      data: { failureReason: 'client_execution_exception' },
-                    };
-                    recordActionDiagnostic('live_ws', actionType, rawArgs, failReport);
-                    if (ws.readyState === WebSocket.OPEN) {
-                      ws.send(
-                        JSON.stringify({
-                          type: 'native_tool_result',
-                          toolCallId,
-                          actionType,
-                          result: {
-                            success: false,
-                            verified: false,
-                            status: 'failed',
-                            failureReason: 'client_execution_exception',
-                            message: failReport.message,
-                          },
-                        })
-                      );
-                    }
-                  });
-                return;
-              }
-
-              if (msg.type === 'flashlight') {
-                const turnOn = Boolean(msg.enable);
-                toggleFlashlight(turnOn);
-                const feedback =
-                  activeLanguageRef.current === 'bn-BD'
-                    ? turnOn
-                      ? 'টর্চ লাইট জ্বালানো হয়েছে।'
-                      : 'টর্চ লাইট বন্ধ করা হয়েছে।'
-                    : turnOn
-                    ? 'Flashlight turned on.'
-                    : 'Flashlight turned off.';
-                setLatestTranscript(feedback);
-                return;
-              }
-
-              if (msg.type === 'user_transcript' && msg.text) {
-                const speechTurnId =
-                  typeof msg.turnId === 'number'
-                    ? msg.turnId
-                    : userSpeechTurnIdRef.current;
-
-                const incomingChunk = String(msg.text || '').trim();
-                if (incomingChunk) {
-                  const prevUtterance = currentSpeechTranscriptRef.current;
-                  currentSpeechTranscriptRef.current =
-                    !prevUtterance || incomingChunk.startsWith(prevUtterance)
-                      ? incomingChunk
-                      : `${prevUtterance} ${incomingChunk}`.trim();
-                }
-
-                setMessages((prev) =>
-                  upsertUserSpeechTurnMessage(
-                    prev,
-                    msg.text,
-                    speechTurnId,
-                    activeLanguageRef.current
-                  )
-                );
-
-                // Debounced deterministic native action execution for spoken voice transcripts
-                // (fires ONLY if Gemini Live has not already executed a native_tool_call for this utterance)
-                if (voiceTranscriptDebounceRef.current) {
-                  clearTimeout(voiceTranscriptDebounceRef.current);
-                }
-                const utteranceSnapshot = currentSpeechTranscriptRef.current;
-                voiceTranscriptDebounceRef.current = setTimeout(() => {
-                  if (isUnmountedRef.current || liveToolExecutedInTurnRef.current) return;
-                  const cleanSpoken = utteranceSnapshot.trim();
-                  if (!cleanSpoken) return;
-
-                  const plan = buildStructuredTaskPlan(cleanSpoken);
-                  if (plan.blockedReason) {
-                    setLatestTranscript(plan.blockedReason);
-                    return;
-                  }
-                  if (plan.steps.length === 0) return;
-
-                  // Routine actions execute directly — no second verbal approval required.
                   if (
-                    plan.steps.length === 1 &&
-                    (plan.steps[0].tool === 'approve_pending_action' ||
-                      plan.steps[0].tool === 'review_pending_draft')
+                    hadConnectedOnceRef.current &&
+                    !wasResumed &&
+                    outgoingQueueRef.current.length === 0
                   ) {
-                    return;
+                    const freshNotice =
+                      activeLanguageRef.current === 'bn-BD'
+                        ? `নতুন Gemini Live সেশন সংযুক্ত হয়েছে ${selectedAffectionNameRef.current}!`
+                        : `Connected to a new Gemini Live session, ${selectedAffectionNameRef.current}!`;
+                    setLatestTranscript(freshNotice);
                   }
+                  hadConnectedOnceRef.current = true;
 
-                  void (async () => {
-                    const outcomes: string[] = [];
-                    for (const step of plan.steps) {
-                      const mapped = mapTaskStepToAssistantTool(step, cleanSpoken);
-                      if (!mapped) continue;
-                      if (
-                        !recentActionDeduplicatorRef.current.shouldExecute(
-                          mapped.name,
-                          mapped.args
-                        )
-                      ) {
-                        continue;
+                  // Flush queued direct Live messages cleanly
+                  const flushedPayloads = new Set<string>();
+                  while (
+                    outgoingQueueRef.current.length > 0 &&
+                    ws.readyState === WebSocket.OPEN
+                  ) {
+                    const queuedPayload = outgoingQueueRef.current.shift();
+                    if (!queuedPayload || flushedPayloads.has(queuedPayload)) continue;
+                    flushedPayloads.add(queuedPayload);
+                    ws.send(queuedPayload);
+                  }
+                  continue;
+                }
+
+                if (ev.type === 'session_resumption') {
+                  if (ev.resumable === false) {
+                    resumptionHandleRef.current = undefined;
+                  } else if (ev.newHandle) {
+                    resumptionHandleRef.current = ev.newHandle;
+                  }
+                  continue;
+                }
+
+                if (ev.type === 'go_away') {
+                  if (!goAwayRotatingRef.current) {
+                    goAwayRotatingRef.current = true;
+                    setWsStatus('reconnecting');
+                    if (reconnectTimerRef.current) {
+                      clearTimeout(reconnectTimerRef.current);
+                    }
+                    reconnectTimerRef.current = setTimeout(() => {
+                      if (!isUnmountedRef.current) {
+                        connectSharedLiveWs(true).catch(() => {
+                          goAwayRotatingRef.current = false;
+                        });
                       }
-                      const report = await executeValidatedAssistantTool(mapped.name, mapped.args);
-                      recordActionDiagnostic('deterministic_native', mapped.name, mapped.args, report);
-                      outcomes.push(
-                        formatLocalizedActionOutcome(
-                          report,
-                          activeLanguageRef.current,
-                          selectedAffectionNameRef.current
-                        )
-                      );
-                    }
-                    if (outcomes.length > 0) {
-                      const combined = outcomes.join(' ');
-                      setLatestTranscript(combined);
-                      setMessages((prev) => [
-                        ...prev,
-                        {
-                          id: `voice-act-${Date.now()}`,
-                          role: 'assistant',
-                          text: combined,
-                          timestamp: new Date(),
-                          lang: activeLanguageRef.current,
-                        },
-                      ]);
-                    }
-                  })();
-                }, 900);
-
-                if (isFlashlightOnCommand(msg.text)) {
-                  if (
-                    recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
-                      enable: true,
-                    })
-                  ) {
-                    toggleFlashlight(true);
-                    const feedback =
-                      activeLanguageRef.current === 'bn-BD'
-                        ? 'টর্চ লাইট জ্বালানো হয়েছে।'
-                        : 'Flashlight turned on.';
-                    setLatestTranscript(feedback);
+                    }, 300);
                   }
-                } else if (isFlashlightOffCommand(msg.text)) {
-                  if (
-                    recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
-                      enable: false,
-                    })
-                  ) {
-                    toggleFlashlight(false);
-                    const feedback =
-                      activeLanguageRef.current === 'bn-BD'
-                        ? 'টর্চ লাইট বন্ধ করা হয়েছে।'
-                        : 'Flashlight turned off.';
-                    setLatestTranscript(feedback);
+                  continue;
+                }
+
+                // Direct Gemini Live 36-Tool Execution & toolResponse Relay
+                if (ev.type === 'tool_call' && Array.isArray(ev.functionCalls)) {
+                  clearTurnTimeout();
+                  liveToolExecutedInTurnRef.current = true;
+                  if (pendingChatFallbackRef.current) {
+                    pendingChatFallbackRef.current.answered = true;
                   }
-                }
-                return;
-              }
 
-              if (msg.type === 'audio' && msg.audio) {
-                clearTurnTimeout();
-                receivedAudioInTurnRef.current = true;
-                if (pendingChatFallbackRef.current) {
-                  pendingChatFallbackRef.current.answered = true;
-                }
-                if (
-                  !voiceMutedRef.current &&
-                  (isLiveActiveRef.current || voiceAutoPlayRef.current)
-                ) {
-                  setAssistantState('speaking');
-                  liveAudioPlayerRef.current?.playPcmChunk(msg.audio, 24000);
-                }
-                return;
-              }
+                  for (const fc of ev.functionCalls) {
+                    const toolCallId = String(fc?.id || `live-fc-${Date.now()}`);
+                    const rawName = String(fc?.name || '');
+                    const rawArgs =
+                      fc?.args && typeof fc.args === 'object'
+                        ? (fc.args as Record<string, unknown>)
+                        : {};
 
-              if ((msg.type === 'output_transcript' || msg.type === 'text') && msg.text) {
-                clearTurnTimeout();
-                if (pendingChatFallbackRef.current) {
-                  pendingChatFallbackRef.current.answered = true;
-                }
-                const turnId =
-                  typeof msg.turnId === 'number'
-                    ? msg.turnId
-                    : currentTurnIdRef.current;
+                    const validation = validateGeminiToolCall(rawName, rawArgs, toolCallId);
+                    if (!validation.valid || !validation.request) {
+                      if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(
+                          JSON.stringify(
+                            buildDirectLiveToolResponseMessage([
+                              {
+                                id: toolCallId,
+                                name: rawName || 'unknown',
+                                response: {
+                                  success: false,
+                                  verified: false,
+                                  status: 'blocked',
+                                  message:
+                                    validation.blockedReason ||
+                                    'Action blocked by ZONI allowlist policy.',
+                                },
+                              },
+                            ])
+                          )
+                        );
+                      }
+                      continue;
+                    }
 
-                const { cleanText, action } = extractActionTagFromText(msg.text);
-                if (action) {
-                  executeAssistantActionDirectly(action);
-                }
-
-                const liveLangSwitch = detectLanguageSwitchCommand(
-                  cleanText || msg.text,
-                  selectedAffectionNameRef.current
-                );
-                if (
-                  liveLangSwitch &&
-                  liveLangSwitch.lang !== activeLanguageRef.current
-                ) {
-                  setActiveLanguage(liveLangSwitch.lang);
-                  localStorage.setItem('zoni_active_language', liveLangSwitch.lang);
-                }
-
-                setMessages((prev) => {
-                  const { messages: updated, latestFullText } =
-                    upsertAssistantTurnMessage(
-                      prev,
-                      msg.text,
-                      turnId,
-                      activeLanguageRef.current
+                    const validatedReq = validation.request;
+                    recentActionDeduplicatorRef.current.markExecuted(
+                      validatedReq.actionType,
+                      validatedReq.arguments
                     );
-                  if (latestFullText) {
-                    setLatestTranscript(latestFullText);
+
+                    void executeValidatedAssistantTool(
+                      validatedReq.actionType,
+                      validatedReq.arguments,
+                      toolCallId
+                    )
+                      .then((report) => {
+                        recordActionDiagnostic(
+                          'live_ws',
+                          validatedReq.actionType,
+                          validatedReq.arguments,
+                          report
+                        );
+                        if (ws.readyState === WebSocket.OPEN) {
+                          ws.send(
+                            JSON.stringify(
+                              buildDirectLiveToolResponseMessage([
+                                {
+                                  id: toolCallId,
+                                  name: validatedReq.actionType,
+                                  response: {
+                                    success: report.success,
+                                    verified: report.verified,
+                                    awaitingConfirmation: Boolean(report.awaitingConfirmation),
+                                    status: report.status,
+                                    message: report.message,
+                                    failureReason: !report.success
+                                      ? String(
+                                          (report.data as Record<string, unknown> | undefined)
+                                            ?.failureReason || report.status
+                                        )
+                                      : undefined,
+                                    requiredPermissions: report.requiredPermissions,
+                                  },
+                                },
+                              ])
+                            )
+                          );
+                        }
+                        if (report.awaitingConfirmation || !report.success) {
+                          const localized = formatLocalizedActionOutcome(
+                            report,
+                            activeLanguageRef.current,
+                            selectedAffectionNameRef.current
+                          );
+                          setLatestTranscript(localized);
+                        }
+                      })
+                      .catch((err) => {
+                        const failMsg =
+                          sanitizeGeminiSecret(err, apiKey) ||
+                          'Native action execution threw an unexpected error.';
+                        const failReport: ToolExecutionReport = {
+                          actionId: toolCallId,
+                          actionType: validatedReq.actionType,
+                          success: false,
+                          verified: false,
+                          status: 'failed',
+                          message: failMsg,
+                          data: { failureReason: 'client_execution_exception' },
+                        };
+                        recordActionDiagnostic(
+                          'live_ws',
+                          validatedReq.actionType,
+                          validatedReq.arguments,
+                          failReport
+                        );
+                        if (ws.readyState === WebSocket.OPEN) {
+                          ws.send(
+                            JSON.stringify(
+                              buildDirectLiveToolResponseMessage([
+                                {
+                                  id: toolCallId,
+                                  name: validatedReq.actionType,
+                                  response: {
+                                    success: false,
+                                    verified: false,
+                                    status: 'failed',
+                                    failureReason: 'client_execution_exception',
+                                    message: failMsg,
+                                  },
+                                },
+                              ])
+                            )
+                          );
+                        }
+                      });
                   }
-                  return updated;
-                });
-
-                return;
-              }
-
-              if (msg.type === 'interrupted') {
-                clearTurnTimeout();
-                stopAllSpeechPlayback();
-                receivedAudioInTurnRef.current = false;
-                currentTurnIdRef.current =
-                  typeof msg.turnId === 'number'
-                    ? msg.turnId + 1
-                    : currentTurnIdRef.current + 1;
-                setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
-                return;
-              }
-
-              if (msg.type === 'turnComplete') {
-                clearTurnTimeout();
-                const completedTurnId =
-                  typeof msg.turnId === 'number'
-                    ? msg.turnId
-                    : currentTurnIdRef.current;
-                currentTurnIdRef.current = completedTurnId + 1;
-                userSpeechTurnIdRef.current += 1;
-                receivedAudioInTurnRef.current = false;
-                liveToolExecutedInTurnRef.current = false;
-                currentSpeechTranscriptRef.current = '';
-                pendingChatFallbackRef.current = null;
-
-                setVitals((prev) => ({
-                  ...prev,
-                  totalInteractions: prev.totalInteractions + 1,
-                  affectionLevel: Math.min(100, prev.affectionLevel + 1),
-                }));
-
-                setTimeout(() => {
-                  setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
-                }, 400);
-                return;
-              }
-
-              if (msg.type === 'error' || msg.type === 'live_init_failed') {
-                clearTurnTimeout();
-                isSessionReadyRef.current = false;
-                const serverErr =
-                  msg.message || 'Gemini Live session could not initialize.';
-                console.warn('Live API event:', serverErr, msg.code || '');
-                setWsStatus('error');
-                setConnectionError(serverErr);
-
-                if (
-                  !shouldAutoReconnectLiveWs(
-                    msg.code,
-                    msg.retryable,
-                    reconnectAttemptRef.current
-                  )
-                ) {
-                  liveNonRetryableErrorRef.current = serverErr;
+                  continue;
                 }
 
-                // Immediately halt mic capture so UI never falsely displays LISTENING
-                if (isLiveActiveRef.current) {
-                  stopVoiceCapture(true);
-                }
-                setAssistantState('error');
-                setLatestTranscript(serverErr);
-                settlePendingHandshake(new Error(serverErr));
+                if (ev.type === 'user_transcript' && ev.text) {
+                  const speechTurnId = userSpeechTurnIdRef.current;
+                  const incomingChunk = String(ev.text || '').trim();
+                  if (incomingChunk) {
+                    const prevUtterance = currentSpeechTranscriptRef.current;
+                    currentSpeechTranscriptRef.current =
+                      !prevUtterance || incomingChunk.startsWith(prevUtterance)
+                        ? incomingChunk
+                        : `${prevUtterance} ${incomingChunk}`.trim();
+                  }
 
-                // If a typed chat turn was awaiting this Live WS, fall back once to /api/chat
-                const pendingChat = pendingChatFallbackRef.current;
-                if (pendingChat && !pendingChat.answered && !pendingChat.fallbackStarted) {
-                  void sendViaHttpChatFallback(
-                    pendingChat.text,
-                    pendingChat.clientMsgId,
-                    pendingChat.historySnapshot
+                  setMessages((prev) =>
+                    upsertUserSpeechTurnMessage(
+                      prev,
+                      ev.text!,
+                      speechTurnId,
+                      activeLanguageRef.current
+                    )
                   );
+
+                  if (voiceTranscriptDebounceRef.current) {
+                    clearTimeout(voiceTranscriptDebounceRef.current);
+                  }
+                  const utteranceSnapshot = currentSpeechTranscriptRef.current;
+                  voiceTranscriptDebounceRef.current = setTimeout(() => {
+                    if (isUnmountedRef.current || liveToolExecutedInTurnRef.current) return;
+                    const cleanSpoken = utteranceSnapshot.trim();
+                    if (!cleanSpoken) return;
+
+                    const plan = buildStructuredTaskPlan(cleanSpoken);
+                    if (plan.blockedReason) {
+                      setLatestTranscript(plan.blockedReason);
+                      return;
+                    }
+                    if (plan.steps.length === 0) return;
+
+                    if (
+                      plan.steps.length === 1 &&
+                      (plan.steps[0].tool === 'approve_pending_action' ||
+                        plan.steps[0].tool === 'review_pending_draft')
+                    ) {
+                      return;
+                    }
+
+                    void (async () => {
+                      const outcomes: string[] = [];
+                      for (const step of plan.steps) {
+                        const mapped = mapTaskStepToAssistantTool(step, cleanSpoken);
+                        if (!mapped) continue;
+                        if (
+                          !recentActionDeduplicatorRef.current.shouldExecute(
+                            mapped.name,
+                            mapped.args
+                          )
+                        ) {
+                          continue;
+                        }
+                        const report = await executeValidatedAssistantTool(mapped.name, mapped.args);
+                        recordActionDiagnostic('deterministic_native', mapped.name, mapped.args, report);
+                        outcomes.push(
+                          formatLocalizedActionOutcome(
+                            report,
+                            activeLanguageRef.current,
+                            selectedAffectionNameRef.current
+                          )
+                        );
+                      }
+                      if (outcomes.length > 0) {
+                        const combined = outcomes.join(' ');
+                        setLatestTranscript(combined);
+                        setMessages((prev) => [
+                          ...prev,
+                          {
+                            id: `voice-act-${Date.now()}`,
+                            role: 'assistant',
+                            text: combined,
+                            timestamp: new Date(),
+                            lang: activeLanguageRef.current,
+                          },
+                        ]);
+                      }
+                    })();
+                  }, 900);
+
+                  if (isFlashlightOnCommand(ev.text)) {
+                    if (
+                      recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
+                        enable: true,
+                      })
+                    ) {
+                      toggleFlashlight(true);
+                      const feedback =
+                        activeLanguageRef.current === 'bn-BD'
+                          ? 'টর্চ লাইট জ্বালানো হয়েছে।'
+                          : 'Flashlight turned on.';
+                      setLatestTranscript(feedback);
+                    }
+                  } else if (isFlashlightOffCommand(ev.text)) {
+                    if (
+                      recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
+                        enable: false,
+                      })
+                    ) {
+                      toggleFlashlight(false);
+                      const feedback =
+                        activeLanguageRef.current === 'bn-BD'
+                          ? 'টর্চ লাইট বন্ধ করা হয়েছে।'
+                          : 'Flashlight turned off.';
+                      setLatestTranscript(feedback);
+                    }
+                  }
+                  continue;
+                }
+
+                if (ev.type === 'audio' && ev.audio) {
+                  clearTurnTimeout();
+                  receivedAudioInTurnRef.current = true;
+                  if (pendingChatFallbackRef.current) {
+                    pendingChatFallbackRef.current.answered = true;
+                  }
+                  if (
+                    !voiceMutedRef.current &&
+                    (isLiveActiveRef.current || voiceAutoPlayRef.current)
+                  ) {
+                    setAssistantState('speaking');
+                    liveAudioPlayerRef.current?.playPcmChunk(ev.audio, 24000);
+                  }
+                  continue;
+                }
+
+                if ((ev.type === 'output_transcript' || ev.type === 'text') && ev.text) {
+                  clearTurnTimeout();
+                  if (pendingChatFallbackRef.current) {
+                    pendingChatFallbackRef.current.answered = true;
+                  }
+                  const turnId = currentTurnIdRef.current;
+
+                  const { cleanText, action } = extractActionTagFromText(ev.text);
+                  if (action) {
+                    executeAssistantActionDirectly(action);
+                  }
+
+                  const liveLangSwitch = detectLanguageSwitchCommand(
+                    cleanText || ev.text,
+                    selectedAffectionNameRef.current
+                  );
+                  if (
+                    liveLangSwitch &&
+                    liveLangSwitch.lang !== activeLanguageRef.current
+                  ) {
+                    setActiveLanguage(liveLangSwitch.lang);
+                    localStorage.setItem('zoni_active_language', liveLangSwitch.lang);
+                  }
+
+                  setMessages((prev) => {
+                    const { messages: updated, latestFullText } =
+                      upsertAssistantTurnMessage(
+                        prev,
+                        ev.text!,
+                        turnId,
+                        activeLanguageRef.current
+                      );
+                    if (latestFullText) {
+                      setLatestTranscript(latestFullText);
+                    }
+                    return updated;
+                  });
+                  continue;
+                }
+
+                if (ev.type === 'interrupted') {
+                  clearTurnTimeout();
+                  stopAllSpeechPlayback();
+                  receivedAudioInTurnRef.current = false;
+                  currentTurnIdRef.current += 1;
+                  setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
+                  continue;
+                }
+
+                if (ev.type === 'turn_complete') {
+                  clearTurnTimeout();
+                  currentTurnIdRef.current += 1;
+                  userSpeechTurnIdRef.current += 1;
+                  receivedAudioInTurnRef.current = false;
+                  liveToolExecutedInTurnRef.current = false;
+                  currentSpeechTranscriptRef.current = '';
+                  pendingChatFallbackRef.current = null;
+
+                  setVitals((prev) => ({
+                    ...prev,
+                    totalInteractions: prev.totalInteractions + 1,
+                    affectionLevel: Math.min(100, prev.affectionLevel + 1),
+                  }));
+
+                  setTimeout(() => {
+                    setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
+                  }, 400);
                 }
               }
             } catch (e) {
-              console.warn('Live message parse notice:', e);
+              console.warn('Direct Gemini Live message notice:', sanitizeGeminiSecret(e, apiKey));
             }
           };
 
@@ -2504,28 +2414,50 @@ export default function App() {
 
           ws.onclose = (closeEvent) => {
             if (isUnmountedRef.current || wsRef.current !== ws) return;
+            const wasReady = isSessionReadyRef.current;
             isSessionReadyRef.current = false;
             wsRef.current = null;
             clearWsConnectionTimers();
 
-            const closeInfo = classifyLiveWsCloseCode(closeEvent?.code, closeEvent?.reason);
+            const cleanReason = sanitizeGeminiSecret(closeEvent?.reason || '', apiKey);
+            const closeInfo = classifyLiveWsCloseCode(closeEvent?.code, cleanReason);
+
+            // If a Live model wasn't found/supported before setupComplete, try next Live candidate once
+            const modelNotSupported =
+              !wasReady &&
+              (closeEvent?.code === 1008 || /not found|not supported|unknown model/i.test(cleanReason)) &&
+              !/api key|invalid|unauthenticated/i.test(cleanReason) &&
+              liveModelFallbackIdxRef.current + 1 < DIRECT_LIVE_MODEL_CANDIDATES.length;
+
+            if (modelNotSupported) {
+              liveModelFallbackIdxRef.current += 1;
+              resumptionHandleRef.current = undefined;
+              setWsStatus('reconnecting');
+              settlePendingHandshake(new Error('Trying fallback Gemini Live model...'));
+              reconnectTimerRef.current = setTimeout(() => {
+                if (!isUnmountedRef.current) {
+                  connectSharedLiveWs(false).catch(() => {});
+                }
+              }, 300);
+              return;
+            }
+
             if (closeInfo.shouldClearHandle) {
               resumptionHandleRef.current = undefined;
             }
             if (!closeInfo.retryable && closeInfo.category === 'auth_or_config') {
-              liveNonRetryableErrorRef.current = closeInfo.diagnosticSummary;
+              liveNonRetryableErrorRef.current =
+                cleanReason || 'Google Gemini Live rejected this API key or model configuration.';
             }
 
             const disconnectReason =
               liveNonRetryableErrorRef.current ||
               (closeInfo.category === 'service_restart'
                 ? 'Gemini Live session rotated; reconnecting cleanly...'
-                : 'Gemini Live WebSocket disconnected. Chat messages will automatically use /api/chat fallback.');
+                : 'Gemini Live WebSocket disconnected. Chat messages will automatically use direct Gemini REST.');
 
             settlePendingHandshake(new Error(disconnectReason));
 
-            // If we are mid-graceful go_away/1012 rotation, keep the UX calm while reconnecting;
-            // on unexpected disconnects, immediately halt mic so UI never falsely displays LISTENING.
             const isGracefulRotation =
               goAwayRotatingRef.current || closeInfo.category === 'service_restart';
 
@@ -2542,7 +2474,7 @@ export default function App() {
               setAssistantState('connecting');
             }
 
-            // If a typed chat turn was awaiting this Live WS, immediately fall back to /api/chat
+            // If a typed chat turn was awaiting this Live WS, immediately fall back to Direct Gemini REST
             const pendingChat = pendingChatFallbackRef.current;
             if (pendingChat && !pendingChat.answered && !pendingChat.fallbackStarted) {
               void sendViaHttpChatFallback(
@@ -2554,6 +2486,7 @@ export default function App() {
 
             if (
               !liveNonRetryableErrorRef.current &&
+              getGeminiApiKeyStatus().configured &&
               closeInfo.retryable &&
               shouldAutoReconnectLiveWs(undefined, true, reconnectAttemptRef.current)
             ) {
@@ -2583,8 +2516,8 @@ export default function App() {
             }
           };
         } catch (err: any) {
-          const msg = err?.message || 'WebSocket creation failed.';
-          console.warn('WebSocket creation failed:', err);
+          const msg = sanitizeGeminiSecret(err, apiKey) || 'WebSocket creation failed.';
+          console.warn('Direct Gemini Live WebSocket creation failed:', msg);
           setWsStatus('error');
           setConnectionError(msg);
           settlePendingHandshake(new Error(msg));
@@ -2598,7 +2531,6 @@ export default function App() {
       clearTurnTimeout,
       clearWsConnectionTimers,
       executeValidatedAssistantTool,
-      handleApprovePendingAction,
       recordActionDiagnostic,
       sendViaHttpChatFallback,
       settlePendingHandshake,
@@ -2607,10 +2539,53 @@ export default function App() {
     ]
   );
 
-  // Send a JSON payload over the shared Gemini Live WebSocket (queueing if connecting)
+  // Translate high-level ZONI payload into official Google Gemini Live JSON and send
   const sendOverSharedWs = useCallback(
     (payload: Record<string, any>): boolean => {
-      const serialized = JSON.stringify(payload);
+      let directPayload: Record<string, any> | null = null;
+
+      if (payload.type === 'client_text' && typeof payload.text === 'string') {
+        directPayload = buildDirectLiveClientTextMessage(payload.text, true);
+      } else if (
+        payload.type === 'update_config' ||
+        payload.type === 'update_nickname' ||
+        payload.type === 'update_affection_name'
+      ) {
+        const updates: string[] = [];
+        const newName = String(payload.selectedAffectionName || payload.nickname || '').trim();
+        if (newName) {
+          updates.push(
+            `The user's designated affection name is now "${newName}". Address the user lovingly as "${newName}".`
+          );
+        }
+        if (payload.lang) {
+          const langLabel =
+            payload.lang === 'bn-BD'
+              ? 'Bangladeshi Bengali (বাংলা - bn-BD)'
+              : payload.lang === 'hi-IN'
+              ? 'Hindi / Hinglish (hi-IN)'
+              : 'English (en-US)';
+          updates.push(`Switch your active response language immediately to ${langLabel}.`);
+        }
+        if (payload.mode) {
+          updates.push(`Switch companion personality mode to ${String(payload.mode).toUpperCase()}.`);
+        }
+        if (updates.length > 0) {
+          directPayload = buildDirectLiveClientTextMessage(
+            `[SYSTEM CONTEXT UPDATE]: ${updates.join(' ')}`,
+            false
+          );
+        }
+      } else if (payload.type === 'interrupt') {
+        // Barge-in is handled locally by stopping playback and streaming new user audio
+        return true;
+      } else if (typeof payload.audio === 'string' && payload.audio.length > 0) {
+        directPayload = buildDirectLiveAudioMessage(payload.audio);
+      }
+
+      if (!directPayload) return false;
+      const serialized = JSON.stringify(directPayload);
+
       if (
         wsRef.current &&
         wsRef.current.readyState === WebSocket.OPEN &&
@@ -2620,11 +2595,14 @@ export default function App() {
           wsRef.current.send(serialized);
           return true;
         } catch (err) {
-          console.warn('Failed to send over active WebSocket, queueing for reconnect:', err);
+          console.warn(
+            'Failed to send over active Gemini Live WebSocket:',
+            sanitizeGeminiSecret(err)
+          );
         }
       }
 
-      if (getBackendConfigError() || liveNonRetryableErrorRef.current) {
+      if (!getGeminiApiKeyStatus().configured || liveNonRetryableErrorRef.current) {
         return false;
       }
 
@@ -2639,13 +2617,16 @@ export default function App() {
     [connectSharedLiveWs]
   );
 
-  // Initialize Audio Player, Backend Health Check, Shared Live WebSocket & Online/Offline listeners
+  // Initialize Audio Player, Direct Gemini Key Check, Shared Live WebSocket & Online/Offline listeners
   useEffect(() => {
     isUnmountedRef.current = false;
     liveAudioPlayerRef.current = new LiveAudioPlayer();
-    void checkBackendHealth();
-    connectSharedLiveWs().catch(() => {
-      // Surfacing via connectionError & wsStatus
+    void checkBackendHealth().then((snap) => {
+      if (!isUnmountedRef.current && snap.geminiConfigured) {
+        connectSharedLiveWs().catch(() => {
+          // Surfacing via connectionError & wsStatus
+        });
+      }
     });
 
     const handleBeforeInstall = (e: any) => {
@@ -2656,9 +2637,12 @@ export default function App() {
     const handleOnline = () => {
       reconnectAttemptRef.current = 0;
       liveNonRetryableErrorRef.current = null;
-      void checkBackendHealth();
-      connectSharedLiveWs(true).catch(() => {
-        // Surfacing via connectionError
+      void checkBackendHealth().then((snap) => {
+        if (!isUnmountedRef.current && snap.geminiConfigured) {
+          connectSharedLiveWs(true).catch(() => {
+            // Surfacing via connectionError
+          });
+        }
       });
     };
 
@@ -2675,26 +2659,57 @@ export default function App() {
       setLatestTranscript(offlineMsg);
     };
 
-    const handleBackendUrlUpdated = () => {
+    const handleGeminiKeyUpdated = () => {
       liveNonRetryableErrorRef.current = null;
       reconnectAttemptRef.current = 0;
-      void checkBackendHealth();
-      connectSharedLiveWs(true).catch(() => {
-        // Handled via connectionError
+      resumptionHandleRef.current = undefined;
+      liveModelFallbackIdxRef.current = 0;
+      if (!getGeminiApiKeyStatus().configured) {
+        // Key was deleted: close any open Live session cleanly and stop voice capture
+        if (reconnectTimerRef.current) {
+          clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = null;
+        }
+        clearWsConnectionTimers();
+        if (wsRef.current) {
+          try {
+            wsRef.current.onclose = null;
+            wsRef.current.onerror = null;
+            wsRef.current.close(1000, 'API key removed');
+          } catch {
+            // ignore
+          }
+          wsRef.current = null;
+        }
+        isSessionReadyRef.current = false;
+        if (isLiveActiveRef.current) {
+          stopVoiceCapture(true);
+        }
+        setWsStatus('disconnected');
+        setConnectionError(null);
+        void checkBackendHealth();
+        return;
+      }
+      void checkBackendHealth().then((snap) => {
+        if (!isUnmountedRef.current && snap.geminiConfigured) {
+          connectSharedLiveWs(true).catch(() => {
+            // Handled via connectionError
+          });
+        }
       });
     };
 
     window.addEventListener('beforeinstallprompt', handleBeforeInstall);
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
-    window.addEventListener('zoni:backend-url-updated', handleBackendUrlUpdated);
+    window.addEventListener('zoni:gemini-key-updated', handleGeminiKeyUpdated);
 
     return () => {
       isUnmountedRef.current = true;
       window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
-      window.removeEventListener('zoni:backend-url-updated', handleBackendUrlUpdated);
+      window.removeEventListener('zoni:gemini-key-updated', handleGeminiKeyUpdated);
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
       }
@@ -2824,7 +2839,7 @@ export default function App() {
     pauseNativeWakeWordForVoice();
 
     try {
-      const configError = getBackendConfigError();
+      const configError = getGeminiConfigError(undefined, activeLanguageRef.current);
       if (configError) {
         setAssistantState('error');
         setConnectionError(configError);
@@ -2837,18 +2852,18 @@ export default function App() {
       setConnectionError(null);
       setLatestTranscript(
         activeLanguageRef.current === 'bn-BD'
-          ? `Gemini Live সার্ভারের সাথে সংযোগ করা হচ্ছে ${selectedAffectionNameRef.current}...`
-          : `Connecting to Gemini Live server, ${selectedAffectionNameRef.current}...`
+          ? `Google Gemini Live-এর সাথে সরাসরি সংযোগ করা হচ্ছে ${selectedAffectionNameRef.current}...`
+          : `Connecting directly to Google Gemini Live, ${selectedAffectionNameRef.current}...`
       );
       getAudioContext();
 
-      // 1. Await real server 'connected' handshake BEFORE activating mic or showing LISTENING
+      // 1. Await real Google Gemini Live setupComplete handshake BEFORE activating mic or showing LISTENING
       try {
         await connectSharedLiveWs(wsStatusRef.current === 'error');
       } catch (wsErr: any) {
         const wsMsg =
           wsErr?.message ||
-          'Could not establish Gemini Live WebSocket session. Verify backend health and server GEMINI_API_KEY.';
+          'Could not establish direct Google Gemini Live session. Verify your Gemini API key in Setup or Settings.';
         setAssistantState('error');
         setConnectionError(wsMsg);
         setLatestTranscript(wsMsg);
@@ -2910,7 +2925,7 @@ export default function App() {
           const channelData = e.inputBuffer.getChannelData(0);
           const base64Audio = pcm16ToBase64(channelData);
           try {
-            wsRef.current.send(JSON.stringify({ audio: base64Audio }));
+            wsRef.current.send(JSON.stringify(buildDirectLiveAudioMessage(base64Audio)));
           } catch {
             stopVoiceCapture(true);
             setAssistantState('error');
@@ -3359,8 +3374,8 @@ export default function App() {
         return;
       }
 
-      // Check backend URL configuration before sending remote chat requests
-      const configError = getBackendConfigError();
+      // Check user-owned Gemini API key before sending remote Gemini requests
+      const configError = getGeminiConfigError(undefined, activeLanguage);
       if (configError) {
         setConnectionError(configError);
         setLatestTranscript(configError);
@@ -3449,12 +3464,13 @@ export default function App() {
     ]
   );
 
-  // Replay speech audio from transcript (uses active Live WS or /api/tts fallback)
+  // Replay speech audio from transcript (uses active Direct Live WS or Direct Gemini TTS)
   const handleReplayAudio = async (text: string) => {
     if (vitals.soundFxEnabled) playProceduralSfx('click');
     stopAllSpeechPlayback();
 
-    const configError = getBackendConfigError();
+    const apiKey = getGeminiApiKeyForRequest();
+    const configError = !apiKey ? getGeminiConfigError(undefined, activeLanguage) : null;
     if (configError) {
       setConnectionError(configError);
       setLatestTranscript(configError);
@@ -3475,30 +3491,22 @@ export default function App() {
       return;
     }
 
-    // Fallback to HTTP /api/tts when Live WS is offline
+    // Direct Gemini TTS fallback when Live WS is offline
     setAssistantState('speaking');
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/tts`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text,
-          voice: vitals.selectedVoice,
-          lang: activeLanguage,
-        }),
+      const audioBase64 = await synthesizeDirectGeminiTts({
+        apiKey,
+        text,
+        voice: vitals.selectedVoice,
+        lang: activeLanguage,
       });
-      const data = await res.json().catch(() => ({}));
-      const audioBase64 = data?.audio || data?.audioBase64;
-      if (!res.ok || !audioBase64) {
-        throw new Error(data?.error || `Audio replay unavailable (HTTP ${res.status})`);
-      }
       liveAudioPlayerRef.current?.playPcmChunk(audioBase64, 24000);
       setTimeout(() => {
         setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
       }, 1200);
     } catch (err: any) {
       setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
-      setConnectionError(err?.message || 'Unable to replay voice audio.');
+      setConnectionError(sanitizeGeminiSecret(err, apiKey) || 'Unable to replay voice audio.');
     }
   };
 
@@ -3562,9 +3570,12 @@ export default function App() {
 
   const handleManualReconnectLive = useCallback(() => {
     setConnectionError(null);
-    void checkBackendHealth();
-    connectSharedLiveWs(true).catch(() => {
-      // Surfacing via connectionError
+    void checkBackendHealth().then((snap) => {
+      if (!isUnmountedRef.current && snap.geminiConfigured) {
+        connectSharedLiveWs(true).catch(() => {
+          // Surfacing via connectionError
+        });
+      }
     });
   }, [checkBackendHealth, connectSharedLiveWs]);
 
@@ -4018,6 +4029,7 @@ export default function App() {
             setIsSettingsModalOpen(false);
             setIsPermissionsModalOpen(true);
           }}
+          onGeminiKeyChanged={handleManualReconnectLive}
         />
       </ErrorBoundary>
 

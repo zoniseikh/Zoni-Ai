@@ -52,7 +52,6 @@ import com.zoni.jarvis.assistant.bridge.ZoniWebAppInterface
 import com.zoni.jarvis.assistant.calling.SimCallManager
 import com.zoni.jarvis.assistant.calling.ZoniInCallService
 import com.zoni.jarvis.assistant.data.SecureKeyManager
-import com.zoni.jarvis.assistant.data.ZoniUserSettings
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
 import com.zoni.jarvis.assistant.service.ScreenCaptureService
 import com.zoni.jarvis.assistant.service.ZoniForegroundService
@@ -419,18 +418,11 @@ class MainActivity : ComponentActivity() {
 
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
-                                val savedBackend = keyManager.getBackendUrl().trim()
-                                val hasValidBackend = ZoniUserSettings.isValidProductionBackendUrl(savedBackend)
-                                val quotedBackendUrl = JSONObject.quote(if (hasValidBackend) savedBackend else ZoniUserSettings.DEFAULT_BACKEND_URL)
                                 view?.evaluateJavascript(
                                     "(function(){ " +
                                         "window.__ZONI_ANDROID_NATIVE__ = true; " +
-                                        "var cur = (localStorage.getItem('zoni_backend_url') || '').trim(); " +
-                                        "var stale = !cur || cur.indexOf('ais-pre-') !== -1 || cur.indexOf('appassets.androidplatform.net') !== -1 || cur.indexOf('://localhost') !== -1 || cur.indexOf('://127.0.0.1') !== -1; " +
-                                        "if (stale && $quotedBackendUrl) { " +
-                                        "localStorage.setItem('zoni_backend_url', $quotedBackendUrl); " +
-                                        "if (cur !== $quotedBackendUrl) { window.dispatchEvent(new CustomEvent('zoni:backend-url-updated')); } " +
-                                        "} })();",
+                                        "try { localStorage.removeItem('zoni_backend_url'); localStorage.removeItem('zoni_byok_browser_gemini_api_key'); } catch(e) {} " +
+                                        "})();",
                                     null
                                 )
                                 // Push fresh native wake-word & call status on initial load
@@ -559,7 +551,8 @@ class MainActivity : ComponentActivity() {
                     onUpdateAffectionName = { viewModel.updateAffectionName(it) },
                     onSelectMode = { viewModel.selectMode(it) },
                     onSelectVoice = { viewModel.selectVoice(it) },
-                    onUpdateBackendUrl = { viewModel.updateBackendUrl(it) }
+                    onSaveGeminiApiKey = { viewModel.saveGeminiApiKey(it) },
+                    onDeleteGeminiApiKey = { viewModel.deleteGeminiApiKey() }
                 )
             }
 

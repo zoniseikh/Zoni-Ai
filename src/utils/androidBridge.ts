@@ -86,8 +86,10 @@ export interface NativeAndroidBridge {
   getPermissionsStatusJson?: () => string;
   requestNativePermissions?: () => boolean;
   getDeviceInfoJson?: () => string;
-  getBackendUrl?: () => string;
-  setBackendUrl?: (url: string) => boolean;
+  saveGeminiApiKey?: (apiKey: string) => boolean;
+  deleteGeminiApiKey?: () => boolean;
+  getGeminiApiKeyStatusJson?: () => string;
+  getGeminiApiKeyForRequest?: () => string;
   openOnboardingWizard?: () => boolean;
 }
 
@@ -1023,3 +1025,64 @@ export function requestNativeCallControlRole(): boolean {
     return false;
   }
 }
+
+// --- Pure Gemini BYOK Keystore Bridge Helpers ---
+
+export interface NativeGeminiApiKeyStatus {
+  configured: boolean;
+  maskedPreview: string;
+  keystoreBacked: boolean;
+  storageKind?: string;
+}
+
+export function getNativeGeminiApiKeyStatus(): NativeGeminiApiKeyStatus | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getGeminiApiKeyStatusJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.getGeminiApiKeyStatusJson());
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      configured: Boolean(parsed.configured),
+      maskedPreview: typeof parsed.maskedPreview === 'string' ? parsed.maskedPreview : '',
+      keystoreBacked: parsed.keystoreBacked !== false,
+      storageKind: typeof parsed.storageKind === 'string' ? parsed.storageKind : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function saveNativeGeminiApiKey(apiKey: string): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.saveGeminiApiKey) return false;
+  try {
+    return Boolean(bridge.saveGeminiApiKey(apiKey));
+  } catch {
+    return false;
+  }
+}
+
+export function deleteNativeGeminiApiKey(): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.deleteGeminiApiKey) return false;
+  try {
+    return Boolean(bridge.deleteGeminiApiKey());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Retrieves the user's Gemini API key from Android Keystore strictly for
+ * authorized direct Google Gemini API requests. Never log or display this value.
+ */
+export function getNativeGeminiApiKeyForRequest(): string {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getGeminiApiKeyForRequest) return '';
+  try {
+    return String(bridge.getGeminiApiKeyForRequest() || '').trim();
+  } catch {
+    return '';
+  }
+}
+

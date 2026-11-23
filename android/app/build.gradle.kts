@@ -8,16 +8,6 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
-val defaultBackendUrl = "https://zoni-ai-675435111499.asia-southeast1.run.app"
-val configuredBackendUrl = (
-    providers.environmentVariable("ZONI_BACKEND_URL").orNull?.trim()?.takeIf { it.isNotEmpty() }
-        ?: providers.gradleProperty("ZONI_BACKEND_URL").orNull?.trim()?.takeIf { it.isNotEmpty() }
-        ?: defaultBackendUrl
-    )
-    .trimEnd('/')
-    .replace("\\", "\\\\")
-    .replace("\"", "\\\"")
-
 val releaseKeystoreFile = providers.environmentVariable("ANDROID_KEYSTORE_PATH")
     .orNull
     ?.trim()
@@ -41,8 +31,6 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
-
-        buildConfigField("String", "ZONI_BACKEND_URL", "\"$configuredBackendUrl\"")
     }
 
     signingConfigs {

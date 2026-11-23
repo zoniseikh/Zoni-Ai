@@ -1,27 +1,15 @@
 package com.zoni.jarvis.assistant.data
 
 import android.util.Base64
-import kotlinx.coroutines.CoroutineScope
+import com.zoni.jarvis.assistant.domain.CompanionMode
+import com.zoni.jarvis.assistant.domain.SupportedLanguage
+import com.zoni.jarvis.assistant.domain.VoiceProfile
+import com.zoni.jarvis.assistant.network.LiveServerEvent
+import com.zoni.jarvis.assistant.network.ZoniLiveSessionClient
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import java.io.BufferedInputStream
-import java.io.BufferedOutputStream
-import java.io.InputStream
-import java.io.OutputStream
 import java.net.HttpURLConnection
-import java.net.Socket
-import java.net.URI
 import java.net.URL
-import java.net.URLEncoder
-import java.security.SecureRandom
-import javax.net.ssl.SSLSocketFactory
-import kotlin.math.min
-import kotlin.math.pow
 
 sealed class GeminiResult {
     data class Success(val text: String) : GeminiResult()
@@ -41,62 +29,95 @@ interface LiveSessionListener {
 }
 
 /**
- * Shared Gemini Live WebSocket Session Client for Android.
- * Connects to the backend `/live` WebSocket endpoint so both Live Voice audio
- * and Chat Box text messages share a single active Gemini Live session and context.
- * No Gemini API key is ever stored or used on the Android client.
+ * Pure Gemini BYOK Repository for Android.
+ * Verifies the user's own Gemini API Key directly against Google's official REST API
+ * (`https://generativelanguage.googleapis.com/v1beta/models`) using the `x-goog-api-key`
+ * header and delegates Live audio/text streaming directly to `ZoniLiveSessionClient`.
  */
 class GeminiRepository(
-    private val keyManager: SecureKeyManager,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
+    private val keyManager: SecureKeyManager
 ) {
-    private var socket: Socket? = null
-    private var outputStream: OutputStream? = null
-    private var readerJob: Job? = null
-    private var reconnectJob: Job? = null
-    @Volatile
-    private var isConnected = false
-    @Volatile
-    private var isManuallyClosed = false
-    private var reconnectAttempt = 0
-    private val outgoingQueue = mutableListOf<String>()
     private var listener: LiveSessionListener? = null
+
+    private val liveClient = ZoniLiveSessionClient { event ->
+        when (event) {
+            is LiveServerEvent.Connected -> {
+                listener?.onConnectionStateChanged(
+                    true,
+                    event.resumed,
+                    if (event.resumed) "Gemini Live resumed." else "Gemini Live active."
+                )
+            }
+            is LiveServerEvent.UserTranscript -> {
+                listener?.onUserTranscript(event.text, event.turnId)
+            }
+            is LiveServerEvent.OutputTranscript -> {
+                listener?.onAssistantTextChunk(event.text, event.turnId)
+            }
+            is LiveServerEvent.AudioChunk -> {
+                listener?.onAssistantAudioBase64(event.base64Pcm24k, event.turnId)
+            }
+            is LiveServerEvent.Flashlight -> {
+                listener?.onFlashlightCommand(event.enable)
+            }
+            is LiveServerEvent.TurnComplete -> {
+                listener?.onTurnComplete(event.turnId)
+            }
+            is LiveServerEvent.Interrupted -> {
+                listener?.onInterrupted(event.turnId)
+            }
+            is LiveServerEvent.Error -> {
+                listener?.onError(SecureKeyManager.sanitizeSecret(event.message, keyManager.getApiKey()))
+            }
+            is LiveServerEvent.StatusChanged -> {
+                if (event.status.name != "CONNECTED") {
+                    listener?.onConnectionStateChanged(false, false, event.status.name.lowercase())
+                }
+            }
+        }
+    }
 
     fun setListener(liveListener: LiveSessionListener) {
         this.listener = liveListener
     }
 
-    fun isLiveConnected(): Boolean = isConnected
+    fun isLiveConnected(): Boolean = liveClient.isConnected()
 
     /**
-     * Verifies backend server reachability via `/api/status`.
+     * Verifies the user's Gemini API Key directly against Google's official models endpoint.
      */
-    suspend fun verifyBackendConnection(backendBaseUrl: String): GeminiResult = withContext(Dispatchers.IO) {
-        val cleanBase = backendBaseUrl.trim().trimEnd('/')
-        if (cleanBase.isBlank()) {
-            return@withContext GeminiResult.GenericError("Server URL cannot be empty.")
+    suspend fun verifyGeminiApiKey(rawApiKey: String): GeminiResult = withContext(Dispatchers.IO) {
+        val validation = SecureKeyManager.validateApiKeyFormat(rawApiKey)
+        if (!validation.valid) {
+            return@withContext GeminiResult.GenericError(validation.error ?: "Invalid Gemini API Key format.")
         }
+        val key = validation.normalizedKey
         try {
-            val url = URL("$cleanBase/api/status")
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models?pageSize=20")
             val conn = (url.openConnection() as HttpURLConnection).apply {
-                connectTimeout = 6000
-                readTimeout = 6000
+                connectTimeout = 8000
+                readTimeout = 8000
                 requestMethod = "GET"
+                setRequestProperty("x-goog-api-key", key)
+                setRequestProperty("Accept", "application/json")
             }
             val code = conn.responseCode
-            if (code in 200..299) {
-                GeminiResult.Success("Zoni Live Server verified and online.")
-            } else {
-                GeminiResult.GenericError("Server responded with HTTP $code")
+            conn.disconnect()
+            when {
+                code in 200..299 -> GeminiResult.Success("Gemini API Key verified with Google Gemini.")
+                code == 400 || code == 401 || code == 403 ->
+                    GeminiResult.GenericError("Invalid or unauthorized Gemini API Key (HTTP $code).")
+                code == 429 ->
+                    GeminiResult.GenericError("Gemini API Key quota exceeded or rate limited (HTTP 429).")
+                else ->
+                    GeminiResult.GenericError("Google Gemini responded with HTTP $code.")
             }
         } catch (e: Exception) {
-            GeminiResult.NetworkError("Could not reach server: ${e.localizedMessage ?: "Connection failed"}")
+            val safeMsg = SecureKeyManager.sanitizeSecret(e.localizedMessage ?: "Network error", key)
+            GeminiResult.NetworkError("Could not reach Google Gemini API: $safeMsg")
         }
     }
 
-    /**
-     * Connects or reuses the single shared `/live` WebSocket session.
-     */
     fun connectSharedSession(
         mode: String = "romantic",
         nickname: String = "Boss",
@@ -104,13 +125,19 @@ class GeminiRepository(
         lang: String = "bn-BD",
         forceReconnect: Boolean = false
     ) {
-        if (isConnected && !forceReconnect) return
-        isManuallyClosed = false
-        reconnectJob?.cancel()
-
-        scope.launch {
-            openWebSocketInternal(mode, nickname, voice, lang)
+        val apiKey = keyManager.getApiKey().orEmpty()
+        if (apiKey.isBlank()) {
+            listener?.onError("Gemini API Key is not configured. Add your key in Setup or Settings.")
+            return
         }
+        liveClient.connect(
+            apiKey = apiKey,
+            mode = CompanionMode.fromId(mode),
+            affectionName = nickname,
+            voice = VoiceProfile.fromId(voice),
+            language = SupportedLanguage.fromCode(lang),
+            forceReconnect = forceReconnect
+        )
     }
 
     fun connectSharedSession(forceNew: Boolean) {
@@ -119,375 +146,22 @@ class GeminiRepository(
 
     fun disconnect() = disconnectSession()
 
-    /**
-     * Sends a typed Chat Box message over the shared Gemini Live WebSocket session.
-     */
-    fun sendChatBoxMessage(text: String, clientMsgId: String = "msg-${System.currentTimeMillis()}") {
-        val trimmed = text.trim()
-        if (trimmed.isEmpty()) return
-
-        val json = JSONObject().apply {
-            put("type", "client_text")
-            put("text", trimmed.take(4000))
-            put("clientMsgId", clientMsgId)
-        }
-        sendJsonPayload(json.toString())
+    fun disconnectSession() {
+        liveClient.disconnect()
     }
 
-    /**
-     * Streams a 16kHz PCM audio chunk (Base64) over the shared Gemini Live WebSocket session.
-     */
+    fun sendChatBoxMessage(text: String, clientMsgId: String = "msg-${System.currentTimeMillis()}") {
+        liveClient.sendClientText(text, clientMsgId)
+    }
+
     fun sendRealtimeAudioChunk(pcm16Bytes: ByteArray, length: Int) {
-        if (!isConnected || length <= 0) return
+        if (!liveClient.isConnected() || length <= 0) return
         val slice = if (length == pcm16Bytes.size) pcm16Bytes else pcm16Bytes.copyOf(length)
         val base64Audio = Base64.encodeToString(slice, Base64.NO_WRAP)
-        val json = JSONObject().apply {
-            put("audio", base64Audio)
-        }
-        sendJsonPayload(json.toString(), queueIfDisconnected = false)
+        liveClient.sendAudioChunk(base64Audio)
     }
 
-    /**
-     * Sends an interrupt signal over the shared Gemini Live WebSocket session.
-     */
     fun sendInterrupt() {
-        val json = JSONObject().apply {
-            put("type", "interrupt")
-        }
-        sendJsonPayload(json.toString(), queueIfDisconnected = false)
-    }
-
-    private fun sendJsonPayload(payload: String, queueIfDisconnected: Boolean = true) {
-        scope.launch {
-            val out = outputStream
-            if (isConnected && out != null) {
-                try {
-                    writeWebSocketTextFrame(out, payload)
-                    return@launch
-                } catch (e: Exception) {
-                    isConnected = false
-                }
-            }
-            if (queueIfDisconnected) {
-                synchronized(outgoingQueue) {
-                    if (outgoingQueue.size < 30) {
-                        outgoingQueue.add(payload)
-                    }
-                }
-                connectSharedSession()
-            }
-        }
-    }
-
-    fun disconnectSession() {
-        isManuallyClosed = true
-        isConnected = false
-        reconnectJob?.cancel()
-        readerJob?.cancel()
-        try {
-            socket?.close()
-        } catch (_: Exception) {}
-        socket = null
-        outputStream = null
-    }
-
-    private suspend fun openWebSocketInternal(
-        mode: String,
-        nickname: String,
-        voice: String,
-        lang: String
-    ) {
-        try {
-            listener?.onConnectionStateChanged(
-                false,
-                false,
-                if (reconnectAttempt > 0) "reconnecting" else "connecting"
-            )
-
-            val base = keyManager.getBackendUrl()
-            val wsBase = when {
-                base.startsWith("https://") -> "wss://" + base.removePrefix("https://")
-                base.startsWith("http://") -> "ws://" + base.removePrefix("http://")
-                base.startsWith("wss://") || base.startsWith("ws://") -> base
-                else -> "ws://$base"
-            }
-
-            val encodedName = URLEncoder.encode(nickname, "UTF-8")
-            val handle = keyManager.getResumptionHandle()
-            val handleParam = if (!handle.isNullOrBlank()) "&handle=${URLEncoder.encode(handle, "UTF-8")}" else ""
-            val fullUri = URI("$wsBase/live?mode=$mode&nickname=$encodedName&selectedAffectionName=$encodedName&voice=$voice&lang=$lang$handleParam")
-
-            val isSecure = fullUri.scheme.equals("wss", ignoreCase = true)
-            val host = fullUri.host ?: "10.0.2.2"
-            val port = if (fullUri.port != -1) fullUri.port else if (isSecure) 443 else 80
-            val pathAndQuery = (fullUri.rawPath.ifEmpty { "/live" }) +
-                (if (fullUri.rawQuery != null) "?${fullUri.rawQuery}" else "")
-
-            val rawSocket = if (isSecure) {
-                SSLSocketFactory.getDefault().createSocket(host, port)
-            } else {
-                Socket(host, port)
-            }
-            rawSocket.keepAlive = true
-            socket = rawSocket
-
-            val input = BufferedInputStream(rawSocket.getInputStream())
-            val output = BufferedOutputStream(rawSocket.getOutputStream())
-            outputStream = output
-
-            // Perform RFC 6455 WebSocket Handshake
-            val keyBytes = ByteArray(16)
-            SecureRandom().nextBytes(keyBytes)
-            val secKey = Base64.encodeToString(keyBytes, Base64.NO_WRAP)
-
-            val requestHeader = buildString {
-                append("GET $pathAndQuery HTTP/1.1\r\n")
-                append("Host: $host:$port\r\n")
-                append("Upgrade: websocket\r\n")
-                append("Connection: Upgrade\r\n")
-                append("Sec-WebSocket-Key: $secKey\r\n")
-                append("Sec-WebSocket-Version: 13\r\n")
-                append("\r\n")
-            }
-            output.write(requestHeader.toByteArray(Charsets.UTF_8))
-            output.flush()
-
-            val statusLine = readHttpLine(input)
-            if (!statusLine.contains("101")) {
-                throw IllegalStateException("WebSocket handshake failed: $statusLine")
-            }
-            while (true) {
-                val line = readHttpLine(input)
-                if (line.isEmpty()) break
-            }
-
-            isConnected = true
-            reconnectAttempt = 0
-
-            readerJob = scope.launch {
-                readWebSocketLoop(input)
-            }
-        } catch (e: Exception) {
-            isConnected = false
-            listener?.onConnectionStateChanged(false, false, "error")
-            listener?.onError("Live WebSocket connection error: ${e.localizedMessage ?: "Disconnected"}")
-            scheduleReconnect(mode, nickname, voice, lang)
-        }
-    }
-
-    private suspend fun readWebSocketLoop(input: InputStream) {
-        try {
-            while (scope.isActive && isConnected) {
-                val b0 = input.read()
-                if (b0 == -1) break
-                val opcode = b0 and 0x0F
-                val b1 = input.read()
-                if (b1 == -1) break
-
-                val isMasked = (b1 and 0x80) != 0
-                var payloadLen = (b1 and 0x7F).toLong()
-                if (payloadLen == 126L) {
-                    val hi = input.read()
-                    val lo = input.read()
-                    payloadLen = ((hi shl 8) or lo).toLong()
-                } else if (payloadLen == 127L) {
-                    var len = 0L
-                    for (i in 0 until 8) {
-                        len = (len shl 8) or (input.read().toLong() and 0xFF)
-                    }
-                    payloadLen = len
-                }
-
-                val maskKey = ByteArray(4)
-                if (isMasked) {
-                    readFully(input, maskKey)
-                }
-
-                val payload = ByteArray(payloadLen.toInt())
-                readFully(input, payload)
-                if (isMasked) {
-                    for (i in payload.indices) {
-                        payload[i] = (payload[i].toInt() xor maskKey[i % 4].toInt()).toByte()
-                    }
-                }
-
-                when (opcode) {
-                    0x1 -> { // Text frame
-                        val text = String(payload, Charsets.UTF_8)
-                        handleIncomingJson(text)
-                    }
-                    0x8 -> { // Close frame
-                        break
-                    }
-                    0x9 -> { // Ping -> send Pong
-                        outputStream?.let { writeWebSocketControlFrame(it, 0xA, payload) }
-                    }
-                }
-            }
-        } catch (_: Exception) {
-            // Connection dropped
-        } finally {
-            isConnected = false
-            if (!isManuallyClosed) {
-                listener?.onConnectionStateChanged(false, false, "reconnecting")
-                scheduleReconnect("romantic", "Boss", "Kore", "bn-BD")
-            } else {
-                listener?.onConnectionStateChanged(false, false, "disconnected")
-            }
-        }
-    }
-
-    private fun handleIncomingJson(rawText: String) {
-        try {
-            val msg = JSONObject(rawText)
-            val type = msg.optString("type")
-            val turnId = msg.optInt("turnId", 1)
-
-            when (type) {
-                "connected" -> {
-                    val resumed = msg.optBoolean("resumed", false)
-                    listener?.onConnectionStateChanged(true, resumed, if (resumed) "Live সেশন পুনরায় সংযুক্ত হয়েছে।" else "Zoni Live সেশন সক্রিয়।")
-                    flushQueuedMessages()
-                }
-                "session_resumption" -> {
-                    val newHandle = msg.optString("newHandle", "")
-                    if (newHandle.isNotBlank()) {
-                        keyManager.saveResumptionHandle(newHandle)
-                    }
-                }
-                "user_transcript" -> {
-                    val text = msg.optString("text", "")
-                    if (text.isNotBlank()) {
-                        listener?.onUserTranscript(text, turnId)
-                    }
-                }
-                "output_transcript", "text" -> {
-                    val text = msg.optString("text", "")
-                    if (text.isNotBlank()) {
-                        listener?.onAssistantTextChunk(text, turnId)
-                    }
-                }
-                "audio" -> {
-                    val audio = msg.optString("audio", "")
-                    if (audio.isNotBlank()) {
-                        listener?.onAssistantAudioBase64(audio, turnId)
-                    }
-                }
-                "flashlight" -> {
-                    val enable = msg.optBoolean("enable", false)
-                    listener?.onFlashlightCommand(enable)
-                }
-                "turnComplete" -> {
-                    listener?.onTurnComplete(turnId)
-                }
-                "interrupted" -> {
-                    listener?.onInterrupted(turnId)
-                }
-                "error", "live_init_failed" -> {
-                    listener?.onError(msg.optString("message", "Live session error"))
-                }
-            }
-        } catch (_: Exception) {}
-    }
-
-    private fun flushQueuedMessages() {
-        scope.launch {
-            val out = outputStream ?: return@launch
-            val toSend = mutableListOf<String>()
-            synchronized(outgoingQueue) {
-                toSend.addAll(outgoingQueue)
-                outgoingQueue.clear()
-            }
-            for (item in toSend) {
-                try {
-                    writeWebSocketTextFrame(out, item)
-                } catch (_: Exception) {
-                    break
-                }
-            }
-        }
-    }
-
-    private fun scheduleReconnect(mode: String, nickname: String, voice: String, lang: String) {
-        if (isManuallyClosed) return
-        reconnectJob?.cancel()
-        val delayMs = min(15000L, (1500.0 * 1.6.pow(reconnectAttempt.toDouble())).toLong())
-        reconnectAttempt += 1
-        reconnectJob = scope.launch {
-            delay(delayMs)
-            if (!isManuallyClosed && !isConnected) {
-                openWebSocketInternal(mode, nickname, voice, lang)
-            }
-        }
-    }
-
-    @Synchronized
-    private fun writeWebSocketTextFrame(out: OutputStream, text: String) {
-        val payload = text.toByteArray(Charsets.UTF_8)
-        writeWebSocketFrame(out, 0x1, payload)
-    }
-
-    @Synchronized
-    private fun writeWebSocketControlFrame(out: OutputStream, opcode: Int, payload: ByteArray) {
-        writeWebSocketFrame(out, opcode, payload)
-    }
-
-    @Synchronized
-    private fun writeWebSocketFrame(out: OutputStream, opcode: Int, payload: ByteArray) {
-        val finAndOpcode = 0x80 or (opcode and 0x0F)
-        out.write(finAndOpcode)
-
-        val maskKey = ByteArray(4)
-        SecureRandom().nextBytes(maskKey)
-
-        val len = payload.size
-        when {
-            len <= 125 -> {
-                out.write(0x80 or len)
-            }
-            len <= 65535 -> {
-                out.write(0x80 or 126)
-                out.write((len shr 8) and 0xFF)
-                out.write(len and 0xFF)
-            }
-            else -> {
-                out.write(0x80 or 127)
-                val longLen = len.toLong()
-                for (i in 7 downTo 0) {
-                    out.write(((longLen shr (i * 8)) and 0xFF).toInt())
-                }
-            }
-        }
-
-        out.write(maskKey)
-        val masked = ByteArray(len)
-        for (i in 0 until len) {
-            masked[i] = (payload[i].toInt() xor maskKey[i % 4].toInt()).toByte()
-        }
-        out.write(masked)
-        out.flush()
-    }
-
-    private fun readHttpLine(input: InputStream): String {
-        val sb = StringBuilder()
-        while (true) {
-            val ch = input.read()
-            if (ch == -1) break
-            if (ch == '\r'.code) {
-                val next = input.read()
-                if (next == '\n'.code) break
-            }
-            sb.append(ch.toChar())
-        }
-        return sb.toString()
-    }
-
-    private fun readFully(input: InputStream, buffer: ByteArray) {
-        var offset = 0
-        while (offset < buffer.size) {
-            val read = input.read(buffer, offset, buffer.size - offset)
-            if (read == -1) throw IllegalStateException("Unexpected EOF in WebSocket stream")
-            offset += read
-        }
+        liveClient.sendInterrupt()
     }
 }

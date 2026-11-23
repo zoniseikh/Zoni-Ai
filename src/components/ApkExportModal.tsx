@@ -49,7 +49,12 @@ import {
   loadAutoReplyConfig,
   saveAutoReplyConfig,
 } from '../utils/autoReplyRules';
-import { getApiBaseUrl, getBackendConfigError } from '../utils/apiConfig';
+import { getGeminiApiKeyForRequest, getGeminiConfigError } from '../utils/apiConfig';
+import {
+  analyzeScreenDirectGemini,
+  classifyDirectGeminiError,
+  generateNotificationSmartRepliesDirectGemini,
+} from '../utils/geminiDirectClient';
 import { playProceduralSfx } from '../utils/audio';
 
 interface ApkExportModalProps {
@@ -150,9 +155,10 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
 
   const handleAnalyzeScreen = async () => {
     if (soundFxEnabled) playProceduralSfx('click');
-    const configErr = getBackendConfigError();
-    if (configErr) {
-      setScreenAnalysis(configErr);
+    const configErr = getGeminiConfigError(undefined, 'bn-BD');
+    const apiKey = getGeminiApiKeyForRequest();
+    if (configErr || !apiKey) {
+      setScreenAnalysis(configErr || 'Enter your own Gemini API key in Setup or Settings first.');
       return;
     }
     setIsAnalyzingScreen(true);
@@ -162,24 +168,17 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
       const visibleText =
         snap.visibleText ||
         (typeof document !== 'undefined' ? document.body?.innerText?.slice(0, 2000) || '' : '');
-      const res = await fetch(`${getApiBaseUrl()}/api/screen/analyze`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          imageBase64: snap.imageBase64,
-          visibleText,
-          affectionName: currentAffection,
-          lang: 'bn-BD',
-        }),
+      const explanation = await analyzeScreenDirectGemini({
+        apiKey,
+        imageBase64: snap.imageBase64,
+        visibleText,
+        affectionName: currentAffection,
+        lang: 'bn-BD',
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setScreenAnalysis(data.error || 'Could not analyze screen.');
-      } else {
-        setScreenAnalysis(data.explanation || 'Screen analyzed.');
-      }
-    } catch {
-      setScreenAnalysis('Network error while analyzing screen.');
+      setScreenAnalysis(explanation || 'Screen analyzed.');
+    } catch (err) {
+      const classified = classifyDirectGeminiError(err, '', 'bn-BD', apiKey);
+      setScreenAnalysis(classified.message || 'Could not analyze screen.');
     } finally {
       setIsAnalyzingScreen(false);
     }
@@ -209,36 +208,30 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk`;
 
   const handleGenerateSmartReply = async (item: NativeNotificationItem) => {
     if (soundFxEnabled) playProceduralSfx('click');
-    const configErr = getBackendConfigError();
-    if (configErr) {
-      setActionFeedback(configErr);
+    const configErr = getGeminiConfigError(undefined, 'bn-BD');
+    const apiKey = getGeminiApiKeyForRequest();
+    if (configErr || !apiKey) {
+      setActionFeedback(configErr || 'Enter your own Gemini API key in Setup or Settings first.');
       return;
     }
     setIsGeneratingReply(true);
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/notifications/smart-reply`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sender: item.title,
-          message: item.text,
-          appName: item.appName,
-          affectionName: currentAffection,
-          lang: 'bn-BD',
-        }),
+      const result = await generateNotificationSmartRepliesDirectGemini({
+        apiKey,
+        sender: item.title,
+        message: item.text,
+        appName: item.appName,
+        affectionName: currentAffection,
+        lang: 'bn-BD',
       });
-      const data = await res.json();
-      if (res.ok) {
-        setSmartReplies({
-          key: item.key,
-          summary: data.summary || '',
-          options: Array.isArray(data.suggestedReplies) ? data.suggestedReplies : [],
-        });
-      } else {
-        setActionFeedback(data.error || 'Failed to generate Smart Replies.');
-      }
-    } catch {
-      setActionFeedback('Network error generating Smart Replies.');
+      setSmartReplies({
+        key: item.key,
+        summary: result.summary,
+        options: result.suggestedReplies,
+      });
+    } catch (err) {
+      const classified = classifyDirectGeminiError(err, '', 'bn-BD', apiKey);
+      setActionFeedback(classified.message || 'Failed to generate Smart Replies.');
     } finally {
       setIsGeneratingReply(false);
     }

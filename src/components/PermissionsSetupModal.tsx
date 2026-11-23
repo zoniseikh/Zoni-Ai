@@ -15,7 +15,10 @@ import {
 } from '../utils/androidBridge';
 import { playProceduralSfx } from '../utils/audio';
 import {
-  Server,
+  KeyRound,
+  Trash2,
+  Eye,
+  EyeOff,
   Mic,
   Bell,
   Camera,
@@ -45,14 +48,15 @@ import {
   Monitor,
 } from 'lucide-react';
 import {
-  getApiBaseUrl,
-  getBackendConfigError,
-  getDisplayBackendUrl,
-  isNativeAndroidWebShell,
-  saveCustomBackendUrl,
-  clearCustomBackendUrl,
+  cleanupLegacyBackendStorage,
+  deleteGeminiApiKey,
+  getGeminiApiKeyForRequest,
+  getGeminiApiKeyStatus,
+  getGeminiConfigError,
+  saveGeminiApiKey,
 } from '../utils/apiConfig';
-import type { BackendHealthSnapshot } from './ZoniSettingsModal';
+import { verifyDirectGeminiApiKey } from '../utils/geminiDirectClient';
+import type { GeminiConnectionSnapshot } from './ZoniSettingsModal';
 
 interface PermissionsSetupModalProps {
   isOpen: boolean;
@@ -65,8 +69,8 @@ interface PermissionsSetupModalProps {
   soundFxEnabled: boolean;
   activeLanguage?: string;
   selectedAffectionName?: string;
-  backendHealth?: BackendHealthSnapshot | null;
-  onRefreshBackendHealth?: () => Promise<BackendHealthSnapshot>;
+  backendHealth?: GeminiConnectionSnapshot | null;
+  onRefreshBackendHealth?: () => Promise<GeminiConnectionSnapshot>;
   onBackendUrlChanged?: () => void;
 }
 
@@ -79,23 +83,20 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
   onLocationInitialized,
   onNotificationInitialized,
   soundFxEnabled,
+  activeLanguage = 'bn-BD',
   backendHealth,
   onRefreshBackendHealth,
   onBackendUrlChanged,
 }) => {
   const [activeStep, setActiveStep] = useState<1 | 2 | 3>(1);
 
-  // Step 1: Server-side Gemini & Backend Connection State (NO client-side Gemini API keys)
-  const [backendUrlInput, setBackendUrlInput] = useState<string>(() => {
-    if (typeof window !== 'undefined') {
-      const apiBase = getApiBaseUrl();
-      if (apiBase) return apiBase;
-    }
-    return '';
-  });
-  const [backendUrlError, setBackendUrlError] = useState<string | null>(null);
-  const [isCheckingBackend, setIsCheckingBackend] = useState(false);
-  const [localBackendHealth, setLocalBackendHealth] = useState<BackendHealthSnapshot | null>(
+  // Step 1: Pure Gemini BYOK API Key State (NO mandatory backend URL)
+  const [geminiKeyInput, setGeminiKeyInput] = useState<string>('');
+  const [showDraftKey, setShowDraftKey] = useState<boolean>(false);
+  const [geminiKeyError, setGeminiKeyError] = useState<string | null>(null);
+  const [isVerifyingKey, setIsVerifyingKey] = useState(false);
+  const [keyStatusEpoch, setKeyStatusEpoch] = useState(0);
+  const [localGeminiHealth, setLocalGeminiHealth] = useState<GeminiConnectionSnapshot | null>(
     backendHealth ?? null
   );
 
@@ -217,96 +218,86 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
     };
   }, [isOpen]);
 
-  // Clean up any legacy unused client-side localStorage key and sync backend health when opened
+  // Clean up obsolete legacy backend URL storage on mount
   useEffect(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        localStorage.removeItem('zoni_user_gemini_key');
-      } catch {
-        // ignore
-      }
-    }
+    cleanupLegacyBackendStorage();
   }, []);
 
   useEffect(() => {
     if (backendHealth) {
-      setLocalBackendHealth(backendHealth);
+      setLocalGeminiHealth(backendHealth);
     }
   }, [backendHealth]);
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      setGeminiKeyInput('');
+      setShowDraftKey(false);
+      setGeminiKeyError(null);
+      return;
+    }
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
     };
+    const handleKeyUpdated = () => setKeyStatusEpoch((v) => v + 1);
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('zoni:gemini-key-updated', handleKeyUpdated);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('zoni:gemini-key-updated', handleKeyUpdated);
+    };
   }, [isOpen, onClose]);
 
-  const probeBackendNow = async () => {
-    setIsCheckingBackend(true);
+  const verifyGeminiKeyNow = async (): Promise<GeminiConnectionSnapshot> => {
+    setIsVerifyingKey(true);
     try {
       if (onRefreshBackendHealth) {
         const snapshot = await onRefreshBackendHealth();
-        setLocalBackendHealth(snapshot);
+        setLocalGeminiHealth(snapshot);
         return snapshot;
       }
-      const backendUrl = getDisplayBackendUrl();
-      const configError = getBackendConfigError();
-      if (configError) {
-        const errSnap: BackendHealthSnapshot = {
+      const keyStatus = getGeminiApiKeyStatus();
+      const rawKey = getGeminiApiKeyForRequest();
+      const lang =
+        activeLanguage === 'hi-IN' || activeLanguage === 'en-US' ? activeLanguage : 'bn-BD';
+      if (!keyStatus.configured || !rawKey) {
+        const missingSnap: GeminiConnectionSnapshot = {
           checked: true,
           reachable: false,
           geminiConfigured: false,
-          statusText: 'UNCONFIGURED',
-          configurationError: configError,
-          backendUrl,
+          statusText: 'API KEY REQUIRED',
+          configurationError: getGeminiConfigError(undefined, lang),
+          maskedKeyPreview: '',
+          storageLabel: keyStatus.storageLabel,
         };
-        setLocalBackendHealth(errSnap);
-        return errSnap;
+        setLocalGeminiHealth(missingSnap);
+        return missingSnap;
       }
-      const base = getApiBaseUrl();
-      const res = await fetch(`${base}/api/status`, { cache: 'no-store' });
-      const data = await res.json().catch(() => ({}));
-      const geminiConfigured =
-        typeof data.geminiConfigured === 'boolean'
-          ? data.geminiConfigured
-          : Boolean(data.geminiLiveSupported || data.status === 'online');
-      const snap: BackendHealthSnapshot = {
+      const verify = await verifyDirectGeminiApiKey(rawKey, fetch, lang);
+      const snap: GeminiConnectionSnapshot = {
         checked: true,
-        reachable: res.ok,
-        geminiConfigured,
-        statusText: res.ok
-          ? geminiConfigured
-            ? 'ONLINE (READY)'
-            : 'DEGRADED (KEY MISSING)'
-          : 'OFFLINE',
-        configurationError:
-          data.configurationError || (!res.ok ? `HTTP ${res.status}` : null),
-        backendUrl,
+        reachable: verify.ok,
+        geminiConfigured: verify.ok,
+        statusText: verify.statusText,
+        configurationError: verify.ok ? null : verify.message,
+        maskedKeyPreview: keyStatus.maskedPreview,
+        storageLabel: keyStatus.storageLabel,
+        preferredChatModel: verify.preferredChatModel,
+        preferredLiveModel: verify.preferredLiveModel,
       };
-      setLocalBackendHealth(snap);
-      return snap;
-    } catch (err: any) {
-      const snap: BackendHealthSnapshot = {
-        checked: true,
-        reachable: false,
-        geminiConfigured: false,
-        statusText: 'OFFLINE',
-        configurationError: err?.message || 'Unable to reach ZONI backend server.',
-        backendUrl: getDisplayBackendUrl(),
-      };
-      setLocalBackendHealth(snap);
+      setLocalGeminiHealth(snap);
       return snap;
     } finally {
-      setIsCheckingBackend(false);
+      setIsVerifyingKey(false);
     }
   };
 
   useEffect(() => {
     if (!isOpen) return;
-    setBackendUrlInput(getApiBaseUrl());
-    void probeBackendNow();
+    setKeyStatusEpoch((v) => v + 1);
+    if (getGeminiApiKeyStatus().configured) {
+      void verifyGeminiKeyNow();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
@@ -326,71 +317,67 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
     }, 3500);
   };
 
-  const activeHealth = localBackendHealth ?? backendHealth ?? null;
-  const configError = getBackendConfigError();
-  const isNativeAndroid = isNativeAndroidWebShell();
-  const hasCustomBackendOverride =
-    typeof window !== 'undefined' && Boolean(localStorage.getItem('zoni_backend_url'));
+  void keyStatusEpoch;
+  const keyStatus = getGeminiApiKeyStatus();
+  const activeHealth = localGeminiHealth ?? backendHealth ?? null;
+  const configError = getGeminiConfigError(
+    undefined,
+    activeLanguage === 'hi-IN' || activeLanguage === 'en-US' ? activeLanguage : 'bn-BD'
+  );
 
-  // --- Step 1 Handlers (Server-side Backend & Gemini Health Verification) ---
-  const handleSaveAndVerifyBackend = async () => {
+  // --- Step 1 Handlers (Pure Gemini BYOK API Key Save / Replace / Verify / Delete) ---
+  const handleSaveAndVerifyGeminiKey = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     if (soundFxEnabled) playProceduralSfx('click');
-    setBackendUrlError(null);
-    const trimmed = backendUrlInput.trim();
+    setGeminiKeyError(null);
 
-    if (!trimmed) {
-      if (isNativeAndroid) {
-        setBackendUrlError(
-          'Enter your deployed ZONI backend HTTPS URL (for example https://zoni-ai-675435111499.asia-southeast1.run.app).'
-        );
-        return;
-      }
-      clearCustomBackendUrl();
-      onBackendUrlChanged?.();
-      const snap = await probeBackendNow();
-      showToast(
-        snap.reachable
-          ? 'Using same-origin backend server — connection verified.'
-          : snap.configurationError || 'Could not reach same-origin backend.'
-      );
+    const saved = saveGeminiApiKey(geminiKeyInput);
+    if (!saved.ok) {
+      setGeminiKeyError(saved.error || 'Invalid Gemini API key.');
       return;
     }
 
-    const result = saveCustomBackendUrl(trimmed);
-    if (!result.ok) {
-      setBackendUrlError(result.error || 'Invalid backend URL.');
-      return;
-    }
-
-    setBackendUrlInput(result.normalizedUrl || trimmed);
+    // Never keep the raw key in form state after saving
+    setGeminiKeyInput('');
+    setShowDraftKey(false);
+    setKeyStatusEpoch((v) => v + 1);
     onBackendUrlChanged?.();
-    const snap = await probeBackendNow();
+
+    const snap = await verifyGeminiKeyNow();
     if (snap.reachable && snap.geminiConfigured) {
-      showToast('Backend verified and server-side Gemini AI is online!');
-    } else if (snap.reachable) {
-      showToast('Backend reachable, but server GEMINI_API_KEY still needs configuration.');
+      showToast('Gemini API Key verified! Direct Google Gemini connection is ready.');
     } else {
-      showToast(snap.configurationError || 'Saved URL, but backend health check failed.');
+      showToast(snap.configurationError || 'Key saved, but Google Gemini rejected verification.');
     }
   };
 
-  const handleResetBackendUrl = async () => {
+  const handleDeleteSavedGeminiKey = () => {
     if (soundFxEnabled) playProceduralSfx('click');
-    setBackendUrlError(null);
-    clearCustomBackendUrl();
-    setBackendUrlInput(getApiBaseUrl());
+    setGeminiKeyError(null);
+    deleteGeminiApiKey();
+    setGeminiKeyInput('');
+    setShowDraftKey(false);
+    setKeyStatusEpoch((v) => v + 1);
+    setLocalGeminiHealth({
+      checked: true,
+      reachable: false,
+      geminiConfigured: false,
+      statusText: 'API KEY REQUIRED',
+      configurationError: getGeminiConfigError(),
+      maskedKeyPreview: '',
+      storageLabel: 'Not Configured',
+    });
     onBackendUrlChanged?.();
-    await probeBackendNow();
-    showToast('Reset backend URL override to default.');
+    showToast('Saved Gemini API Key deleted.');
   };
 
-  const handleRecheckBackend = async () => {
+  const handleRecheckGeminiKey = async () => {
     if (soundFxEnabled) playProceduralSfx('click');
-    const snap = await probeBackendNow();
+    const snap = await verifyGeminiKeyNow();
     if (snap.reachable && snap.geminiConfigured) {
-      showToast('ZONI backend & Gemini Live server are healthy!');
+      showToast('Your Gemini API Key is valid and ready!');
     } else {
-      showToast(snap.configurationError || 'Backend check completed with warnings.');
+      showToast(snap.configurationError || 'Gemini API Key verification failed.');
     }
   };
 
@@ -628,7 +615,7 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                 </span>
               </div>
               <p className="text-xs text-pink-300/80 font-hud tracking-wide mt-0.5 truncate">
-                {activeStep === 1 && 'Verify Zoni backend & server-side Gemini link'}
+                {activeStep === 1 && 'Connect directly with your own Gemini API Key'}
                 {activeStep === 2 && 'Let Zoni Ai use your phone'}
                 {activeStep === 3 && 'Keep Zoni Ai alive in the background'}
               </p>
@@ -655,8 +642,8 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                 : 'border-transparent text-slate-400 hover:text-cyan-200'
             }`}
           >
-            <Server className="w-3.5 h-3.5" />
-            <span>1. BACKEND &amp; GEMINI LINK</span>
+            <KeyRound className="w-3.5 h-3.5" />
+            <span>1. GEMINI API KEY</span>
           </button>
           <button
             type="button"
@@ -698,166 +685,186 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
           className="zoni-modal-scroll p-4 sm:p-6 space-y-4"
         >
           {/* ======================================================== */}
-          {/* STEP 1: Server-Side Gemini Auth & Backend Connection */}
+          {/* STEP 1: Pure Gemini BYOK API Key Setup */}
           {/* ======================================================== */}
           {activeStep === 1 && (
-            <div className="space-y-4 animate-in fade-in duration-200">
+            <div data-testid="setup-gemini-key-step" className="space-y-4 animate-in fade-in duration-200">
               <div className="space-y-2">
                 <h4 className="font-sci-fi text-lg sm:text-xl font-bold text-cyan-200 tracking-wide">
-                  Server-Side Gemini &amp; Backend Link
+                  Your Gemini API Key (Direct Connection)
                 </h4>
                 <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
-                  For security, Zoni Ai keeps the Gemini API key strictly on the backend server (
-                  <code className="text-cyan-300 font-mono">GEMINI_API_KEY</code>) and never stores
-                  API keys in browser storage or client APK bundles.
+                  Zoni AI connects directly to Google Gemini using your own API key. No backend
+                  server URL is required. Get a key anytime from{' '}
+                  <code className="text-cyan-300 font-mono">aistudio.google.com/apikey</code>.
                 </p>
               </div>
 
-              {/* Live Backend Health Diagnostic Card */}
+              {/* Direct Gemini Connection Status Card */}
               <div className="p-4 rounded-xl bg-slate-900/70 border border-cyan-500/30 space-y-3">
                 <div className="flex items-center justify-between gap-2 flex-wrap">
                   <div className="flex items-center gap-2">
-                    {activeHealth?.reachable && activeHealth.geminiConfigured ? (
+                    {keyStatus.configured && activeHealth?.geminiConfigured ? (
                       <Wifi className="w-4 h-4 text-emerald-400" />
                     ) : (
-                      <WifiOff className="w-4 h-4 text-rose-400" />
+                      <WifiOff className="w-4 h-4 text-amber-400" />
                     )}
                     <span className="font-hud text-xs font-bold tracking-wider uppercase text-cyan-200">
-                      Live Backend Health Check
+                      Direct Gemini API Status
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={handleRecheckBackend}
-                    disabled={isCheckingBackend}
-                    className="px-2.5 py-1 rounded-lg bg-cyan-950/70 border border-cyan-500/40 hover:bg-cyan-900/60 text-cyan-200 text-[11px] font-hud font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
-                  >
-                    <RefreshCw className={`w-3 h-3 ${isCheckingBackend ? 'animate-spin' : ''}`} />
-                    <span>{isCheckingBackend ? 'Checking...' : 'Re-check Backend'}</span>
-                  </button>
+                  {keyStatus.configured && (
+                    <button
+                      type="button"
+                      onClick={handleRecheckGeminiKey}
+                      disabled={isVerifyingKey}
+                      className="px-2.5 py-1 rounded-lg bg-cyan-950/70 border border-cyan-500/40 hover:bg-cyan-900/60 text-cyan-200 text-[11px] font-hud font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${isVerifyingKey ? 'animate-spin' : ''}`} />
+                      <span>{isVerifyingKey ? 'Verifying...' : 'Verify Key'}</span>
+                    </button>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs font-hud">
                   <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
-                    <span className="text-[10px] text-slate-400 uppercase block">Active Backend</span>
-                    <span className="font-mono text-cyan-200 break-all">
-                      {getDisplayBackendUrl()}
-                    </span>
-                  </div>
-                  <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
-                    <span className="text-[10px] text-slate-400 uppercase block">Server Status</span>
+                    <span className="text-[10px] text-slate-400 uppercase block">Key Status</span>
                     <span
+                      data-testid="setup-gemini-key-status"
                       className={`font-bold uppercase ${
-                        activeHealth?.reachable
-                          ? activeHealth.geminiConfigured
-                            ? 'text-emerald-400'
-                            : 'text-amber-300'
-                          : 'text-rose-400'
+                        keyStatus.configured
+                          ? activeHealth?.checked && !activeHealth.geminiConfigured
+                            ? 'text-rose-400'
+                            : 'text-emerald-400'
+                          : 'text-amber-300'
                       }`}
                     >
-                      {isCheckingBackend
-                        ? 'CHECKING /api/status...'
-                        : activeHealth?.reachable
-                        ? activeHealth.geminiConfigured
-                          ? 'ONLINE (READY)'
-                          : 'DEGRADED (KEY MISSING ON SERVER)'
-                        : configError
-                        ? 'BACKEND URL UNCONFIGURED'
-                        : 'OFFLINE / UNREACHABLE'}
+                      {isVerifyingKey
+                        ? 'VERIFYING WITH GOOGLE...'
+                        : keyStatus.configured
+                        ? activeHealth?.checked
+                          ? activeHealth.statusText
+                          : `SAVED (${keyStatus.maskedPreview})`
+                        : 'API KEY REQUIRED'}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
+                    <span className="text-[10px] text-slate-400 uppercase block">Masked Key</span>
+                    <span data-testid="setup-gemini-key-masked" className="font-mono text-cyan-200">
+                      {keyStatus.configured ? keyStatus.maskedPreview : 'Not saved yet'}
                     </span>
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
                     <span className="text-[10px] text-slate-400 uppercase block">
-                      Server Gemini Key
+                      Key Storage
                     </span>
-                    <span
-                      className={`font-bold flex items-center gap-1.5 ${
-                        activeHealth?.geminiConfigured ? 'text-emerald-400' : 'text-amber-300'
-                      }`}
-                    >
-                      <ShieldCheck className="w-3.5 h-3.5" />
-                      {activeHealth?.geminiConfigured
-                        ? 'CONFIGURED SERVER-SIDE'
-                        : 'NOT CONFIGURED ON SERVER'}
+                    <span className="font-bold flex items-center gap-1.5 text-emerald-300">
+                      <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                      <span className="truncate">{keyStatus.storageLabel}</span>
                     </span>
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
                     <span className="text-[10px] text-slate-400 uppercase block">
-                      Live Voice &amp; Chat Routes
+                      Direct Google Endpoints
                     </span>
                     <span className="font-mono text-cyan-300">
-                      /live (WS) + /api/chat (HTTP)
+                      Gemini Live WSS + REST API
                     </span>
                   </div>
                 </div>
 
                 {(configError || activeHealth?.configurationError) && (
-                  <div className="p-3 rounded-lg bg-rose-950/60 border border-rose-500/40 text-xs text-rose-200 flex items-start gap-2">
-                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div className="p-3 rounded-lg bg-amber-950/50 border border-amber-500/40 text-xs text-amber-200 flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
                     <span>{configError || activeHealth?.configurationError}</span>
                   </div>
                 )}
               </div>
 
-              {/* Backend Server URL Configuration (for Android APK / self-hosted servers) */}
-              <div className="p-4 rounded-xl bg-slate-900/60 border border-cyan-500/25 space-y-2.5">
+              {/* Gemini API Key Entry / Replace / Delete Form */}
+              <form
+                onSubmit={handleSaveAndVerifyGeminiKey}
+                className="p-4 rounded-xl bg-slate-900/60 border border-cyan-500/25 space-y-3"
+              >
                 <div className="flex items-center justify-between gap-2">
                   <label
-                    htmlFor="zoni-backend-url-input"
+                    htmlFor="zoni-gemini-api-key-input"
                     className="font-hud text-xs font-bold uppercase tracking-wider text-cyan-200"
                   >
-                    Backend Server URL {isNativeAndroid ? '(Required for Android APK)' : '(Optional Override)'}
+                    {keyStatus.configured
+                      ? 'Replace Saved Gemini API Key'
+                      : 'Enter Your Gemini API Key'}
                   </label>
-                  {hasCustomBackendOverride && !isNativeAndroid && (
+                  {keyStatus.configured && (
                     <button
                       type="button"
-                      onClick={handleResetBackendUrl}
-                      className="text-[11px] font-hud text-slate-400 hover:text-cyan-300 underline cursor-pointer"
+                      onClick={handleDeleteSavedGeminiKey}
+                      data-testid="setup-delete-gemini-key-btn"
+                      className="text-[11px] font-hud text-rose-300 hover:text-rose-200 flex items-center gap-1 cursor-pointer"
                     >
-                      Use same-origin default
+                      <Trash2 className="w-3 h-3" />
+                      <span>Delete Saved Key</span>
                     </button>
                   )}
                 </div>
 
                 <div className="flex flex-col sm:flex-row gap-2">
-                  <input
-                    id="zoni-backend-url-input"
-                    type="url"
-                    value={backendUrlInput}
-                    onChange={(e) => {
-                      setBackendUrlInput(e.target.value);
-                      setBackendUrlError(null);
-                    }}
-                    onFocus={(e) => {
-                      const target = e.currentTarget;
-                      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                      window.setTimeout(() => {
+                  <div className="relative flex-1">
+                    <input
+                      id="zoni-gemini-api-key-input"
+                      data-testid="setup-gemini-key-input"
+                      type={showDraftKey ? 'text' : 'password'}
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={geminiKeyInput}
+                      onChange={(e) => {
+                        setGeminiKeyInput(e.target.value);
+                        setGeminiKeyError(null);
+                      }}
+                      onFocus={(e) => {
+                        const target = e.currentTarget;
                         target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                      }, 250);
-                    }}
-                    placeholder="https://zoni-ai-675435111499.asia-southeast1.run.app"
-                    className="flex-1 py-2.5 px-3.5 rounded-xl bg-slate-950 border border-cyan-500/40 text-xs sm:text-sm text-cyan-100 font-mono placeholder:text-slate-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50"
-                  />
+                        window.setTimeout(() => {
+                          target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        }, 250);
+                      }}
+                      placeholder="AIzaSy..."
+                      className="w-full py-2.5 pl-3.5 pr-10 rounded-xl bg-slate-950 border border-cyan-500/40 text-xs sm:text-sm text-cyan-100 font-mono placeholder:text-slate-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowDraftKey((prev) => !prev)}
+                      aria-label={showDraftKey ? 'Hide typed key' : 'Show typed key'}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-cyan-300 cursor-pointer"
+                    >
+                      {showDraftKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
                   <button
-                    type="button"
-                    onClick={handleSaveAndVerifyBackend}
-                    disabled={isCheckingBackend}
+                    type="submit"
+                    disabled={isVerifyingKey}
+                    data-testid="setup-save-gemini-key-btn"
                     className="shrink-0 px-4 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-hud text-xs font-bold tracking-wider uppercase transition-all cursor-pointer disabled:opacity-60"
                   >
-                    Save &amp; Verify
+                    {isVerifyingKey
+                      ? 'Verifying...'
+                      : keyStatus.configured
+                      ? 'Replace & Verify'
+                      : 'Save & Verify'}
                   </button>
                 </div>
 
-                {backendUrlError && (
-                  <p className="text-xs text-rose-400 font-hud">{backendUrlError}</p>
+                {geminiKeyError && (
+                  <p data-testid="setup-gemini-key-error" className="text-xs text-rose-400 font-hud">
+                    {geminiKeyError}
+                  </p>
                 )}
 
                 <p className="text-[11px] text-slate-400 font-hud leading-relaxed">
-                  {isNativeAndroid
-                    ? 'The Android APK bundles the UI offline and connects to your deployed ZONI backend server. Configure GEMINI_API_KEY in the backend environment (see BACKEND_DEPLOYMENT.md).'
-                    : 'Leave blank in the web app to use this server directly, or enter a deployed HTTPS backend URL to test against a remote ZONI server.'}
+                  {keyStatus.securityNotice} After saving, your full key is never displayed again
+                  and is never written to chat history or diagnostics.
                 </p>
-              </div>
+              </form>
 
               {/* Action Buttons */}
               <div className="pt-2 flex flex-col sm:flex-row gap-2.5">

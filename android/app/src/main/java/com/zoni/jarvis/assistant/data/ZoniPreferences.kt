@@ -8,9 +8,6 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
-import com.zoni.jarvis.assistant.BuildConfig
 import com.zoni.jarvis.assistant.domain.CompanionMode
 import com.zoni.jarvis.assistant.domain.SupportedLanguage
 import com.zoni.jarvis.assistant.domain.VoiceProfile
@@ -31,25 +28,8 @@ data class ZoniUserSettings(
     val floatingOrbEnabled: Boolean = false,
     val wakeWordEnabled: Boolean = false,
     val backgroundListeningEnabled: Boolean = false,
-    val wakePhrase: String = "Zoni",
-    val backendServerUrl: String = DEFAULT_BACKEND_URL
-) {
-    companion object {
-        const val PRODUCTION_BACKEND_URL = "https://zoni-ai-675435111499.asia-southeast1.run.app"
-        val DEFAULT_BACKEND_URL: String = BuildConfig.ZONI_BACKEND_URL.ifBlank { PRODUCTION_BACKEND_URL }
-
-        fun isValidProductionBackendUrl(raw: String?): Boolean {
-            val clean = raw?.trim()?.trimEnd('/').orEmpty()
-            if (clean.isBlank()) return false
-            if (!clean.startsWith("https://") && !clean.startsWith("http://")) return false
-            val lower = clean.lowercase()
-            if (lower.contains("appassets.androidplatform.net")) return false
-            if (lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://0.0.0.0")) return false
-            if (lower.contains("ais-pre-")) return false
-            return true
-        }
-    }
-}
+    val wakePhrase: String = "Zoni"
+)
 
 class ZoniPreferences(private val context: Context) {
 
@@ -66,28 +46,14 @@ class ZoniPreferences(private val context: Context) {
         val WAKE_WORD_ENABLED = booleanPreferencesKey("zoni_wake_word_enabled")
         val BACKGROUND_LISTENING_ENABLED = booleanPreferencesKey("zoni_background_listening_enabled")
         val WAKE_PHRASE = stringPreferencesKey("zoni_wake_phrase")
-        val BACKEND_URL = stringPreferencesKey("zoni_backend_url")
     }
 
     private val syncPrefs: SharedPreferences by lazy {
         context.getSharedPreferences("zoni_wake_sync_prefs", Context.MODE_PRIVATE)
     }
 
-    private val encryptedPrefs: SharedPreferences by lazy {
-        try {
-            val masterKey = MasterKey.Builder(context)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                context,
-                "secure_zoni_prefs",
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
-        } catch (_: Exception) {
-            context.getSharedPreferences("secure_zoni_prefs_fallback", Context.MODE_PRIVATE)
-        }
+    private val secureKeyManager: SecureKeyManager by lazy {
+        SecureKeyManager(context.applicationContext)
     }
 
     val settingsFlow: Flow<ZoniUserSettings> = context.zoniDataStore.data.map { prefs ->
@@ -103,10 +69,7 @@ class ZoniPreferences(private val context: Context) {
             floatingOrbEnabled = prefs[Keys.FLOATING_ORB] ?: false,
             wakeWordEnabled = prefs[Keys.WAKE_WORD_ENABLED] ?: isWakeWordEnabledSync(),
             backgroundListeningEnabled = prefs[Keys.BACKGROUND_LISTENING_ENABLED] ?: isBackgroundListeningEnabledSync(),
-            wakePhrase = prefs[Keys.WAKE_PHRASE]?.takeIf { it.isNotBlank() } ?: getWakePhraseSync(),
-            backendServerUrl = prefs[Keys.BACKEND_URL]
-                ?.takeIf { ZoniUserSettings.isValidProductionBackendUrl(it) }
-                ?: ZoniUserSettings.DEFAULT_BACKEND_URL
+            wakePhrase = prefs[Keys.WAKE_PHRASE]?.takeIf { it.isNotBlank() } ?: getWakePhraseSync()
         )
     }
 
@@ -183,22 +146,19 @@ class ZoniPreferences(private val context: Context) {
         syncPrefs.edit().putString(SYNC_WAKE_PHRASE, clean).apply()
     }
 
-    suspend fun setBackendServerUrl(url: String) {
-        val clean = url.trim().trimEnd('/')
-        if (ZoniUserSettings.isValidProductionBackendUrl(clean)) {
-            context.zoniDataStore.edit { it[Keys.BACKEND_URL] = clean }
-        }
-    }
+    fun getGeminiApiKey(): String = secureKeyManager.getApiKey().orEmpty()
 
-    fun getGeminiApiKey(): String =
-        encryptedPrefs.getString(KEY_GEMINI_API, "")?.trim().orEmpty()
+    fun saveGeminiApiKey(apiKey: String): Boolean = secureKeyManager.saveApiKey(apiKey)
 
-    fun saveGeminiApiKey(apiKey: String) {
-        encryptedPrefs.edit().putString(KEY_GEMINI_API, apiKey.trim()).apply()
-    }
+    fun deleteGeminiApiKey(): Boolean = secureKeyManager.deleteApiKey()
+
+    fun hasGeminiApiKey(): Boolean = secureKeyManager.hasApiKey()
+
+    fun getMaskedGeminiApiKeyPreview(): String? = secureKeyManager.getMaskedApiKeyPreview()
+
+    fun isKeystoreBacked(): Boolean = secureKeyManager.isUsingAndroidKeystore()
 
     companion object {
-        private const val KEY_GEMINI_API = "zoni_encrypted_gemini_api_key"
         private const val SYNC_WAKE_WORD_ENABLED = "zoni_sync_wake_word_enabled"
         private const val SYNC_BG_LISTENING_ENABLED = "zoni_sync_bg_listening_enabled"
         private const val SYNC_WAKE_PHRASE = "zoni_sync_wake_phrase"
