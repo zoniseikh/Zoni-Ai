@@ -143,11 +143,17 @@ object WakeWordMatcher {
         "zoney" to 0.90f,
         "joni" to 0.86f,
         "jonie" to 0.84f,
-        "jony" to 0.84f,
-        "johny" to 0.78f,
-        "johnny" to 0.76f,
-        "sooni" to 0.74f,
-        "soni" to 0.74f
+        "jony" to 0.84f
+    )
+
+    // Similar-sounding unrelated English/common words that must NEVER trigger Zoni wake word
+    private val REJECTED_SIMILAR_WORDS = setOf(
+        "zone", "zones", "zoom", "zero",
+        "johnny", "johny", "soni", "sooni", "sony",
+        "tony", "pony", "bony", "bonny", "donny",
+        "moni", "mini", "boni", "roni", "sunny",
+        "honey", "money", "funny", "bunny", "phone",
+        "done", "gone", "none", "bone", "cone", "tone", "lone"
     )
 
     private val OPTIONAL_PREFIXES = listOf("hey ", "hi ", "ok ", "okay ", "hello ", "ওহে ", "হেই ", "হ্যালো ", "हे ", "ओए ")
@@ -163,7 +169,8 @@ object WakeWordMatcher {
 
     /**
      * Evaluates a local recognition candidate against the configured wake phrase.
-     * Applies strict prefix/exact matching, confidence thresholds, and duplicate-trigger cooldown.
+     * Applies strict prefix/exact matching, confidence thresholds, false-positive word rejection,
+     * and duplicate-trigger cooldown.
      */
     fun evaluateCandidate(
         rawTranscript: String,
@@ -190,6 +197,15 @@ object WakeWordMatcher {
         }
 
         val configuredNorm = normalizeText(config.wakePhrase).ifBlank { "zoni" }
+        val firstToken = stripped.substringBefore(" ")
+        if (configuredNorm == "zoni" && firstToken in REJECTED_SIMILAR_WORDS) {
+            return WakeWordMatchResult(
+                matched = false,
+                confidence = 0f,
+                rejectedReason = "wake_phrase_not_present"
+            )
+        }
+
         val variants: List<Pair<String, Float>> = if (configuredNorm == "zoni") {
             DEFAULT_ZONI_VARIANTS
         } else {
@@ -228,9 +244,16 @@ object WakeWordMatcher {
                 continue
             }
 
-            // Single-token edit distance <= 1 for short Latin variants ("zon" / "zonni") ONLY if whole utterance is 1 word
+            // Tight single-token edit distance == 1 ONLY against primary wake phrase with same starting letter
             val words = stripped.split(" ")
-            if (words.size == 1 && vNorm.length >= 4 && vNorm.all { it in 'a'..'z' } && stripped.all { it in 'a'..'z' }) {
+            if (words.size == 1 &&
+                vNorm == configuredNorm &&
+                vNorm.length >= 4 &&
+                vNorm.all { it in 'a'..'z' } &&
+                stripped.all { it in 'a'..'z' } &&
+                stripped.firstOrNull() == vNorm.firstOrNull() &&
+                stripped !in REJECTED_SIMILAR_WORDS
+            ) {
                 val dist = levenshtein(stripped, vNorm)
                 if (dist == 1) {
                     val score = min(1f, 0.80f * safeRecConf)

@@ -458,4 +458,75 @@ test('Incoming & Active Call Control: parses strict Bengali, English, and Hindi 
   assert.equal(buildStructuredTaskPlan('আজকে অনেক কল এসেছে').steps.length, 0);
 });
 
+test('Perfect Volume Control: parses exact percentages (Bengali/Hindi/English), clamping, all 5 streams, mute/unmute/max/status', () => {
+  const bnPct = buildStructuredTaskPlan('ভলিউম ৫০ শতাংশ করো');
+  assert.equal(bnPct.steps[0]?.tool, 'volume_control');
+  assert.equal(bnPct.steps[0]?.args.action, 'set');
+  assert.equal(bnPct.steps[0]?.args.percent, 50);
+  assert.equal(bnPct.steps[0]?.args.stream, 'media');
 
+  const enRingPct = buildStructuredTaskPlan('Set ring volume to 80%');
+  assert.equal(enRingPct.steps[0]?.tool, 'volume_control');
+  assert.equal(enRingPct.steps[0]?.args.action, 'set');
+  assert.equal(enRingPct.steps[0]?.args.percent, 80);
+  assert.equal(enRingPct.steps[0]?.args.stream, 'ring');
+
+  const hiAlarmPct = buildStructuredTaskPlan('अलार्म वॉल्यूम ७५% करो');
+  assert.equal(hiAlarmPct.steps[0]?.tool, 'volume_control');
+  assert.equal(hiAlarmPct.steps[0]?.args.action, 'set');
+  assert.equal(hiAlarmPct.steps[0]?.args.percent, 75);
+  assert.equal(hiAlarmPct.steps[0]?.args.stream, 'alarm');
+
+  const clampedOver = buildStructuredTaskPlan('Set media volume to 140%');
+  assert.equal(clampedOver.steps[0]?.tool, 'volume_control');
+  assert.equal(clampedOver.steps[0]?.args.action, 'set');
+  assert.equal(clampedOver.steps[0]?.args.percent, 100);
+
+  const callVolUp = buildStructuredTaskPlan('Increase call volume');
+  assert.equal(callVolUp.steps[0]?.tool, 'volume_control');
+  assert.equal(callVolUp.steps[0]?.args.action, 'up');
+  assert.equal(callVolUp.steps[0]?.args.stream, 'call');
+
+  const notifMute = buildStructuredTaskPlan('Mute notification volume');
+  assert.equal(notifMute.steps[0]?.tool, 'volume_control');
+  assert.equal(notifMute.steps[0]?.args.action, 'mute');
+  assert.equal(notifMute.steps[0]?.args.stream, 'notification');
+
+  const unmutePhone = buildStructuredTaskPlan('Unmute phone');
+  assert.equal(unmutePhone.steps[0]?.tool, 'volume_control');
+  assert.equal(unmutePhone.steps[0]?.args.action, 'unmute');
+
+  const maxVol = buildStructuredTaskPlan('ভলিউম ফুল করো');
+  assert.equal(maxVol.steps[0]?.tool, 'volume_control');
+  assert.equal(maxVol.steps[0]?.args.action, 'max');
+});
+
+test('Advanced App UI Control: parses YouTube Play/Pause/Stop and Facebook/Bengali button clicks cleanly', () => {
+  const bnPause = buildStructuredTaskPlan('ভিডিওটি Pause করো');
+  assert.equal(bnPause.steps[0]?.tool, 'click_youtube_video');
+  assert.equal(bnPause.steps[0]?.args.target, 'pause_video');
+
+  const enPause = buildStructuredTaskPlan('Pause the video');
+  assert.equal(enPause.steps[0]?.tool, 'click_youtube_video');
+  assert.equal(enPause.steps[0]?.args.target, 'pause_video');
+
+  const bnStop = buildStructuredTaskPlan('ভিডিওটি Stop করো');
+  assert.equal(bnStop.steps[0]?.tool, 'click_youtube_video');
+  assert.equal(bnStop.steps[0]?.args.target, 'stop_video');
+
+  const enStop = buildStructuredTaskPlan('Stop the video');
+  assert.equal(enStop.steps[0]?.tool, 'click_youtube_video');
+  assert.equal(enStop.steps[0]?.args.target, 'stop_video');
+
+  const bnResume = buildStructuredTaskPlan('ভিডিও আবার চালাও');
+  assert.equal(bnResume.steps[0]?.tool, 'click_youtube_video');
+  assert.equal(bnResume.steps[0]?.args.target, 'play_video');
+
+  const fbLikeBn = buildStructuredTaskPlan('Facebook-এ Like বাটনে ক্লিক করো');
+  assert.equal(fbLikeBn.steps[0]?.tool, 'accessibility_action');
+  assert.equal(fbLikeBn.steps[0]?.args.command, 'tap:Like');
+
+  const fbCommentEn = buildStructuredTaskPlan('Tap Comment on Facebook');
+  assert.equal(fbCommentEn.steps[0]?.tool, 'accessibility_action');
+  assert.equal(fbCommentEn.steps[0]?.args.command, 'tap:Comment');
+});

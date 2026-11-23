@@ -29,24 +29,40 @@ test('WakeWordMatcher activates on Zoni in English, Bengali, and Hindi', () => {
   assert.equal(heyEn.remainingCommand, 'open whatsapp');
 });
 
-test('WakeWordMatcher strictly rejects unrelated speech (false-activation prevention)', () => {
-  const unrelated = [
+test('WakeWordMatcher strictly rejects unrelated and similar-sounding speech (false-activation prevention)', () => {
+  const unrelatedAndConfusable = [
     'Hello how are you today',
     'Open YouTube please',
     'আজকের আবহাওয়া কেমন আছে',
     'মাকে ফোন করো',
     'Please turn on the flashlight',
     'Receive the call',
+    'johnny',
+    'johny',
+    'soni',
+    'sooni',
+    'zone',
+    'tony',
+    'sony',
+    'pony',
+    'sunny',
+    'honey',
+    'money',
+    'funny',
+    'bonnie',
+    'ronnie',
+    'Hey Johnny open YouTube',
+    'Sony TV price',
   ];
-  for (const sample of unrelated) {
+  for (const sample of unrelatedAndConfusable) {
     const res = evaluateWakeWordCandidate(sample, 0.99);
-    assert.equal(res.matched, false, `Should reject unrelated speech: ${sample}`);
+    assert.equal(res.matched, false, `Should reject unrelated/similar speech: ${sample}`);
     assert.equal(res.rejectedReason, 'wake_phrase_not_present');
   }
 });
 
 test('WakeWordMatcher enforces confidence threshold and duplicate-trigger cooldown', () => {
-  const lowConf = evaluateWakeWordCandidate('johnny', 0.35, DEFAULT_WAKE_WORD_CONFIG, 0, 10000);
+  const lowConf = evaluateWakeWordCandidate('zonie', 0.35, DEFAULT_WAKE_WORD_CONFIG, 0, 10000);
   assert.equal(lowConf.matched, false);
   assert.equal(lowConf.rejectedReason, 'below_confidence_threshold');
 

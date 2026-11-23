@@ -9,6 +9,9 @@ import {
   getReconnectDelayMs,
   shouldAutoReconnectLiveWs,
   shouldUseHttpChatFallback,
+  shouldResetReconnectAttempts,
+  classifyLiveWsCloseCode,
+  HEALTHY_SESSION_RESET_MS,
 } from './liveSessionProtocol';
 import { ChatMessage } from '../types';
 
@@ -89,13 +92,20 @@ test('extractActionTagFromText parses hardware action tags and cleans visible te
   assert.equal(res.action?.target, 'ON');
 });
 
-test('getReconnectDelayMs increases exponentially up to maxMs', () => {
+test('getReconnectDelayMs increases exponentially up to maxMs and supports bounded jitter', () => {
   const d0 = getReconnectDelayMs(0, 1000, 10000);
   const d1 = getReconnectDelayMs(1, 1000, 10000);
   const d10 = getReconnectDelayMs(10, 1000, 10000);
   assert.equal(d0, 1000);
   assert.ok(d1 > d0);
   assert.equal(d10, 10000);
+
+  // Jitter bounds at +/-25% around 1600ms (attempt=1, base=1000, factor=1.6)
+  const lowJitter = getReconnectDelayMs(1, 1000, 10000, 0.25, () => 0);
+  const highJitter = getReconnectDelayMs(1, 1000, 10000, 0.25, () => 1);
+  assert.equal(lowJitter, 1200);
+  assert.equal(highJitter, 2000);
+  assert.ok(getReconnectDelayMs(0, 200, 10000, 0.5, () => 0) >= 250);
 });
 
 test('shouldAutoReconnectLiveWs stops on non-retryable auth/config errors and respects maxAttempts', () => {
@@ -104,6 +114,42 @@ test('shouldAutoReconnectLiveWs stops on non-retryable auth/config errors and re
   assert.equal(shouldAutoReconnectLiveWs('BACKEND_URL_MISSING', undefined, 0), false);
   assert.equal(shouldAutoReconnectLiveWs(undefined, true, 0, 5), true);
   assert.equal(shouldAutoReconnectLiveWs(undefined, true, 5, 5), false);
+});
+
+test('shouldResetReconnectAttempts waits for sustained healthy connection window', () => {
+  assert.equal(shouldResetReconnectAttempts(Number.NaN), false);
+  assert.equal(shouldResetReconnectAttempts(HEALTHY_SESSION_RESET_MS - 1), false);
+  assert.equal(shouldResetReconnectAttempts(HEALTHY_SESSION_RESET_MS), true);
+  assert.equal(shouldResetReconnectAttempts(HEALTHY_SESSION_RESET_MS + 5000), true);
+});
+
+test('classifyLiveWsCloseCode distinguishes normal, auth/config, service restart, and transient drops', () => {
+  const normal = classifyLiveWsCloseCode(1000, 'Client disconnect');
+  assert.equal(normal.retryable, false);
+  assert.equal(normal.category, 'normal');
+
+  const authFail = classifyLiveWsCloseCode(4001, 'Unauthorized');
+  assert.equal(authFail.retryable, false);
+  assert.equal(authFail.shouldClearHandle, true);
+  assert.equal(authFail.category, 'auth_or_config');
+
+  const forbidden = classifyLiveWsCloseCode(4003, 'Policy violation');
+  assert.equal(forbidden.retryable, false);
+  assert.equal(forbidden.shouldClearHandle, true);
+
+  const serviceRestart = classifyLiveWsCloseCode(1012, 'Gemini upstream closed');
+  assert.equal(serviceRestart.retryable, true);
+  assert.equal(serviceRestart.shouldClearHandle, false);
+  assert.equal(serviceRestart.category, 'service_restart');
+
+  const abnormal = classifyLiveWsCloseCode(1006, '');
+  assert.equal(abnormal.retryable, true);
+  assert.equal(abnormal.shouldClearHandle, false);
+  assert.equal(abnormal.category, 'transient_drop');
+
+  const expiredHandle = classifyLiveWsCloseCode(1011, 'Session handle expired');
+  assert.equal(expiredHandle.retryable, true);
+  assert.equal(expiredHandle.shouldClearHandle, true);
 });
 
 test('shouldUseHttpChatFallback falls back unless Live WS is both OPEN and server-handshake ready', () => {

@@ -708,21 +708,72 @@ export function captureNativeScreenSnapshot(): {
   return { imageBase64, visibleText, error };
 }
 
-export function adjustNativeVolume(action: 'up' | 'down' | 'mute' | 'unmute' | 'max' | 'status'): {
+export type VolumeControlAction = 'up' | 'down' | 'set' | 'mute' | 'unmute' | 'max' | 'status';
+export type VolumeStreamName = 'media' | 'ring' | 'alarm' | 'call' | 'notification';
+
+export interface NativeVolumeResult {
   success: boolean;
+  verified?: boolean;
+  action?: string;
+  stream?: VolumeStreamName;
+  streamLabel?: string;
   volumePercent?: number;
+  streamIndex?: number;
+  streamMin?: number;
+  streamMax?: number;
+  isMuted?: boolean;
   message: string;
-} {
+}
+
+export function buildNativeVolumePayload(
+  action: VolumeControlAction,
+  options?: { percent?: number; stream?: VolumeStreamName }
+): string {
+  const hasPercent = typeof options?.percent === 'number' && Number.isFinite(options.percent);
+  const clampedPercent = hasPercent
+    ? Math.max(0, Math.min(100, Math.round(options!.percent!)))
+    : undefined;
+  const stream = options?.stream;
+
+  if (action === 'set' || clampedPercent !== undefined || (stream && stream !== 'media')) {
+    return JSON.stringify({
+      action,
+      ...(clampedPercent !== undefined ? { percent: clampedPercent } : {}),
+      ...(stream ? { stream } : {}),
+    });
+  }
+  return action;
+}
+
+export function adjustNativeVolume(
+  action: VolumeControlAction,
+  options?: { percent?: number; stream?: VolumeStreamName }
+): NativeVolumeResult {
   const bridge = getNativeAndroidBridge();
   if (bridge?.adjustVolumeJson) {
     try {
-      return JSON.parse(bridge.adjustVolumeJson(action));
+      const payload = buildNativeVolumePayload(action, options);
+      const parsed = JSON.parse(bridge.adjustVolumeJson(payload));
+      return {
+        success: Boolean(parsed?.success),
+        verified: typeof parsed?.verified === 'boolean' ? parsed.verified : Boolean(parsed?.success),
+        action: typeof parsed?.action === 'string' ? parsed.action : action,
+        stream: typeof parsed?.stream === 'string' ? (parsed.stream as VolumeStreamName) : options?.stream || 'media',
+        streamLabel: typeof parsed?.streamLabel === 'string' ? parsed.streamLabel : undefined,
+        volumePercent: typeof parsed?.volumePercent === 'number' ? parsed.volumePercent : undefined,
+        streamIndex: typeof parsed?.streamIndex === 'number' ? parsed.streamIndex : undefined,
+        streamMin: typeof parsed?.streamMin === 'number' ? parsed.streamMin : undefined,
+        streamMax: typeof parsed?.streamMax === 'number' ? parsed.streamMax : undefined,
+        isMuted: typeof parsed?.isMuted === 'boolean' ? parsed.isMuted : undefined,
+        message: typeof parsed?.message === 'string' ? parsed.message : 'Volume updated.',
+      };
     } catch {
-      return { success: false, message: 'Failed to parse native volume response.' };
+      return { success: false, verified: false, message: 'Failed to parse native volume response.' };
     }
   }
   return {
     success: false,
+    verified: false,
     message: 'Hardware volume control is available inside the native Android APK.',
   };
 }

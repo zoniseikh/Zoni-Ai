@@ -970,21 +970,44 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
     console.warn('[ZONI-LIVE] Client WebSocket notice:', sanitizeErrorMessage(err));
   });
 
-  // Keep connection alive with periodic ping for Cloud Run & reverse proxies
+  // Keep connection alive with periodic ping + pong liveness check for Cloud Run & reverse proxies
+  let missedPongs = 0;
+  let upstreamClosed = false;
+
+  clientWs.on('pong', () => {
+    missedPongs = 0;
+  });
+
   const pingInterval = setInterval(() => {
-    if (clientWs.readyState === WebSocket.OPEN) {
+    if (clientWs.readyState !== WebSocket.OPEN) return;
+    if (missedPongs >= 2) {
+      console.warn('[ZONI-LIVE] Terminating unresponsive client WebSocket after missed pongs.');
+      try {
+        clientWs.terminate();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    missedPongs += 1;
+    try {
       clientWs.ping();
+    } catch {
+      // ignore
     }
   }, 25000);
 
   clientWs.on('close', () => {
     clearInterval(pingInterval);
     isAlive = false;
+    upstreamClosed = true;
     toolRelay.dispose('client_disconnected');
     pendingClientMessages.length = 0;
-    if (liveSession && typeof liveSession.close === 'function') {
+    const sessionToClose = liveSession;
+    liveSession = null;
+    if (sessionToClose && typeof sessionToClose.close === 'function') {
       try {
-        liveSession.close();
+        sessionToClose.close();
       } catch {
         // ignore
       }
@@ -992,12 +1015,36 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
   });
 
   const handleIncomingClientPayload = (rawStr: string) => {
+    // Handle application-level client keepalive ping immediately (even during handshake)
+    try {
+      const quickPeek = JSON.parse(rawStr);
+      if (quickPeek && typeof quickPeek === 'object' && quickPeek.type === 'ping') {
+        missedPongs = 0;
+        sendToClient({
+          type: 'pong',
+          ts: typeof quickPeek.ts === 'number' ? quickPeek.ts : Date.now(),
+        });
+        return;
+      }
+    } catch {
+      // Fall through to normal validation error handling
+    }
+
     if (liveInitFailed) {
       sendToClient({
         type: 'error',
         code: liveInitErrorCode,
         retryable: liveInitErrorCode !== 'GEMINI_KEY_MISSING' && liveInitErrorCode !== 'GEMINI_KEY_INVALID',
         message: liveInitErrorMsg || 'Gemini Live session is unavailable.',
+      });
+      return;
+    }
+
+    if (upstreamClosed) {
+      sendToClient({
+        type: 'session_closed',
+        retryable: true,
+        reason: 'Upstream Gemini Live session closed; please reconnect.',
       });
       return;
     }
@@ -1081,12 +1128,30 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
 
       // 3. Stream 16kHz PCM microphone audio chunk to shared Gemini Live session
       if (typeof parsed.audio === 'string' && parsed.audio.length > 0) {
-        liveSession.sendRealtimeInput({
-          audio: {
-            data: parsed.audio,
-            mimeType: 'audio/pcm;rate=16000',
-          },
-        });
+        try {
+          liveSession.sendRealtimeInput({
+            audio: {
+              data: parsed.audio,
+              mimeType: 'audio/pcm;rate=16000',
+            },
+          });
+        } catch (audioErr) {
+          console.warn('[ZONI-LIVE] Upstream audio send failed:', sanitizeErrorMessage(audioErr));
+          upstreamClosed = true;
+          liveSession = null;
+          sendToClient({
+            type: 'session_closed',
+            retryable: true,
+            reason: 'Upstream Live audio stream closed; reconnecting.',
+          });
+          if (clientWs.readyState === WebSocket.OPEN) {
+            setTimeout(() => {
+              if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.close(1012, 'Upstream Gemini Live audio stream closed');
+              }
+            }, 40);
+          }
+        }
         return;
       }
 
@@ -1334,13 +1399,45 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
               sendToClient({ type: 'turnComplete', turnId: completedTurn });
             }
           },
-          onclose: () => {
-            sendToClient({ type: 'session_closed' });
+          onclose: (closeEvt?: any) => {
+            const closeCode = typeof closeEvt?.code === 'number' ? closeEvt.code : undefined;
+            const closeReason = sanitizeErrorMessage(closeEvt?.reason || '');
+            upstreamClosed = true;
+            liveSession = null;
+            toolRelay.dispose('upstream_closed');
+            console.log(
+              `[ZONI-LIVE] Upstream Gemini Live session closed (code=${closeCode ?? 'unknown'}${
+                closeReason ? `, reason=${closeReason}` : ''
+              })`
+            );
+            sendToClient({
+              type: 'session_closed',
+              code: closeCode ? String(closeCode) : 'UPSTREAM_CLOSED',
+              reason: closeReason || 'Upstream Gemini Live session closed.',
+              retryable: true,
+            });
+            // Proactively close client WebSocket with 1012 so client never stays stuck on a zombie socket
+            if (isAlive && clientWs.readyState === WebSocket.OPEN) {
+              setTimeout(() => {
+                if (clientWs.readyState === WebSocket.OPEN) {
+                  try {
+                    clientWs.close(1012, 'Upstream Gemini Live session closed');
+                  } catch {
+                    // ignore
+                  }
+                }
+              }, 50);
+            }
           },
           onerror: (err: any) => {
             const cleanErr = sanitizeErrorMessage(err);
-            console.warn('Gemini Live session notice:', cleanErr);
-            sendToClient({ type: 'error', message: cleanErr });
+            console.warn('[ZONI-LIVE] Gemini Live session notice:', cleanErr);
+            sendToClient({
+              type: 'error',
+              code: 'UPSTREAM_LIVE_ERROR',
+              retryable: true,
+              message: cleanErr,
+            });
           },
         },
       });

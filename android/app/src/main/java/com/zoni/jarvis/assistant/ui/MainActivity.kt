@@ -601,6 +601,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        isActivityInForeground = true
+        ZoniForegroundService.cancelWakeActivationNotification(applicationContext)
         viewModel.refreshSystemStatus()
         simCallManager.startCallStateMonitoring { callJson ->
             dispatchNativeEvent("zoni:call-state-changed", callJson)
@@ -610,6 +612,11 @@ class MainActivity : ComponentActivity() {
             ZoniForegroundService.getCurrentStatusSnapshot(applicationContext).toJson()
         )
         dispatchNativeEvent("zoni:call-state-changed", simCallManager.getIncomingCallStatusAsJson())
+    }
+
+    override fun onPause() {
+        isActivityInForeground = false
+        super.onPause()
     }
 
     override fun onDestroy() {
@@ -667,6 +674,10 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "ZoniMainActivity"
+        @Volatile
+        var isActivityInForeground: Boolean = false
+            private set
+
         const val EXTRA_AUTO_VOICE = "extra_auto_voice"
         const val EXTRA_WAKE_WORD_TRIGGERED = "extra_wake_word_triggered"
         const val EXTRA_WAKE_REMAINING_COMMAND = "extra_wake_remaining_command"

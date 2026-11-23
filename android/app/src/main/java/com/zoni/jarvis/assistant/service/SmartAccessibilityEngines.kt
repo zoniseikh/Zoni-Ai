@@ -251,38 +251,110 @@ object YouTubeClickEngine {
             .sortedWith(compareBy<YouTubeCandidate> { it.bounds.top }.thenBy { it.bounds.left })
     }
 
+    private val PAUSE_BUTTON_LABELS = setOf(
+        "pause", "pause video", "পজ", "ভিডিও পজ করুন", "বিরতি", "पॉज़", "वीडियो रोकें", "रोकें"
+    )
+
+    private val STOP_OR_CLOSE_LABELS = setOf(
+        "stop", "stop video", "close", "close player", "minimize", "dismiss",
+        "স্টপ", "বন্ধ", "প্লেয়ার বন্ধ", "बंद करें", "स्टॉप"
+    )
+
+    /**
+     * Finds the visible YouTube video player container so controls can be revealed when auto-hidden.
+     */
+    fun findPlayerSurface(nodes: List<AccessibleNodeSnapshot>): AccessibleNodeSnapshot? {
+        return nodes.firstOrNull { node ->
+            !node.isPassword && node.isVisibleToUser && node.bounds.isValidVisible && (
+                node.viewIdResourceName?.lowercase()?.let { vid ->
+                    vid.contains("watch_player") || vid.contains("player_view") || vid.contains("player_fragment_container")
+                } == true ||
+                    (node.bounds.top <= 240 && node.bounds.width >= 500 && node.bounds.height >= 260 &&
+                        node.contentDescription?.lowercase()?.contains("video player") == true)
+                )
+        }
+    }
+
     /**
      * Finds an explicit Play button on screen (e.g. "Play Button চাপো" / "Click the Play button").
      */
     fun findPlayButton(nodes: List<AccessibleNodeSnapshot>): YouTubeCandidate? {
+        return findPlaybackControl(nodes, "play")
+    }
+
+    /**
+     * Finds a semantic YouTube Play, Pause, or Stop/Close player control without confusing Play vs Pause state.
+     */
+    fun findPlaybackControl(nodes: List<AccessibleNodeSnapshot>, controlType: String): YouTubeCandidate? {
+        val kind = controlType.trim().lowercase()
         val nodesById = nodes.associateBy { it.nodeId }
+
+        fun buildCandidate(node: AccessibleNodeSnapshot, fallbackTitle: String): YouTubeCandidate? {
+            val clickable = AccessibilityTreeResolver.findNearestClickableNode(node, nodesById)
+            val rect = if (node.bounds.isValidVisible) node.bounds else clickable?.bounds ?: node.bounds
+            if (!rect.isValidVisible && clickable == null) return null
+            return YouTubeCandidate(
+                matchNode = node,
+                clickableNode = clickable,
+                title = node.contentDescription?.trim()?.ifEmpty { null }
+                    ?: node.text?.trim()?.ifEmpty { null }
+                    ?: fallbackTitle,
+                bounds = rect,
+                isThumbnail = false,
+                isPlayButton = true
+            )
+        }
+
+        if (kind == "stop") {
+            // Prefer explicit Stop / Close / Minimize player controls first
+            for (node in nodes) {
+                if (node.isPassword || !node.isVisibleToUser || !node.isEnabled) continue
+                val vid = node.viewIdResourceName?.lowercase().orEmpty()
+                val desc = node.contentDescription?.trim()?.lowercase().orEmpty()
+                val txt = node.text?.trim()?.lowercase().orEmpty()
+                val isStop = desc in STOP_OR_CLOSE_LABELS ||
+                    txt in STOP_OR_CLOSE_LABELS ||
+                    desc.startsWith("close player") ||
+                    desc.startsWith("minimize") ||
+                    vid.contains("player_collapse") ||
+                    vid.contains("close_button")
+                if (isStop) {
+                    buildCandidate(node, "Stop")?.let { return it }
+                }
+            }
+            // YouTube mobile player often exposes Pause instead of Stop; fall back to Pause so playback stops cleanly
+            return findPlaybackControl(nodes, "pause")
+        }
+
         for (node in nodes) {
             if (node.isPassword || !node.isVisibleToUser || !node.isEnabled) continue
             val vid = node.viewIdResourceName?.lowercase().orEmpty()
             val desc = node.contentDescription?.trim()?.lowercase().orEmpty()
             val txt = node.text?.trim()?.lowercase().orEmpty()
-            val isPlayId = vid.contains("player_control_play") ||
-                vid.endsWith(":id/play") ||
-                vid.contains("play_pause") ||
-                vid.contains("play_button")
-            val isPlayLabel = desc in PLAY_BUTTON_LABELS ||
-                txt in PLAY_BUTTON_LABELS ||
-                desc.startsWith("play video") ||
-                desc == "play"
-            if (isPlayId || isPlayLabel) {
-                val clickable = AccessibilityTreeResolver.findNearestClickableNode(node, nodesById)
-                val rect = if (node.bounds.isValidVisible) node.bounds else clickable?.bounds ?: node.bounds
-                if (rect.isValidVisible || clickable != null) {
-                    return YouTubeCandidate(
-                        matchNode = node,
-                        clickableNode = clickable,
-                        title = node.contentDescription?.trim()?.ifEmpty { null }
-                            ?: node.text?.trim()?.ifEmpty { null }
-                            ?: "Play",
-                        bounds = rect,
-                        isThumbnail = false,
-                        isPlayButton = true
-                    )
+
+            if (kind == "pause") {
+                val isPauseLabel = desc in PAUSE_BUTTON_LABELS ||
+                    txt in PAUSE_BUTTON_LABELS ||
+                    desc.startsWith("pause video") ||
+                    desc == "pause"
+                val isPauseToggleId = vid.contains("player_control_play_pause") &&
+                    !desc.startsWith("play") && txt != "play"
+                if (isPauseLabel || (isPauseToggleId && desc.contains("pause"))) {
+                    buildCandidate(node, "Pause")?.let { return it }
+                }
+            } else {
+                // Play / Resume: do NOT tap a control explicitly labeled Pause
+                if (desc.startsWith("pause") || txt == "pause") continue
+                val isPlayId = vid.contains("player_control_play") ||
+                    vid.endsWith(":id/play") ||
+                    vid.contains("play_pause") ||
+                    vid.contains("play_button")
+                val isPlayLabel = desc in PLAY_BUTTON_LABELS ||
+                    txt in PLAY_BUTTON_LABELS ||
+                    desc.startsWith("play video") ||
+                    desc == "play"
+                if (isPlayId || isPlayLabel) {
+                    buildCandidate(node, "Play")?.let { return it }
                 }
             }
         }
@@ -290,7 +362,40 @@ object YouTubeClickEngine {
     }
 
     /**
-     * Resolves a user YouTube click request (ordinal index, thumbnail, Play button, or title query).
+     * Verifies whether a Play/Pause/Stop playback control click changed player state honestly.
+     */
+    fun verifyPlaybackControlResult(
+        controlType: String,
+        afterNodes: List<AccessibleNodeSnapshot>,
+        accessibilityEventObserved: Boolean
+    ): YouTubeVerificationResult {
+        val kind = controlType.trim().lowercase()
+        val hasPauseNow = findPlaybackControl(afterNodes, "pause") != null
+        val hasPlayNow = findPlaybackControl(afterNodes, "play") != null
+        val confirmed = when (kind) {
+            "pause" -> hasPlayNow || accessibilityEventObserved
+            "play" -> hasPauseNow || accessibilityEventObserved
+            "stop" -> hasPlayNow || !hasPauseNow || accessibilityEventObserved
+            else -> accessibilityEventObserved
+        }
+        val status = when {
+            confirmed && kind == "pause" -> "youtube_video_paused"
+            confirmed && kind == "stop" -> "youtube_video_stopped"
+            confirmed && kind == "play" -> "youtube_video_playing"
+            else -> "youtube_playback_unverified"
+        }
+        val evidence = when {
+            kind == "pause" && hasPlayNow -> "Verified YouTube player control switched to Play (video paused)."
+            kind == "play" && hasPauseNow -> "Verified YouTube player control switched to Pause (video playing)."
+            kind == "stop" && (hasPlayNow || !hasPauseNow) -> "Verified YouTube playback stopped/closed."
+            accessibilityEventObserved -> "YouTube player accessibility state transition observed."
+            else -> "Could not visually confirm YouTube playback state changed."
+        }
+        return YouTubeVerificationResult(openedWatchScreen = confirmed, status = status, evidence = evidence)
+    }
+
+    /**
+     * Resolves a user YouTube click request (ordinal index, thumbnail, Play/Pause/Stop button, or title query).
      * Strictly stops on ambiguous title matches or missing visible targets.
      */
     fun resolveVideoTarget(
@@ -302,15 +407,42 @@ object YouTubeClickEngine {
         val hintLower = targetHint.trim().lowercase()
         val queryClean = titleQuery.trim()
 
-        // 1. Explicit Play button request
-        if (hintLower == "play_button" || hintLower == "play" ||
-            hintLower.contains("play button") || hintLower.contains("প্লে বাটন")
+        // 1a. Explicit Pause control request ("ভিডিওটি Pause করো", "Pause the video")
+        if (hintLower == "pause_video" || hintLower == "pause_button" || hintLower == "pause" ||
+            hintLower.contains("pause") || hintLower.contains("পজ")
         ) {
-            val playBtn = findPlayButton(nodes)
+            val pauseBtn = findPlaybackControl(nodes, "pause")
+            if (pauseBtn != null) {
+                return YouTubeTargetResolution.Matched(pauseBtn, 1)
+            }
+            return YouTubeTargetResolution.NotFound(
+                reason = "Could not find a visible Pause control on the current YouTube screen.",
+                failureCode = "pause_button_not_found"
+            )
+        }
+
+        // 1b. Explicit Stop control request ("ভিডিওটি Stop করো", "Stop the video")
+        if (hintLower == "stop_video" || hintLower == "stop_button" || hintLower == "stop" ||
+            hintLower.contains("stop") || hintLower.contains("স্টপ")
+        ) {
+            val stopBtn = findPlaybackControl(nodes, "stop")
+            if (stopBtn != null) {
+                return YouTubeTargetResolution.Matched(stopBtn, 1)
+            }
+            return YouTubeTargetResolution.NotFound(
+                reason = "Could not find a visible Stop or Pause control on the current YouTube screen.",
+                failureCode = "stop_button_not_found"
+            )
+        }
+
+        // 1c. Explicit Play button request
+        if (hintLower == "play_button" || hintLower == "play_video" || hintLower == "resume_video" ||
+            hintLower == "play" || hintLower.contains("play button") || hintLower.contains("প্লে বাটন")
+        ) {
+            val playBtn = findPlaybackControl(nodes, "play")
             if (playBtn != null) {
                 return YouTubeTargetResolution.Matched(playBtn, 1)
             }
-            // If no player Play button is visible, fall back ONLY if there's an unambiguous single video card? No — report honestly!
             return YouTubeTargetResolution.NotFound(
                 reason = "Could not find a visible Play button on the current YouTube screen.",
                 failureCode = "play_button_not_found"
@@ -1093,3 +1225,193 @@ object WhatsAppSendButtonResolver {
         }
     }
 }
+
+// ============================================================================
+// PART 3 — FACEBOOK ACCESSIBILITY UI CONTROL ENGINE (SEMANTIC + SAFE)
+// ============================================================================
+
+data class FacebookControlCandidate(
+    val matchNode: AccessibleNodeSnapshot,
+    val clickableNode: AccessibleNodeSnapshot?,
+    val label: String,
+    val category: String,
+    val bounds: AccessibleRect,
+    val score: Int
+)
+
+sealed class FacebookUiResolution {
+    data class Matched(val candidate: FacebookControlCandidate, val rankIndex: Int) : FacebookUiResolution()
+    data class Ambiguous(val query: String, val candidates: List<FacebookControlCandidate>) : FacebookUiResolution()
+    data class NotFound(val reason: String, val failureCode: String) : FacebookUiResolution()
+}
+
+object FacebookUiControlEngine {
+
+    private val FACEBOOK_PACKAGES = setOf(
+        "com.facebook.katana",
+        "com.facebook.lite",
+        "com.facebook.mlite"
+    )
+
+    private val CONTROL_SYNONYMS: Map<String, Pair<String, Set<String>>> = mapOf(
+        "like" to ("feed_control" to setOf("like", "like button", "লাইক", "लाइक")),
+        "comment" to ("feed_control" to setOf("comment", "comments", "কমেন্ট", "মন্তব্য", "कमेंट")),
+        "share" to ("feed_control" to setOf("share", "শেয়ার", "শেয়ার", "शेयर")),
+        "save" to ("feed_control" to setOf("save", "save post", "সেভ", "सेव")),
+        "follow" to ("feed_control" to setOf("follow", "ফলো", "फॉलो")),
+        "home" to ("nav_tab" to setOf("home", "home, tab", "feed", "হোম", "होम")),
+        "video" to ("nav_tab" to setOf("video", "watch", "reels", "ভিডিও", "রিলস", "वीडियो", "रील्स")),
+        "friends" to ("nav_tab" to setOf("friends", "ফ্রেন্ডস", "বন্ধু", "फ्रेंड्स")),
+        "notifications" to ("nav_tab" to setOf("notifications", "notification", "নোটিফিকেশন", "नोटिफिकेशन")),
+        "menu" to ("menu" to setOf("menu", "more", "more options", "মেনু", "মেইন মেনু", "मेनू")),
+        "profile" to ("nav_tab" to setOf("profile", "প্রোফাইল", "प्रोफ़ाइल")),
+        "search" to ("search" to setOf("search", "search facebook", "সার্চ", "খুঁজুন", "सर्च"))
+    )
+
+    fun isFacebookPackage(pkg: String?): Boolean {
+        val clean = pkg?.trim()?.lowercase().orEmpty()
+        return clean in FACEBOOK_PACKAGES
+    }
+
+    /**
+     * Resolves a visible accessible Facebook UI control (buttons, feed actions, nav tabs, menus).
+     * Never clicks password/disabled/hidden nodes and reports ambiguity honestly when multiple controls match.
+     */
+    fun resolveControl(
+        nodes: List<AccessibleNodeSnapshot>,
+        rawQuery: String,
+        ordinalIndex: Int? = null
+    ): FacebookUiResolution {
+        val cleanQuery = rawQuery.trim()
+            .replace(Regex("^(?:facebook(?:-?এ|\\s*এ|\\s*on|\\s*in|\\s*में)?\\s+)", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s*(?:button|tab|icon|বাটনে|বাটন|বটন|बटन)$", RegexOption.IGNORE_CASE), "")
+            .trim()
+        if (cleanQuery.isEmpty()) {
+            return FacebookUiResolution.NotFound(
+                reason = "Please specify which visible Facebook button or tab to tap.",
+                failureCode = "empty_facebook_target"
+            )
+        }
+
+        val lowerQuery = cleanQuery.lowercase()
+        val matchedCanonical = CONTROL_SYNONYMS.entries.firstOrNull { (key, pair) ->
+            lowerQuery == key || pair.second.any { lowerQuery == it || lowerQuery.contains(it) }
+        }
+        val acceptedTerms = matchedCanonical?.value?.second ?: setOf(lowerQuery)
+        val category = matchedCanonical?.value?.first ?: "visible_control"
+
+        val nodesById = nodes.associateBy { it.nodeId }
+        val rawMatches = mutableListOf<FacebookControlCandidate>()
+
+        for (node in nodes) {
+            if (node.isPassword || !node.isVisibleToUser || !node.isEnabled) continue
+            val txt = node.text?.trim().orEmpty()
+            val desc = node.contentDescription?.trim().orEmpty()
+            val label = txt.ifEmpty { desc }
+            if (label.isEmpty()) continue
+            val lowerTxt = txt.lowercase()
+            val lowerDesc = desc.lowercase()
+            val lowerLabel = label.lowercase()
+
+            var score = 0
+            for (term in acceptedTerms) {
+                when {
+                    lowerTxt == term || lowerDesc == term -> score = maxOf(score, 100)
+                    lowerDesc.startsWith("$term,") || lowerDesc.startsWith("$term ") || lowerTxt.startsWith("$term ") ->
+                        score = maxOf(score, 88)
+                    lowerLabel.contains(term) -> score = maxOf(score, 72)
+                }
+            }
+            if (score == 0 && MultilingualNameMatcher.matchesQuery(label, cleanQuery)) {
+                score = 68
+            }
+            if (score == 0) continue
+
+            val clickable = AccessibilityTreeResolver.findNearestClickableNode(node, nodesById, maxDepth = 4)
+            val bounds = if (node.bounds.isValidVisible) node.bounds else clickable?.bounds ?: node.bounds
+            if (clickable == null && !bounds.isValidVisible) continue
+            if (clickable != null) score += 10
+
+            rawMatches.add(
+                FacebookControlCandidate(
+                    matchNode = node,
+                    clickableNode = clickable,
+                    label = label,
+                    category = category,
+                    bounds = bounds,
+                    score = score
+                )
+            )
+        }
+
+        if (rawMatches.isEmpty()) {
+            return FacebookUiResolution.NotFound(
+                reason = "Could not find a visible \"$cleanQuery\" control on the current Facebook screen.",
+                failureCode = "facebook_control_not_found"
+            )
+        }
+
+        // Deduplicate by clickable container ID and sort visually top-to-bottom
+        val deduped = LinkedHashMap<String, FacebookControlCandidate>()
+        for (cand in rawMatches.sortedWith(compareByDescending<FacebookControlCandidate> { it.score }
+            .thenBy { it.bounds.top }.thenBy { it.bounds.left })) {
+            val key = cand.clickableNode?.nodeId?.let { "fb_click_$it" }
+                ?: "fb_pos_${cand.bounds.top / 40}_${cand.bounds.left / 40}"
+            if (!deduped.containsKey(key)) {
+                deduped[key] = cand
+            }
+        }
+        val ordered = deduped.values.sortedWith(compareBy<FacebookControlCandidate> { it.bounds.top }.thenBy { it.bounds.left })
+
+        if (ordinalIndex != null) {
+            if (ordinalIndex < 1 || ordinalIndex > ordered.size) {
+                return FacebookUiResolution.NotFound(
+                    reason = "Requested Facebook \"$cleanQuery\" #$ordinalIndex is not visible (only ${ordered.size} visible match(es)).",
+                    failureCode = "facebook_index_out_of_range"
+                )
+            }
+            return FacebookUiResolution.Matched(ordered[ordinalIndex - 1], ordinalIndex)
+        }
+
+        val topScore = ordered.maxOf { it.score }
+        val topTier = ordered.filter { it.score >= topScore - 6 }
+        if (topTier.size == 1) {
+            return FacebookUiResolution.Matched(topTier[0], ordered.indexOf(topTier[0]) + 1)
+        }
+        return FacebookUiResolution.Ambiguous(cleanQuery, topTier.take(5))
+    }
+}
+
+// ============================================================================
+// PART 4 — GENERAL UI ACTION DUPLICATE-TAP GUARD (PURE JVM-TESTABLE)
+// ============================================================================
+
+object UiActionDeduplicator {
+    private val recentClicks = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private const val DEFAULT_COOLDOWN_MS = 1200L
+
+    fun tryAcquire(
+        packageName: String,
+        actionType: String,
+        target: String,
+        nowMs: Long = System.currentTimeMillis(),
+        cooldownMs: Long = DEFAULT_COOLDOWN_MS
+    ): Boolean {
+        val key = "${packageName.trim().lowercase()}|${actionType.trim().lowercase()}|${target.trim().lowercase()}"
+        val previous = recentClicks[key]
+        if (previous != null && (nowMs - previous) < cooldownMs) {
+            return false
+        }
+        recentClicks[key] = nowMs
+        if (recentClicks.size > 120) {
+            val cutoff = nowMs - (cooldownMs * 4L)
+            recentClicks.entries.removeIf { it.value < cutoff }
+        }
+        return true
+    }
+
+    fun resetForTests() {
+        recentClicks.clear()
+    }
+}
+

@@ -395,15 +395,18 @@ class DeviceActionExecutor(private val context: Context) {
 
             AllowedActionType.VOLUME_CONTROL -> {
                 val action = args["action"] ?: "status"
-                val volJson = JSONObject(adjustVolume(action))
+                val stream = args["stream"]
+                val percent = args["percent"]?.let { VolumeControlMath.normalizeDigits(it).trim().toIntOrNull() }
+                val volJson = JSONObject(adjustVolume(action, stream, percent))
                 val ok = volJson.optBoolean("success", false)
                 TypedActionResult(
                     actionId = request.actionId,
                     actionType = request.actionType.toolName,
                     success = ok,
-                    verified = ok,
-                    status = if (ok) "executed" else "failed",
+                    verified = volJson.optBoolean("verified", ok),
+                    status = if (ok) "executed" else volJson.optString("status", "failed"),
                     message = volJson.optString("message", "Volume updated."),
+                    failureReason = if (ok) null else volJson.optString("failureReason", "volume_adjust_failed"),
                     data = volJson
                 )
             }
@@ -1823,52 +1826,126 @@ class DeviceActionExecutor(private val context: Context) {
         }
     }
 
-    fun adjustVolume(action: String): String {
+    fun adjustVolume(action: String, streamOverride: String? = null, percentOverride: Int? = null): String {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
-            ?: return """{"success":false,"message":"AudioManager unavailable."}"""
-        val stream = android.media.AudioManager.STREAM_MUSIC
-        val normalized = action.trim().lowercase()
+            ?: return JSONObject()
+                .put("success", false)
+                .put("verified", false)
+                .put("status", "audio_manager_unavailable")
+                .put("failureReason", "audio_manager_unavailable")
+                .put("message", "AudioManager unavailable.")
+                .toString()
+
+        val req = VolumeControlMath.parseBridgeVolumeRequest(action, streamOverride, percentOverride)
+        val streamType = req.stream
+        val stream = streamType.androidStream
+        val flags = android.media.AudioManager.FLAG_SHOW_UI
+
         return try {
-            when (normalized) {
-                "up", "increase", "raise" -> audioManager.adjustStreamVolume(
+            val minVol = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                try {
+                    audioManager.getStreamMinVolume(stream).coerceAtLeast(0)
+                } catch (_: Exception) {
+                    0
+                }
+            } else {
+                0
+            }
+            val maxVol = audioManager.getStreamMaxVolume(stream).coerceAtLeast(1)
+
+            when (req.action) {
+                "up" -> audioManager.adjustStreamVolume(
                     stream,
                     android.media.AudioManager.ADJUST_RAISE,
-                    android.media.AudioManager.FLAG_SHOW_UI
+                    flags
                 )
-                "down", "decrease", "lower" -> audioManager.adjustStreamVolume(
+                "down" -> audioManager.adjustStreamVolume(
                     stream,
                     android.media.AudioManager.ADJUST_LOWER,
-                    android.media.AudioManager.FLAG_SHOW_UI
+                    flags
                 )
+                "set" -> {
+                    val targetPct = req.percent
+                        ?: return JSONObject()
+                            .put("success", false)
+                            .put("verified", false)
+                            .put("status", "missing_percent")
+                            .put("failureReason", "missing_percent")
+                            .put("stream", streamType.id)
+                            .put("message", "Specify a volume percentage between 0 and 100.")
+                            .toString()
+                    val targetIndex = VolumeControlMath.percentToStreamIndex(targetPct, minVol, maxVol)
+                    // If currently muted and user sets > 0%, unmute first so audio actually plays
+                    if (targetPct > 0 && audioManager.isStreamMute(stream)) {
+                        try {
+                            audioManager.adjustStreamVolume(stream, android.media.AudioManager.ADJUST_UNMUTE, 0)
+                        } catch (_: SecurityException) {
+                            // Some streams ignore unmute under DND; setStreamVolume below will surface if restricted
+                        }
+                    }
+                    audioManager.setStreamVolume(stream, targetIndex, flags)
+                }
                 "mute" -> audioManager.adjustStreamVolume(
                     stream,
                     android.media.AudioManager.ADJUST_MUTE,
-                    android.media.AudioManager.FLAG_SHOW_UI
+                    flags
                 )
                 "unmute" -> audioManager.adjustStreamVolume(
                     stream,
                     android.media.AudioManager.ADJUST_UNMUTE,
-                    android.media.AudioManager.FLAG_SHOW_UI
+                    flags
                 )
-                "max" -> {
-                    val maxVol = audioManager.getStreamMaxVolume(stream)
-                    audioManager.setStreamVolume(stream, maxVol, android.media.AudioManager.FLAG_SHOW_UI)
-                }
-                else -> Unit
+                "max" -> audioManager.setStreamVolume(stream, maxVol, flags)
+                else -> Unit // "status" read-only
             }
-            val current = audioManager.getStreamVolume(stream)
-            val max = audioManager.getStreamMaxVolume(stream).coerceAtLeast(1)
-            val percent = ((current * 100f) / max).toInt().coerceIn(0, 100)
+
+            // Read back actual resulting volume & mute state from Android AudioManager
+            val currentIndex = audioManager.getStreamVolume(stream)
+            val actualMuted = try {
+                audioManager.isStreamMute(stream) || currentIndex == 0
+            } catch (_: Exception) {
+                currentIndex == 0
+            }
+            val actualPercent = VolumeControlMath.streamIndexToPercent(currentIndex, minVol, maxVol)
+            val stateDesc = when {
+                actualMuted && req.action == "mute" -> "${streamType.displayLabel} volume muted ($actualPercent%)."
+                actualMuted -> "${streamType.displayLabel} volume is $actualPercent% (muted)."
+                else -> "${streamType.displayLabel} volume is now $actualPercent%."
+            }
+
             JSONObject()
                 .put("success", true)
-                .put("action", normalized)
-                .put("volumePercent", percent)
-                .put("message", "Media volume is now $percent%.")
+                .put("verified", true)
+                .put("action", req.action)
+                .put("stream", streamType.id)
+                .put("streamLabel", streamType.displayLabel)
+                .put("volumePercent", actualPercent)
+                .put("streamIndex", currentIndex)
+                .put("streamMin", minVol)
+                .put("streamMax", maxVol)
+                .put("isMuted", actualMuted)
+                .apply {
+                    if (req.percent != null) put("requestedPercent", req.percent)
+                }
+                .put("message", stateDesc)
+                .toString()
+        } catch (se: SecurityException) {
+            JSONObject()
+                .put("success", false)
+                .put("verified", false)
+                .put("status", "dnd_policy_restricted")
+                .put("failureReason", "dnd_policy_restricted")
+                .put("stream", streamType.id)
+                .put("message", "Android Do Not Disturb / policy blocked changing ${streamType.displayLabel} volume: ${se.message ?: "Access denied"}")
                 .toString()
         } catch (e: Exception) {
             JSONObject()
                 .put("success", false)
-                .put("message", e.message ?: "Unable to adjust device volume.")
+                .put("verified", false)
+                .put("status", "volume_adjust_failed")
+                .put("failureReason", "volume_adjust_failed")
+                .put("stream", streamType.id)
+                .put("message", e.message ?: "Unable to adjust ${streamType.displayLabel} volume.")
                 .toString()
         }
     }

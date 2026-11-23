@@ -951,8 +951,53 @@ class ZoniAccessibilityService : AccessibilityService() {
         }
 
         val beforeLabels = collectVisibleLabels(root, 40)
-        val (snapshots, nodeMap) = captureNodeSnapshotTree(root)
-        return when (val resolution = YouTubeClickEngine.resolveVideoTarget(snapshots, index, targetHint, titleQuery)) {
+        var (snapshots, nodeMap) = captureNodeSnapshotTree(root)
+        val hintLower = targetHint.trim().lowercase()
+        val playbackKind = when {
+            hintLower == "pause_video" || hintLower == "pause_button" || hintLower == "pause" || hintLower.contains("pause") || hintLower.contains("পজ") -> "pause"
+            hintLower == "stop_video" || hintLower == "stop_button" || hintLower == "stop" || hintLower.contains("stop") || hintLower.contains("স্টপ") -> "stop"
+            hintLower == "play_button" || hintLower == "play_video" || hintLower == "resume_video" || hintLower == "play" || hintLower.contains("play button") || hintLower.contains("প্লে বাটন") -> "play"
+            else -> null
+        }
+
+        val dedupTarget = titleQuery.ifBlank { targetHint.ifBlank { index?.toString().orEmpty() } }
+        if (!UiActionDeduplicator.tryAcquire(activePkg, actionTypeName, dedupTarget)) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = actionTypeName,
+                activePackage = activePkg,
+                message = "Prevented accidental duplicate YouTube action for \"$dedupTarget\".",
+                failureReason = "duplicate_tap_prevented",
+                target = dedupTarget,
+                executionStatus = "duplicate_blocked"
+            )
+        }
+
+        var resolution = YouTubeClickEngine.resolveVideoTarget(snapshots, index, targetHint, titleQuery)
+
+        // If Play/Pause/Stop overlay controls auto-hid on YouTube watch screen, tap the player surface once to reveal them
+        if (resolution is YouTubeTargetResolution.NotFound && playbackKind != null) {
+            val playerSurface = YouTubeClickEngine.findPlayerSurface(snapshots)
+            if (playerSurface != null) {
+                val liveSurface = nodeMap[playerSurface.nodeId]
+                val (revealed, _) = performSmartClickOnResolvedTarget(liveSurface, liveSurface, playerSurface.bounds)
+                if (revealed) {
+                    try {
+                        Thread.sleep(360L)
+                    } catch (_: InterruptedException) {
+                        // ignore
+                    }
+                    val refreshedRoot = rootInActiveWindow ?: root
+                    val refreshedTree = captureNodeSnapshotTree(refreshedRoot)
+                    snapshots = refreshedTree.first
+                    nodeMap = refreshedTree.second
+                    resolution = YouTubeClickEngine.resolveVideoTarget(snapshots, index, targetHint, titleQuery)
+                }
+            }
+        }
+
+        return when (resolution) {
             is YouTubeTargetResolution.NotFound -> AccessibilityActionOutcome(
                 success = false,
                 verified = true,
@@ -960,7 +1005,7 @@ class ZoniAccessibilityService : AccessibilityService() {
                 activePackage = activePkg,
                 message = resolution.reason,
                 failureReason = resolution.failureCode,
-                target = titleQuery.ifBlank { targetHint.ifBlank { index?.toString().orEmpty() } },
+                target = dedupTarget,
                 executionStatus = resolution.failureCode
             )
             is YouTubeTargetResolution.Ambiguous -> {
@@ -1005,13 +1050,21 @@ class ZoniAccessibilityService : AccessibilityService() {
                 val postPkg = postRoot?.packageName?.toString().orEmpty().ifBlank { getActivePackageName() }
                 val postSnapshots = if (postRoot != null) captureNodeSnapshotTree(postRoot).first else emptyList()
 
-                val verification = YouTubeClickEngine.verifyWatchScreenOpened(
-                    beforeLabels = beforeLabels,
-                    afterNodes = postSnapshots,
-                    clickedTitle = cand.title,
-                    activePackage = postPkg,
-                    accessibilityEventObserved = eventObserved
-                )
+                val verification = if (playbackKind != null) {
+                    YouTubeClickEngine.verifyPlaybackControlResult(
+                        controlType = playbackKind,
+                        afterNodes = postSnapshots,
+                        accessibilityEventObserved = eventObserved
+                    )
+                } else {
+                    YouTubeClickEngine.verifyWatchScreenOpened(
+                        beforeLabels = beforeLabels,
+                        afterNodes = postSnapshots,
+                        clickedTitle = cand.title,
+                        activePackage = postPkg,
+                        accessibilityEventObserved = eventObserved
+                    )
+                }
 
                 AccessibilityActionOutcome(
                     success = true,
@@ -1021,7 +1074,7 @@ class ZoniAccessibilityService : AccessibilityService() {
                     message = if (verification.openedWatchScreen) {
                         "Clicked YouTube target \"${cand.title}\" (#${resolution.rankIndex}) via $method. ${verification.evidence}"
                     } else {
-                        "Clicked YouTube target \"${cand.title}\" (#${resolution.rankIndex}) via $method, but could not verify the video player opened. ${verification.evidence}"
+                        "Clicked YouTube target \"${cand.title}\" (#${resolution.rankIndex}) via $method, but could not verify the screen state changed. ${verification.evidence}"
                     },
                     failureReason = if (verification.openedWatchScreen) null else "watch_screen_unverified",
                     target = cand.title,
@@ -1039,16 +1092,131 @@ class ZoniAccessibilityService : AccessibilityService() {
         }
     }
 
+    fun clickFacebookControl(targetText: String, index: Int? = null): AccessibilityActionOutcome {
+        val root = rootInActiveWindow ?: return AccessibilityActionOutcome(
+            success = false,
+            verified = false,
+            actionType = "click_visible_element",
+            activePackage = lastForegroundPackage,
+            message = "No active Android window is accessible to tap a Facebook control.",
+            failureReason = "no_active_window",
+            target = targetText,
+            executionStatus = "failed"
+        )
+        val activePkg = root.packageName?.toString().orEmpty()
+        checkScreenSafety(root, "click_visible_element")?.let { return it }
+
+        if (!UiActionDeduplicator.tryAcquire(activePkg, "click_facebook_control", "$targetText#${index ?: 0}")) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visible_element",
+                activePackage = activePkg,
+                message = "Prevented accidental duplicate tap on Facebook \"$targetText\".",
+                failureReason = "duplicate_tap_prevented",
+                target = targetText,
+                executionStatus = "duplicate_blocked"
+            )
+        }
+
+        val (snapshots, nodeMap) = captureNodeSnapshotTree(root)
+        return when (val resolution = FacebookUiControlEngine.resolveControl(snapshots, targetText, index)) {
+            is FacebookUiResolution.NotFound -> AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visible_element",
+                activePackage = activePkg,
+                message = resolution.reason,
+                failureReason = resolution.failureCode,
+                target = targetText,
+                executionStatus = resolution.failureCode
+            )
+            is FacebookUiResolution.Ambiguous -> {
+                val arr = JSONArray()
+                resolution.candidates.forEachIndexed { i, c ->
+                    arr.put(JSONObject().put("index", i + 1).put("label", c.label).put("category", c.category))
+                }
+                AccessibilityActionOutcome(
+                    success = false,
+                    verified = true,
+                    actionType = "click_visible_element",
+                    activePackage = activePkg,
+                    message = "Multiple visible Facebook controls match \"${resolution.query}\". Please specify which one (e.g., first or second).",
+                    failureReason = "ambiguous_target",
+                    target = resolution.query,
+                    executionStatus = "ambiguous_target",
+                    data = JSONObject().put("candidates", arr).put("query", resolution.query)
+                )
+            }
+            is FacebookUiResolution.Matched -> {
+                val cand = resolution.candidate
+                val liveTarget = nodeMap[cand.matchNode.nodeId]
+                val liveClickable = cand.clickableNode?.let { nodeMap[it.nodeId] }
+                val preClickMs = System.currentTimeMillis()
+                val (clicked, method) = performSmartClickOnResolvedTarget(liveTarget, liveClickable, cand.bounds)
+                if (!clicked) {
+                    return AccessibilityActionOutcome(
+                        success = false,
+                        verified = false,
+                        actionType = "click_visible_element",
+                        activePackage = activePkg,
+                        message = "Found Facebook control \"${cand.label}\", but the tap was rejected.",
+                        failureReason = "facebook_click_rejected",
+                        target = cand.label,
+                        executionStatus = "failed"
+                    )
+                }
+                val transitioned = waitForUiTransitionEvent(preClickMs, 850L)
+                AccessibilityActionOutcome(
+                    success = true,
+                    verified = transitioned,
+                    actionType = "click_visible_element",
+                    activePackage = getActivePackageName(),
+                    message = if (transitioned) {
+                        "Tapped Facebook \"${cand.label}\" (${cand.category}) via $method and observed UI update."
+                    } else {
+                        "Tapped Facebook \"${cand.label}\" (${cand.category}) via $method."
+                    },
+                    target = cand.label,
+                    executionStatus = if (transitioned) "facebook_control_clicked" else "clicked_unverified",
+                    data = JSONObject()
+                        .put("label", cand.label)
+                        .put("category", cand.category)
+                        .put("rankIndex", resolution.rankIndex)
+                        .put("method", method)
+                )
+            }
+        }
+    }
+
     fun clickVisibleElementAdvanced(targetText: String, index: Int? = null): AccessibilityActionOutcome {
         val activePkg = getActivePackageName()
         val lower = targetText.trim().lowercase()
-        // Route YouTube-specific visible requests (thumbnail / play button / video) to the YouTube Click Engine automatically
+        // Route YouTube-specific visible requests (thumbnail / play / pause / stop / video) to the YouTube Click Engine automatically
         if (YouTubeClickEngine.isYouTubePackage(activePkg) &&
             (lower.contains("video") || lower.contains("ভিডিও") || lower.contains("वीडियो") ||
                 lower.contains("thumbnail") || lower.contains("থাম্বনেইল") ||
-                lower.contains("play") || lower.contains("প্লে"))
+                lower.contains("play") || lower.contains("প্লে") ||
+                lower.contains("pause") || lower.contains("পজ") ||
+                lower.contains("stop") || lower.contains("স্টপ"))
         ) {
             return clickYouTubeVideo(index = index, targetHint = targetText, titleQuery = "", actionTypeName = "click_visible_element")
+        }
+        // Route Facebook visible controls (Like, Comment, Share, Menu, Notifications, Search, tabs) to FacebookUiControlEngine
+        if (FacebookUiControlEngine.isFacebookPackage(activePkg)) {
+            return clickFacebookControl(targetText, index)
+        }
+        if (!UiActionDeduplicator.tryAcquire(activePkg, "click_visible_element", "$targetText#${index ?: 0}")) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visible_element",
+                activePackage = activePkg,
+                message = "Prevented accidental duplicate tap on \"$targetText\".",
+                failureReason = "duplicate_tap_prevented",
+                target = targetText,
+                executionStatus = "duplicate_blocked"
+            )
         }
         return tapElementByTextDetailed(targetText).copy(actionType = "click_visible_element", target = targetText)
     }

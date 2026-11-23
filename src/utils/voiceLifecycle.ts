@@ -116,11 +116,41 @@ const DEFAULT_ZONI_VARIANTS: ReadonlyArray<readonly [string, number]> = [
   ['joni', 0.86],
   ['jonie', 0.84],
   ['jony', 0.84],
-  ['johny', 0.78],
-  ['johnny', 0.76],
-  ['sooni', 0.74],
-  ['soni', 0.74],
 ];
+
+const REJECTED_SIMILAR_WORDS = new Set([
+  'zone',
+  'zones',
+  'zoom',
+  'zero',
+  'johnny',
+  'johny',
+  'soni',
+  'sooni',
+  'sony',
+  'tony',
+  'pony',
+  'bony',
+  'bonny',
+  'donny',
+  'moni',
+  'mini',
+  'boni',
+  'roni',
+  'sunny',
+  'honey',
+  'money',
+  'funny',
+  'bunny',
+  'phone',
+  'done',
+  'gone',
+  'none',
+  'bone',
+  'cone',
+  'tone',
+  'lone',
+]);
 
 const OPTIONAL_PREFIXES = [
   'hey ',
@@ -197,6 +227,17 @@ export function evaluateWakeWordCandidate(
   }
 
   const configuredNorm = normalizeWakeText(config.wakePhrase) || 'zoni';
+  const firstToken = stripped.split(' ')[0] || '';
+  if (configuredNorm === 'zoni' && REJECTED_SIMILAR_WORDS.has(firstToken)) {
+    return {
+      matched: false,
+      confidence: 0,
+      matchedVariant: '',
+      remainingCommand: '',
+      rejectedReason: 'wake_phrase_not_present',
+    };
+  }
+
   const variants: ReadonlyArray<readonly [string, number]> =
     configuredNorm === 'zoni' ? DEFAULT_ZONI_VARIANTS : [[configuredNorm, 1.0]];
 
@@ -234,9 +275,12 @@ export function evaluateWakeWordCandidate(
     const words = stripped.split(' ');
     if (
       words.length === 1 &&
+      vNorm === configuredNorm &&
       vNorm.length >= 4 &&
       /^[a-z]+$/.test(vNorm) &&
-      /^[a-z]+$/.test(stripped)
+      /^[a-z]+$/.test(stripped) &&
+      stripped[0] === vNorm[0] &&
+      !REJECTED_SIMILAR_WORDS.has(stripped)
     ) {
       if (levenshtein(stripped, vNorm) === 1) {
         const score = Math.min(1, 0.8 * safeRecConf);

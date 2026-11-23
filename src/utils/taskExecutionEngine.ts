@@ -462,6 +462,35 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
 
   // 2b. Advanced YouTube Click Engine (Bengali / English / Hindi)
   // Play button: "Play Button চাপো", "Click the Play button", "প্লে বাটন চাপো"
+  // YouTube Pause / Stop / Play playback controls ("ভিডিওটি Pause করো", "Pause the video", "ভিডিওটি Stop করো", "ভিডিওটি Play করো")
+  if (
+    /(?:\bpause\b|পজ|বিরতি|पॉज़|रोकें)/i.test(segment) &&
+    /(?:video|ভিডিও|वीडियो|playback|প্লেব্যাক|button|বাটন|করো|करो|the)/i.test(segment)
+  ) {
+    return {
+      stepId,
+      tool: 'click_youtube_video',
+      args: { target: 'pause_video' },
+      requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Pauses the visible YouTube video via Accessibility and verifies player state.',
+    };
+  }
+
+  if (
+    /(?:\bstop\b|স্টপ|বন্ধ\s*করো|बंद\s*करो)/i.test(segment) &&
+    /(?:video|ভিডিও|वीडियो|playback|প্লেব্যাক)/i.test(segment)
+  ) {
+    return {
+      stepId,
+      tool: 'click_youtube_video',
+      args: { target: 'stop_video' },
+      requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Stops/pauses the visible YouTube video via Accessibility and verifies player state.',
+    };
+  }
+
   if (
     /(?:play\s*button|প্লে\s*বাটন|प्ले\s*बटन)/i.test(segment) &&
     /(?:click|tap|press|চাপো|ক্লিক|ট্যাপ|दबाओ|क्लिक)/i.test(segment)
@@ -473,6 +502,21 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
       requiredPermissions: ['ACCESSIBILITY_SERVICE'],
       requiresUserConfirmation: false,
       honestOutcomeNote: 'Clicks the visible YouTube Play button via Accessibility and verifies playback.',
+    };
+  }
+
+  if (
+    /^(?:play|resume)\s+(?:the\s+|this\s+)?video$|^ভিডিও(?:টি|টা)?\s*(?:(?:play|প্লে|রিজিউম)\s*করো|আবার\s*চালাও)$|^वीडियो\s*(?:प्ले|चलाओ|फिर\s*से\s*चलाओ)(?:\s*करो)?$/i.test(
+      segment
+    )
+  ) {
+    return {
+      stepId,
+      tool: 'click_youtube_video',
+      args: { target: 'play_video' },
+      requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Plays/resumes the visible YouTube video via Accessibility and verifies playback.',
     };
   }
 
@@ -781,13 +825,31 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
   }
   const tapMatch = segment.match(/^(?:tap|click|press)\s+(?:on\s+)?(.+)$/i);
   if (tapMatch && tapMatch[1]) {
+    const rawTarget = tapMatch[1].trim().replace(/\s+(?:on|in)\s+facebook$/i, '').trim();
     return {
       stepId,
       tool: 'accessibility_action',
-      args: { command: `tap:${tapMatch[1].trim()}` },
+      args: { command: `tap:${rawTarget}` },
       requiredPermissions: ['ACCESSIBILITY_SERVICE'],
       requiresUserConfirmation: false,
-      honestOutcomeNote: `Attempts to tap "${tapMatch[1].trim()}" via Android AccessibilityService.`,
+      honestOutcomeNote: `Attempts to tap "${rawTarget}" via Android AccessibilityService.`,
+    };
+  }
+
+  // Bengali & Hindi visible button/control click ("Facebook-এ Like বাটনে ক্লিক করো", "এই বাটনে ক্লিক করো", "<label> বাটনে ক্লিক করো")
+  const bnTapMatch = segment.match(
+    /^(?:(?:facebook|ফেসবুক|youtube|ইউটিউব)(?:-?এ|\s*এ)\s+)?(.+?)\s*(?:বাটনে|বাটনটিতে|বটনে)?\s*(?:ক্লিক\s*করো|ট্যাপ\s*করো|চাপো)$/i
+  );
+  if (bnTapMatch && bnTapMatch[1]) {
+    const rawTarget = bnTapMatch[1].trim();
+    const normalizedTarget = /^এই$/i.test(rawTarget) ? 'button' : rawTarget;
+    return {
+      stepId,
+      tool: 'accessibility_action',
+      args: { command: `tap:${normalizedTarget}` },
+      requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: `Attempts to tap visible "${normalizedTarget}" control via Android AccessibilityService.`,
     };
   }
 
@@ -803,36 +865,105 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     };
   }
 
-  // 5. Volume Controls
-  if (/(?:volume\s+up|increase\s+volume|turn\s+up\s+(?:the\s+)?volume|ভলিউম\s*বাড়াও|ভলিউম\s*বাড়াও|আওয়াজ\s*বাড়াও|वॉल्यूम\s*बढ़ाओ)/i.test(segment)) {
-    return {
-      stepId,
-      tool: 'volume_control',
-      args: { action: 'up' },
-      requiredPermissions: [],
-      requiresUserConfirmation: false,
-      honestOutcomeNote: 'Increases Android media volume.',
-    };
-  }
-  if (/(?:volume\s+down|decrease\s+volume|lower\s+volume|turn\s+down\s+(?:the\s+)?volume|ভলিউম\s*কমাও|আওয়াজ\s*কমাও|वॉल्यूम\s*कम\s*करो)/i.test(segment)) {
-    return {
-      stepId,
-      tool: 'volume_control',
-      args: { action: 'down' },
-      requiredPermissions: [],
-      requiresUserConfirmation: false,
-      honestOutcomeNote: 'Decreases Android media volume.',
-    };
-  }
-  if (/(?:mute\s+(?:the\s+)?volume|mute\s+phone|ভলিউম\s*মিউট\s*করো|সাউন্ড\s*বন্ধ\s*করো|वॉल्यूम\s*म्यूट\s*करो)/i.test(segment)) {
-    return {
-      stepId,
-      tool: 'volume_control',
-      args: { action: 'mute' },
-      requiredPermissions: [],
-      requiresUserConfirmation: false,
-      honestOutcomeNote: 'Mutes Android media volume.',
-    };
+  // 5. Perfect Volume Controls (media / ring / alarm / call / notification + percentage + mute/unmute/max/status)
+  if (
+    /(?:\bvolume\b|\bsound\b|\bmute\s+phone\b|\bunmute\s+phone\b|ভলিউম|ভোলিউম|সাউন্ড|আওয়াজ|আওয়াজ|वॉल्यूम|आवाज़|आवाज|রিংটোন|ringtone|\bringer\b)/i.test(
+      segment
+    ) &&
+    !/(?:settings|সেটিংস|सेटिंग्स)/i.test(segment)
+  ) {
+    const normalizedDigits = segment
+      .replace(/[০-৯]/g, (d) => String(d.charCodeAt(0) - '০'.charCodeAt(0)))
+      .replace(/[०-९]/g, (d) => String(d.charCodeAt(0) - '०'.charCodeAt(0)));
+
+    let stream: 'media' | 'ring' | 'alarm' | 'call' | 'notification' = 'media';
+    if (/(?:\bring\b|ringtone|\bringer\b|রিংটোন|রিং|रिंगटोन|रिंग)/i.test(normalizedDigits)) {
+      stream = 'ring';
+    } else if (/(?:\balarm\b|অ্যালার্ম|এলার্ম|अलार्म)/i.test(normalizedDigits)) {
+      stream = 'alarm';
+    } else if (/(?:call\s+volume|voice\s+call\s+volume|কলের\s*ভলিউম|কল\s*ভলিউম|कॉल\s*वॉल्यूम)/i.test(normalizedDigits)) {
+      stream = 'call';
+    } else if (/(?:notification\s+volume|নোটিফিকেশন\s*ভলিউম|नोटिफिकेशन\s*वॉल्यूम)/i.test(normalizedDigits)) {
+      stream = 'notification';
+    }
+
+    // Exact percentage ("volume ৫০ শতাংশ করো", "set volume to 50%", "ring volume 80 percent", "वॉल्यूम 50 प्रतिशत करो")
+    const pctMatch = normalizedDigits.match(
+      /(?:set|করো|করে\s*দাও|দাও|करो|to|at|volume|ভলিউম|ভোলিউম|সাউন্ড|আওয়াজ|वॉल्यूम)\s*(?:the\s+|my\s+)?(?:(?:media|ring|ringtone|alarm|call|notification)\s+)?(?:volume\s+)?(?:to\s+|at\s+)?(\d{1,3})\s*(?:%|percent|শতাংশ|পার্সেন্ট|পারসেন্ট|प्रतिशत|पर्सेंट)?/i
+    ) || normalizedDigits.match(/(\d{1,3})\s*(?:%|percent|শতাংশ|পার্সেন্ট|পারসেন্ট|प्रतिशत|पर्सेंट)/i);
+
+    if (pctMatch && pctMatch[1]) {
+      const clampedPercent = Math.max(0, Math.min(100, Number(pctMatch[1])));
+      return {
+        stepId,
+        tool: 'volume_control',
+        args: { action: 'set', percent: clampedPercent, stream },
+        requiredPermissions: [],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Sets Android ${stream} volume to ${clampedPercent}% and verifies resulting level.`,
+      };
+    }
+
+    if (/(?:\bunmute\b|আনমিউট|সাউন্ড\s*অন\s*করো|সাউন্ড\s*চালু\s*করো|अनम्यूट)/i.test(normalizedDigits)) {
+      return {
+        stepId,
+        tool: 'volume_control',
+        args: { action: 'unmute', stream },
+        requiredPermissions: [],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Unmutes Android ${stream} volume.`,
+      };
+    }
+    if (/(?:\bmute\b|silent|মিউট|সাউন্ড\s*বন্ধ\s*করো|আওয়াজ\s*বন্ধ\s*করো|म्यूट)/i.test(normalizedDigits)) {
+      return {
+        stepId,
+        tool: 'volume_control',
+        args: { action: 'mute', stream },
+        requiredPermissions: [],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Mutes Android ${stream} volume.`,
+      };
+    }
+    if (/(?:\bmax\b|\bfull\b|maximum|সর্বোচ্চ|ফুল\s*করো|पूरा\s*बढ़ाओ|फुल\s*करो)/i.test(normalizedDigits)) {
+      return {
+        stepId,
+        tool: 'volume_control',
+        args: { action: 'max', stream },
+        requiredPermissions: [],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Sets Android ${stream} volume to maximum.`,
+      };
+    }
+    if (/(?:\bup\b|increase|raise|louder|বাড়াও|বাড়াও|বেশি\s*করো|बढ़ाओ)/i.test(normalizedDigits)) {
+      return {
+        stepId,
+        tool: 'volume_control',
+        args: { action: 'up', stream },
+        requiredPermissions: [],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Increases Android ${stream} volume.`,
+      };
+    }
+    if (/(?:\bdown\b|decrease|lower|quieter|কমাও|কম\s*করো|कम\s*करो)/i.test(normalizedDigits)) {
+      return {
+        stepId,
+        tool: 'volume_control',
+        args: { action: 'down', stream },
+        requiredPermissions: [],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Decreases Android ${stream} volume.`,
+      };
+    }
+    if (/(?:status|check|what\s+is|কত\s*আছে|কত\s*শতাংশ|कितना\s*है)/i.test(normalizedDigits)) {
+      return {
+        stepId,
+        tool: 'volume_control',
+        args: { action: 'status', stream },
+        requiredPermissions: [],
+        requiresUserConfirmation: false,
+        honestOutcomeNote: `Checks current Android ${stream} volume level.`,
+      };
+    }
   }
 
   // 6. Android System Settings ("ফোনের সেটিংস খোলো", "location settings", "notification settings", "accessibility settings")

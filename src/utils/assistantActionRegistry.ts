@@ -376,7 +376,8 @@ export const ASSISTANT_TOOL_SPECS: readonly AssistantToolSpec[] = [
   },
   {
     name: 'volume_control',
-    description: 'Adjust Android media volume (up, down, mute, unmute, max, status).',
+    description:
+      'Adjust Android device volume accurately across media, ring, alarm, call, or notification streams (up, down, set percentage 0-100, mute, unmute, max, status).',
     requiredPermissions: [],
     requiresConfirmation: false,
     timeoutMs: 3000,
@@ -384,8 +385,17 @@ export const ASSISTANT_TOOL_SPECS: readonly AssistantToolSpec[] = [
       properties: {
         action: {
           type: 'STRING',
-          description: 'Volume control action.',
-          enum: ['up', 'down', 'mute', 'unmute', 'max', 'status'],
+          description: 'Volume control action (use "set" with percent for exact percentage).',
+          enum: ['up', 'down', 'set', 'mute', 'unmute', 'max', 'status'],
+        },
+        percent: {
+          type: 'INTEGER',
+          description: 'Target volume percentage from 0 to 100 (used when action is "set").',
+        },
+        stream: {
+          type: 'STRING',
+          description: 'Android audio stream to adjust (defaults to "media").',
+          enum: ['media', 'ring', 'alarm', 'call', 'notification'],
         },
       },
       required: ['action'],

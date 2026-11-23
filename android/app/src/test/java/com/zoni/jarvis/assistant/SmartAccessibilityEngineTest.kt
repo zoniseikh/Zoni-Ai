@@ -7,7 +7,10 @@ import com.zoni.jarvis.assistant.domain.VoiceCommand
 import com.zoni.jarvis.assistant.service.AccessibilityGuard
 import com.zoni.jarvis.assistant.service.AccessibleNodeSnapshot
 import com.zoni.jarvis.assistant.service.AccessibleRect
+import com.zoni.jarvis.assistant.service.FacebookUiControlEngine
+import com.zoni.jarvis.assistant.service.FacebookUiResolution
 import com.zoni.jarvis.assistant.service.MultilingualNameMatcher
+import com.zoni.jarvis.assistant.service.UiActionDeduplicator
 import com.zoni.jarvis.assistant.service.WhatsAppContactResolution
 import com.zoni.jarvis.assistant.service.WhatsAppDeliveryState
 import com.zoni.jarvis.assistant.service.WhatsAppSendButtonResolver
@@ -587,5 +590,133 @@ class SmartAccessibilityEngineTest {
         )
         assertEquals("maya", MultilingualNameMatcher.toPhoneticLatin("মায়া"))
         assertEquals("bari", MultilingualNameMatcher.toPhoneticLatin("বাড়ি"))
+    }
+
+    // ========================================================================
+    // PART 3 — YOUTUBE PLAY/PAUSE/STOP, FACEBOOK UI ENGINE & DUPLICATE-TAP GUARD
+    // ========================================================================
+
+    @Test
+    fun ytPlaybackControlParsesResolvesAndVerifiesPauseStopAndPlay() {
+        val pauseBn = dispatcher.parseCommand("ভিডিওটি Pause করো")
+        assertTrue(pauseBn is VoiceCommand.ClickYouTubeVideo)
+        assertEquals("pause_video", (pauseBn as VoiceCommand.ClickYouTubeVideo).targetHint)
+
+        val stopEn = dispatcher.parseCommand("Stop the video")
+        assertTrue(stopEn is VoiceCommand.ClickYouTubeVideo)
+        assertEquals("stop_video", (stopEn as VoiceCommand.ClickYouTubeVideo).targetHint)
+
+        val resumeBn = dispatcher.parseCommand("ভিডিও আবার চালাও")
+        assertTrue(resumeBn is VoiceCommand.ClickYouTubeVideo)
+        assertEquals("play_video", (resumeBn as VoiceCommand.ClickYouTubeVideo).targetHint)
+
+        val playingNodes = listOf(
+            AccessibleNodeSnapshot(
+                nodeId = 700,
+                viewIdResourceName = "com.google.android.youtube:id/player_control_play_pause_replay_button",
+                className = "android.widget.ImageView",
+                contentDescription = "Pause video",
+                isClickable = true,
+                bounds = AccessibleRect(460, 260, 620, 420)
+            )
+        )
+        val pauseRes = YouTubeClickEngine.resolveVideoTarget(playingNodes, targetHint = "pause_video")
+        assertTrue(pauseRes is YouTubeTargetResolution.Matched)
+        assertEquals(700, (pauseRes as YouTubeTargetResolution.Matched).candidate.clickableNode?.nodeId)
+
+        // Must NOT tap Pause when user asked for Play
+        val wrongPlay = YouTubeClickEngine.resolveVideoTarget(playingNodes, targetHint = "play_button")
+        assertTrue(wrongPlay is YouTubeTargetResolution.NotFound)
+
+        // After Pause tapped, Play button appears -> verification confirms paused
+        val pausedNodes = listOf(
+            AccessibleNodeSnapshot(
+                nodeId = 701,
+                viewIdResourceName = "com.google.android.youtube:id/player_control_play_pause_replay_button",
+                className = "android.widget.ImageView",
+                contentDescription = "Play video",
+                isClickable = true,
+                bounds = AccessibleRect(460, 260, 620, 420)
+            )
+        )
+        val verifyPaused = YouTubeClickEngine.verifyPlaybackControlResult("pause", pausedNodes, accessibilityEventObserved = false)
+        assertTrue(verifyPaused.openedWatchScreen)
+        assertEquals("youtube_video_paused", verifyPaused.status)
+
+        val verifyPlaying = YouTubeClickEngine.verifyPlaybackControlResult("play", playingNodes, accessibilityEventObserved = false)
+        assertTrue(verifyPlaying.openedWatchScreen)
+        assertEquals("youtube_video_playing", verifyPlaying.status)
+    }
+
+    @Test
+    fun facebookUiControlEngineMatchesControlsDetectsAmbiguityAndBlocksPasswords() {
+        assertTrue(FacebookUiControlEngine.isFacebookPackage("com.facebook.katana"))
+        assertTrue(FacebookUiControlEngine.isFacebookPackage("com.facebook.lite"))
+        assertFalse(FacebookUiControlEngine.isFacebookPackage("com.whatsapp"))
+
+        val fbFeedTree = listOf(
+            AccessibleNodeSnapshot(
+                nodeId = 1, className = "android.widget.Button", contentDescription = "Home, tab 1 of 6",
+                isClickable = true, bounds = AccessibleRect(0, 120, 180, 220)
+            ),
+            AccessibleNodeSnapshot(
+                nodeId = 2, className = "android.widget.Button", contentDescription = "Notifications, tab 5 of 6",
+                isClickable = true, bounds = AccessibleRect(720, 120, 900, 220)
+            ),
+            AccessibleNodeSnapshot(
+                nodeId = 3, className = "android.widget.Button", contentDescription = "Menu, tab 6 of 6",
+                isClickable = true, bounds = AccessibleRect(900, 120, 1080, 220)
+            ),
+            // Two Like buttons in two visible posts (tests ambiguity + ordinal selection)
+            AccessibleNodeSnapshot(
+                nodeId = 10, className = "android.widget.Button", text = "Like",
+                isClickable = true, bounds = AccessibleRect(20, 900, 340, 1000)
+            ),
+            AccessibleNodeSnapshot(
+                nodeId = 11, className = "android.widget.Button", text = "Comment",
+                isClickable = true, bounds = AccessibleRect(360, 900, 700, 1000)
+            ),
+            AccessibleNodeSnapshot(
+                nodeId = 20, className = "android.widget.Button", text = "Like",
+                isClickable = true, bounds = AccessibleRect(20, 1600, 340, 1700)
+            ),
+            // Password node must never be matched
+            AccessibleNodeSnapshot(
+                nodeId = 99, className = "android.widget.EditText", text = "Share",
+                isClickable = true, isPassword = true, bounds = AccessibleRect(20, 1800, 500, 1900)
+            )
+        )
+
+        // Single Comment button resolves unambiguously
+        val commentRes = FacebookUiControlEngine.resolveControl(fbFeedTree, "Facebook-এ Comment বাটনে")
+        assertTrue(commentRes is FacebookUiResolution.Matched)
+        assertEquals(11, (commentRes as FacebookUiResolution.Matched).candidate.clickableNode?.nodeId)
+
+        // Menu tab resolves via Bengali label
+        val menuRes = FacebookUiControlEngine.resolveControl(fbFeedTree, "মেনু")
+        assertTrue(menuRes is FacebookUiResolution.Matched)
+        assertEquals(3, (menuRes as FacebookUiResolution.Matched).candidate.clickableNode?.nodeId)
+
+        // Two Like buttons without ordinal MUST report Ambiguous
+        val ambigLike = FacebookUiControlEngine.resolveControl(fbFeedTree, "Like")
+        assertTrue(ambigLike is FacebookUiResolution.Ambiguous)
+        assertEquals(2, (ambigLike as FacebookUiResolution.Ambiguous).candidates.size)
+
+        // Explicit ordinal 2 picks the second Like button
+        val secondLike = FacebookUiControlEngine.resolveControl(fbFeedTree, "Like", ordinalIndex = 2)
+        assertTrue(secondLike is FacebookUiResolution.Matched)
+        assertEquals(20, (secondLike as FacebookUiResolution.Matched).candidate.clickableNode?.nodeId)
+
+        // Password-flagged "Share" node MUST NOT match
+        val shareRes = FacebookUiControlEngine.resolveControl(fbFeedTree, "Share")
+        assertTrue(shareRes is FacebookUiResolution.NotFound)
+    }
+
+    @Test
+    fun uiActionDeduplicatorBlocksRapidDuplicateTapsAndAllowsAfterCooldown() {
+        UiActionDeduplicator.resetForTests()
+        assertTrue(UiActionDeduplicator.tryAcquire("com.facebook.katana", "click_fb", "like", nowMs = 5000L, cooldownMs = 1200L))
+        assertFalse(UiActionDeduplicator.tryAcquire("com.facebook.katana", "click_fb", "like", nowMs = 5600L, cooldownMs = 1200L))
+        assertTrue(UiActionDeduplicator.tryAcquire("com.facebook.katana", "click_fb", "like", nowMs = 6300L, cooldownMs = 1200L))
     }
 }

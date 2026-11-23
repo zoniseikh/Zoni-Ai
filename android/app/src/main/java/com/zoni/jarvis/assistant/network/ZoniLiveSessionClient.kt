@@ -54,11 +54,18 @@ class ZoniLiveSessionClient(
 
     private var webSocket: WebSocket? = null
     private var reconnectJob: Job? = null
+    private var healthyResetJob: Job? = null
     private var reconnectAttempt = 0
     private var isClosedManually = false
 
     @Volatile
+    private var isConnecting = false
+
+    @Volatile
     private var isSessionReady = false
+
+    @Volatile
+    private var isRotatingSession = false
 
     @Volatile
     private var nonRetryableError: String? = null
@@ -95,16 +102,19 @@ class ZoniLiveSessionClient(
         lastVoice = voice
         lastLanguage = language
 
-        if (!forceReconnect && webSocket != null && isSessionReady) return
+        if (!forceReconnect && ((webSocket != null && isSessionReady) || isConnecting)) return
 
         reconnectJob?.cancel()
-        webSocket?.close(1000, "Reconnecting")
+        healthyResetJob?.cancel()
+        val previousSocket = webSocket
         webSocket = null
         isSessionReady = false
+        isConnecting = true
+        previousSocket?.close(1000, "Reconnecting")
 
         onEvent(
             LiveServerEvent.StatusChanged(
-                if (reconnectAttempt > 0) WsConnectionStatus.RECONNECTING else WsConnectionStatus.CONNECTING
+                if (reconnectAttempt > 0 || isRotatingSession) WsConnectionStatus.RECONNECTING else WsConnectionStatus.CONNECTING
             )
         )
 
@@ -120,36 +130,61 @@ class ZoniLiveSessionClient(
         val request = Request.Builder().url(wsUrl).build()
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onMessage(ws: WebSocket, text: String) {
+                if (ws != webSocket) return
                 handleIncomingJson(text)
+            }
+
+            override fun onClosing(ws: WebSocket, code: Int, reason: String) {
+                if (ws != webSocket) return
+                ws.close(code, reason)
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 if (ws != webSocket) return
+                isConnecting = false
                 isSessionReady = false
+                healthyResetJob?.cancel()
                 webSocket = null
                 onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.ERROR))
-                scheduleReconnect()
+                scheduleReconnect(isGracefulRotation = isRotatingSession)
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 if (ws != webSocket) return
+                isConnecting = false
                 isSessionReady = false
+                healthyResetJob?.cancel()
                 webSocket = null
-                if (!isClosedManually) {
-                    scheduleReconnect()
-                } else {
+
+                val classification = classifyCloseCode(code, reason)
+                if (classification.shouldClearHandle) {
+                    resumptionHandle = null
+                }
+                if (!classification.retryable && classification.category == "auth_or_config") {
+                    nonRetryableError = classification.summary
+                }
+
+                if (isClosedManually || classification.category == "normal") {
+                    isRotatingSession = false
                     onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.DISCONNECTED))
+                } else if (classification.retryable) {
+                    scheduleReconnect(isGracefulRotation = isRotatingSession || classification.category == "service_restart")
+                } else {
+                    isRotatingSession = false
+                    onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.ERROR))
                 }
             }
         })
     }
 
-    private fun scheduleReconnect() {
+    private fun scheduleReconnect(isGracefulRotation: Boolean = false) {
         if (isClosedManually || lastBackendUrl.isBlank() || nonRetryableError != null) {
+            isRotatingSession = false
             onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.ERROR))
             return
         }
-        if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+        if (!isGracefulRotation && reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+            isRotatingSession = false
             onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.ERROR))
             onEvent(
                 LiveServerEvent.Error(
@@ -161,13 +196,25 @@ class ZoniLiveSessionClient(
             return
         }
         onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.RECONNECTING))
-        val delayMs = MobileAssistantEngine.getReconnectDelayMs(reconnectAttempt)
-        reconnectAttempt += 1
+        val delayMs = if (isGracefulRotation) {
+            350L
+        } else {
+            val computed = computeReconnectDelayMs(reconnectAttempt, jitterFraction = 0.2)
+            reconnectAttempt += 1
+            computed
+        }
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             delay(delayMs)
             if (!isClosedManually && nonRetryableError == null) {
-                connect(lastBackendUrl, lastMode, lastAffectionName, lastVoice, lastLanguage, forceReconnect = false)
+                connect(
+                    lastBackendUrl,
+                    lastMode,
+                    lastAffectionName,
+                    lastVoice,
+                    lastLanguage,
+                    forceReconnect = isGracefulRotation
+                )
             }
         }
     }
@@ -176,17 +223,46 @@ class ZoniLiveSessionClient(
         try {
             val json = JSONObject(raw)
             when (json.optString("type")) {
+                "pong" -> Unit
                 "connected" -> {
+                    isConnecting = false
                     isSessionReady = true
-                    reconnectAttempt = 0
+                    isRotatingSession = false
                     nonRetryableError = null
                     onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.CONNECTED))
                     onEvent(LiveServerEvent.Connected(json.optBoolean("resumed", false)))
+                    healthyResetJob?.cancel()
+                    healthyResetJob = scope.launch {
+                        delay(HEALTHY_SESSION_RESET_MS)
+                        if (isSessionReady) {
+                            reconnectAttempt = 0
+                        }
+                    }
                     flushQueue()
                 }
                 "session_resumption" -> {
+                    val resumable = json.optBoolean("resumable", true)
                     val handle = json.optString("newHandle", "")
-                    if (handle.isNotBlank()) resumptionHandle = handle
+                    if (!resumable) {
+                        resumptionHandle = null
+                    } else if (handle.isNotBlank()) {
+                        resumptionHandle = handle
+                    }
+                }
+                "go_away" -> {
+                    if (!isRotatingSession) {
+                        isRotatingSession = true
+                        scheduleReconnect(isGracefulRotation = true)
+                    }
+                }
+                "session_closed" -> {
+                    isSessionReady = false
+                    isConnecting = false
+                    healthyResetJob?.cancel()
+                    if (!isRotatingSession) {
+                        isRotatingSession = true
+                        scheduleReconnect(isGracefulRotation = true)
+                    }
                 }
                 "flashlight" -> {
                     onEvent(LiveServerEvent.Flashlight(json.optBoolean("enable", false)))
@@ -216,7 +292,9 @@ class ZoniLiveSessionClient(
                     onEvent(LiveServerEvent.TurnComplete(json.optInt("turnId", 1)))
                 }
                 "error", "live_init_failed" -> {
+                    isConnecting = false
                     isSessionReady = false
+                    healthyResetJob?.cancel()
                     val errMsg = json.optString("message", "Live connection error")
                     val errCode = json.optString("code", "").ifBlank { null }
                     val retryable = json.optBoolean("retryable", errCode != "GEMINI_KEY_MISSING" && errCode != "GEMINI_KEY_INVALID")
@@ -277,30 +355,93 @@ class ZoniLiveSessionClient(
         if (outgoingQueue.size < 30) {
             outgoingQueue.offer(serialized)
         }
-        if (lastBackendUrl.isNotBlank() && ws == null) {
+        if (lastBackendUrl.isNotBlank() && ws == null && !isConnecting) {
             connect(lastBackendUrl, lastMode, lastAffectionName, lastVoice, lastLanguage)
         }
     }
 
     private fun flushQueue() {
         val ws = webSocket ?: return
+        val seenIds = HashSet<String>()
         while (outgoingQueue.isNotEmpty()) {
             val next = outgoingQueue.poll() ?: break
+            val msgId = try {
+                JSONObject(next).optString("clientMsgId", "")
+            } catch (_: Exception) {
+                ""
+            }
+            if (msgId.isNotEmpty() && !seenIds.add(msgId)) continue
             ws.send(next)
         }
     }
 
     fun disconnect() {
         isClosedManually = true
+        isConnecting = false
+        isRotatingSession = false
         reconnectJob?.cancel()
+        healthyResetJob?.cancel()
         isSessionReady = false
         webSocket?.close(1000, "Client closed")
         webSocket = null
         onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.DISCONNECTED))
     }
 
+    data class CloseClassification(
+        val retryable: Boolean,
+        val shouldClearHandle: Boolean,
+        val category: String,
+        val summary: String
+    )
+
     companion object {
         private const val MAX_RECONNECT_ATTEMPTS = 5
+        const val HEALTHY_SESSION_RESET_MS = 10_000L
+
+        fun computeReconnectDelayMs(
+            attempt: Int,
+            baseMs: Long = 1500L,
+            maxMs: Long = 15_000L,
+            jitterFraction: Double = 0.0,
+            randomUnit: Double = Math.random()
+        ): Long {
+            val raw = MobileAssistantEngine.getReconnectDelayMs(attempt, baseMs, maxMs)
+            val safeJitter = jitterFraction.coerceIn(0.0, 0.5)
+            if (safeJitter <= 0.0) return raw
+            val offset = (randomUnit.coerceIn(0.0, 1.0) * 2.0 - 1.0) * safeJitter * raw.toDouble()
+            return (raw.toDouble() + offset).toLong().coerceIn(250L, maxMs)
+        }
+
+        fun classifyCloseCode(code: Int, reason: String = ""): CloseClassification {
+            val clean = reason.trim()
+            return when (code) {
+                4001, 4003, 1008 -> CloseClassification(
+                    retryable = false,
+                    shouldClearHandle = true,
+                    category = "auth_or_config",
+                    summary = clean.ifBlank { "Connection rejected by server (code $code)." }
+                )
+                1012, 1013, 1001 -> CloseClassification(
+                    retryable = true,
+                    shouldClearHandle = false,
+                    category = "service_restart",
+                    summary = clean.ifBlank { "Live session rotated by server (code $code)." }
+                )
+                1000 -> CloseClassification(
+                    retryable = false,
+                    shouldClearHandle = false,
+                    category = "normal",
+                    summary = clean.ifBlank { "Closed normally." }
+                )
+                else -> CloseClassification(
+                    retryable = true,
+                    shouldClearHandle = clean.contains("handle", ignoreCase = true) ||
+                        clean.contains("expired", ignoreCase = true),
+                    category = "transient_drop",
+                    summary = clean.ifBlank { "Transient WebSocket disconnect (code $code)." }
+                )
+            }
+        }
 
         fun buildLiveWsUrl(
             backendBaseUrl: String,

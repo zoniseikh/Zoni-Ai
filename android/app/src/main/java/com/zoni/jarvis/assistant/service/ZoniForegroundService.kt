@@ -205,7 +205,14 @@ class ZoniForegroundService : Service() {
         )
         updateNotificationIfForeground("Zoni শনাক্ত হয়েছে! অ্যাসিস্ট্যান্ট চালু হচ্ছে...")
 
-        // Bring MainActivity forward safely (or post actionable notification if Android blocks background Activity launch)
+        // Bring MainActivity forward safely. On Android 10+ (API 29+), startActivity from background
+        // may be silently blocked without throwing, so we also post a high-priority wake notification
+        // whenever MainActivity is not already in foreground (MainActivity.onResume cancels it immediately
+        // if startActivity succeeds).
+        val appAlreadyVisible = MainActivity.isActivityInForeground
+        if (!appAlreadyVisible && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            postWakeActivationFallbackNotification(event.remainingCommand)
+        }
         try {
             val launchIntent = Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or
@@ -223,6 +230,7 @@ class ZoniForegroundService : Service() {
     }
 
     private fun postWakeActivationFallbackNotification(remainingCommand: String) {
+        if (!hasNotificationPermission(this)) return
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         val openIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -241,10 +249,15 @@ class ZoniForegroundService : Service() {
             .setContentTitle("Zoni AI Activated")
             .setContentText("Tap to continue your voice session with Zoni AI.")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
             .setAutoCancel(true)
             .setContentIntent(pi)
             .build()
-        nm.notify(WAKE_ALERT_NOTIFICATION_ID, notif)
+        try {
+            nm.notify(WAKE_ALERT_NOTIFICATION_ID, notif)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not post wake activation fallback notification: ${e.message}")
+        }
     }
 
     private fun promoteToMicrophoneForeground(statusText: String): Boolean {
@@ -467,6 +480,14 @@ class ZoniForegroundService : Service() {
             } else {
                 true
             }
+
+        fun cancelWakeActivationNotification(context: Context) {
+            try {
+                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                nm?.cancel(WAKE_ALERT_NOTIFICATION_ID)
+            } catch (_: Exception) {
+            }
+        }
 
         fun getCurrentStatusSnapshot(context: Context): WakeWordStatusSnapshot {
             val prefs = ZoniPreferences(context.applicationContext)

@@ -54,22 +54,34 @@ class WakeWordAndCallControlTest {
 
     @Test
     fun wakeWordMatcherRejectsUnrelatedSpeechLowConfidenceAndCooldownDuplicates() {
-        val unrelated = listOf(
+        val unrelatedAndConfusable = listOf(
             "Hello how are you today",
             "What is the weather in Dhaka",
             "তুমি কেমন আছো",
             "আজকের খবর বলো",
-            "Open YouTube please"
+            "Open YouTube please",
+            "johnny",
+            "johny",
+            "soni",
+            "sooni",
+            "zone",
+            "tony",
+            "sony",
+            "pony",
+            "sunny",
+            "honey",
+            "money",
+            "Hey Johnny open YouTube"
         )
-        for (phrase in unrelated) {
-            val res = WakeWordMatcher.evaluateCandidate(phrase, 0.95f)
+        for (phrase in unrelatedAndConfusable) {
+            val res = WakeWordMatcher.evaluateCandidate(phrase, 0.99f)
             assertFalse("Must NOT wake on '$phrase'", res.matched)
             assertEquals("wake_phrase_not_present", res.rejectedReason)
         }
 
-        // Low confidence rejected
+        // Low confidence rejected on a valid variant
         val lowConf = WakeWordMatcher.evaluateCandidate(
-            rawTranscript = "soni",
+            rawTranscript = "zonie",
             recognizerConfidence = 0.25f,
             config = WakeWordConfig(confidenceThreshold = 0.72f)
         )

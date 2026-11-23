@@ -102,7 +102,11 @@ import {
 } from './utils/liveToolRelay';
 import {
   WsConnectionStatus,
+  CLIENT_WS_PING_INTERVAL_MS,
+  CLIENT_WS_STALE_TIMEOUT_MS,
+  HEALTHY_SESSION_RESET_MS,
   buildClientTextPayload,
+  classifyLiveWsCloseCode,
   extractActionTagFromText,
   upsertAssistantTurnMessage,
   upsertUserSpeechTurnMessage,
@@ -202,7 +206,11 @@ function mapTaskStepToAssistantTool(
     case 'volume_control':
       return {
         name: 'volume_control',
-        args: { action: String(step.args.action || 'status') },
+        args: {
+          action: String(step.args.action || 'status'),
+          ...(step.args.percent !== undefined ? { percent: Number(step.args.percent) } : {}),
+          ...(step.args.stream ? { stream: String(step.args.stream) } : {}),
+        },
       };
     case 'flashlight':
       return { name: 'flashlight_control', args: { enable: Boolean(step.args.enable) } };
@@ -519,6 +527,10 @@ export default function App() {
   const hadConnectedOnceRef = useRef<boolean>(false);
   const reconnectAttemptRef = useRef<number>(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wsHealthyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wsClientPingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wsLastActivityAtRef = useRef<number>(0);
+  const goAwayRotatingRef = useRef<boolean>(false);
   const turnTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const outgoingQueueRef = useRef<string[]>([]);
   const isUnmountedRef = useRef<boolean>(false);
@@ -602,6 +614,17 @@ export default function App() {
     if (turnTimeoutRef.current) {
       clearTimeout(turnTimeoutRef.current);
       turnTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearWsConnectionTimers = useCallback(() => {
+    if (wsHealthyResetTimerRef.current) {
+      clearTimeout(wsHealthyResetTimerRef.current);
+      wsHealthyResetTimerRef.current = null;
+    }
+    if (wsClientPingTimerRef.current) {
+      clearInterval(wsClientPingTimerRef.current);
+      wsClientPingTimerRef.current = null;
     }
   }, []);
 
@@ -1356,14 +1379,24 @@ export default function App() {
           };
         }
         case 'volume_control': {
-          const volRes = adjustNativeVolume(String(req.arguments.action || 'status') as any);
+          const volAction = String(req.arguments.action || 'status') as any;
+          const volPercent =
+            req.arguments.percent !== undefined && req.arguments.percent !== null && req.arguments.percent !== ''
+              ? Number(req.arguments.percent)
+              : undefined;
+          const volStream = req.arguments.stream ? (String(req.arguments.stream) as any) : undefined;
+          const volRes = adjustNativeVolume(volAction, {
+            percent: Number.isFinite(volPercent) ? volPercent : undefined,
+            stream: volStream,
+          });
           return {
             actionId: req.actionId,
             actionType: 'volume_control',
             success: volRes.success,
-            verified: true,
+            verified: Boolean(volRes.verified ?? volRes.success),
             status: volRes.success ? 'volume_updated' : 'native_android_required',
             message: volRes.message,
+            data: volRes as unknown as Record<string, unknown>,
           };
         }
         case 'battery_status': {
@@ -1889,6 +1922,7 @@ export default function App() {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
+      clearWsConnectionTimers();
 
       settlePendingHandshake(new Error('Replaced by newer Live WebSocket connection attempt.'));
 
@@ -1896,7 +1930,7 @@ export default function App() {
         try {
           wsRef.current.onclose = null;
           wsRef.current.onerror = null;
-          wsRef.current.close();
+          wsRef.current.close(1000, 'Replaced by newer connection');
         } catch {
           // ignore
         }
@@ -1904,7 +1938,7 @@ export default function App() {
       }
 
       isSessionReadyRef.current = false;
-      setWsStatus(reconnectAttemptRef.current > 0 ? 'reconnecting' : 'connecting');
+      setWsStatus(reconnectAttemptRef.current > 0 || goAwayRotatingRef.current ? 'reconnecting' : 'connecting');
 
       const wsUrl = getLiveWsUrl(
         activeModeRef.current,
@@ -1951,13 +1985,18 @@ export default function App() {
 
           ws.onmessage = (event) => {
             if (isUnmountedRef.current || wsRef.current !== ws) return;
+            wsLastActivityAtRef.current = Date.now();
             try {
               const msg = JSON.parse(event.data);
+
+              if (msg.type === 'pong') {
+                return;
+              }
 
               if (msg.type === 'connected') {
                 isSessionReadyRef.current = true;
                 liveToolsReadyRef.current = msg.liveToolCallingSupported !== false;
-                reconnectAttemptRef.current = 0;
+                goAwayRotatingRef.current = false;
                 liveNonRetryableErrorRef.current = null;
                 setWsStatus('connected');
                 setConnectionError(null);
@@ -1972,6 +2011,39 @@ export default function App() {
                 }));
                 settlePendingHandshake();
 
+                // Reset reconnect backoff only after the session stays healthy for HEALTHY_SESSION_RESET_MS
+                clearWsConnectionTimers();
+                wsHealthyResetTimerRef.current = setTimeout(() => {
+                  if (wsRef.current === ws && isSessionReadyRef.current) {
+                    reconnectAttemptRef.current = 0;
+                  }
+                }, HEALTHY_SESSION_RESET_MS);
+
+                // Client application-level heartbeat to detect silent NAT/WebView half-open drops
+                wsLastActivityAtRef.current = Date.now();
+                wsClientPingTimerRef.current = setInterval(() => {
+                  if (isUnmountedRef.current || wsRef.current !== ws) {
+                    clearWsConnectionTimers();
+                    return;
+                  }
+                  if (ws.readyState !== WebSocket.OPEN) return;
+                  const silenceMs = Date.now() - wsLastActivityAtRef.current;
+                  if (silenceMs >= CLIENT_WS_STALE_TIMEOUT_MS) {
+                    console.warn('[ZONI-LIVE] Stale WebSocket detected (no pong/traffic); forcing clean reconnect.');
+                    try {
+                      ws.close(4000, 'Client heartbeat timeout');
+                    } catch {
+                      // ignore
+                    }
+                    return;
+                  }
+                  try {
+                    ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+                  } catch {
+                    // ignore
+                  }
+                }, CLIENT_WS_PING_INTERVAL_MS);
+
                 if (
                   hadConnectedOnceRef.current &&
                   !wasResumed &&
@@ -1985,22 +2057,82 @@ export default function App() {
                 }
                 hadConnectedOnceRef.current = true;
 
-                // Flush any queued messages (e.g. typed Chat Box messages sent while connecting)
+                // Flush queued messages with clientMsgId deduplication so reconnect never sends duplicates
+                const flushedMsgIds = new Set<string>();
                 while (
                   outgoingQueueRef.current.length > 0 &&
                   ws.readyState === WebSocket.OPEN
                 ) {
                   const queuedPayload = outgoingQueueRef.current.shift();
-                  if (queuedPayload) {
-                    ws.send(queuedPayload);
+                  if (!queuedPayload) continue;
+                  try {
+                    const parsedQueued = JSON.parse(queuedPayload);
+                    if (typeof parsedQueued?.clientMsgId === 'string') {
+                      if (flushedMsgIds.has(parsedQueued.clientMsgId)) continue;
+                      flushedMsgIds.add(parsedQueued.clientMsgId);
+                    }
+                  } catch {
+                    // Send raw payload if not JSON
                   }
+                  ws.send(queuedPayload);
                 }
                 return;
               }
 
               if (msg.type === 'session_resumption') {
-                if (msg.newHandle && typeof msg.newHandle === 'string') {
+                if (msg.resumable === false) {
+                  resumptionHandleRef.current = undefined;
+                } else if (msg.newHandle && typeof msg.newHandle === 'string') {
                   resumptionHandleRef.current = msg.newHandle;
+                }
+                return;
+              }
+
+              // Proactive graceful rotation before Gemini upstream closes the session
+              if (msg.type === 'go_away') {
+                if (!goAwayRotatingRef.current) {
+                  goAwayRotatingRef.current = true;
+                  setWsStatus('reconnecting');
+                  console.log(
+                    `[ZONI-LIVE] Received go_away (timeLeft=${msg.timeLeft || 'soon'}); rotating session gracefully.`
+                  );
+                  if (reconnectTimerRef.current) {
+                    clearTimeout(reconnectTimerRef.current);
+                  }
+                  reconnectTimerRef.current = setTimeout(() => {
+                    if (!isUnmountedRef.current) {
+                      connectSharedLiveWs(true).catch(() => {
+                        goAwayRotatingRef.current = false;
+                      });
+                    }
+                  }, 300);
+                }
+                return;
+              }
+
+              // Upstream Gemini session closed cleanly -> reconnect using saved resumption handle
+              if (msg.type === 'session_closed') {
+                isSessionReadyRef.current = false;
+                clearWsConnectionTimers();
+                if (
+                  !liveNonRetryableErrorRef.current &&
+                  !goAwayRotatingRef.current &&
+                  shouldAutoReconnectLiveWs(msg.code, msg.retryable !== false, reconnectAttemptRef.current)
+                ) {
+                  goAwayRotatingRef.current = true;
+                  setWsStatus('reconnecting');
+                  const delay = getReconnectDelayMs(reconnectAttemptRef.current, 1500, 15000, 0.2);
+                  reconnectAttemptRef.current += 1;
+                  if (reconnectTimerRef.current) {
+                    clearTimeout(reconnectTimerRef.current);
+                  }
+                  reconnectTimerRef.current = setTimeout(() => {
+                    if (!isUnmountedRef.current) {
+                      connectSharedLiveWs(false).catch(() => {
+                        goAwayRotatingRef.current = false;
+                      });
+                    }
+                  }, delay);
                 }
                 return;
               }
@@ -2370,19 +2502,34 @@ export default function App() {
             setWsStatus('error');
           };
 
-          ws.onclose = () => {
+          ws.onclose = (closeEvent) => {
             if (isUnmountedRef.current || wsRef.current !== ws) return;
             isSessionReadyRef.current = false;
             wsRef.current = null;
+            clearWsConnectionTimers();
+
+            const closeInfo = classifyLiveWsCloseCode(closeEvent?.code, closeEvent?.reason);
+            if (closeInfo.shouldClearHandle) {
+              resumptionHandleRef.current = undefined;
+            }
+            if (!closeInfo.retryable && closeInfo.category === 'auth_or_config') {
+              liveNonRetryableErrorRef.current = closeInfo.diagnosticSummary;
+            }
 
             const disconnectReason =
               liveNonRetryableErrorRef.current ||
-              'Gemini Live WebSocket disconnected. Chat messages will automatically use /api/chat fallback.';
+              (closeInfo.category === 'service_restart'
+                ? 'Gemini Live session rotated; reconnecting cleanly...'
+                : 'Gemini Live WebSocket disconnected. Chat messages will automatically use /api/chat fallback.');
 
             settlePendingHandshake(new Error(disconnectReason));
 
-            // Never leave microphone active / UI showing LISTENING after WS disconnects
-            if (isLiveActiveRef.current) {
+            // If we are mid-graceful go_away/1012 rotation, keep the UX calm while reconnecting;
+            // on unexpected disconnects, immediately halt mic so UI never falsely displays LISTENING.
+            const isGracefulRotation =
+              goAwayRotatingRef.current || closeInfo.category === 'service_restart';
+
+            if (isLiveActiveRef.current && !isGracefulRotation) {
               stopVoiceCapture(true);
               setAssistantState('error');
               setConnectionError(disconnectReason);
@@ -2391,6 +2538,8 @@ export default function App() {
                   ? `লাইভ ভয়েস সংযোগ বিচ্ছিন্ন হয়েছে: ${disconnectReason}`
                   : `Live voice disconnected: ${disconnectReason}`
               );
+            } else if (isLiveActiveRef.current && isGracefulRotation) {
+              setAssistantState('connecting');
             }
 
             // If a typed chat turn was awaiting this Live WS, immediately fall back to /api/chat
@@ -2405,20 +2554,29 @@ export default function App() {
 
             if (
               !liveNonRetryableErrorRef.current &&
+              closeInfo.retryable &&
               shouldAutoReconnectLiveWs(undefined, true, reconnectAttemptRef.current)
             ) {
               setWsStatus('reconnecting');
-              const delay = getReconnectDelayMs(reconnectAttemptRef.current);
-              reconnectAttemptRef.current += 1;
+              const delay = isGracefulRotation
+                ? 400
+                : getReconnectDelayMs(reconnectAttemptRef.current, 1500, 15000, 0.2);
+              if (!isGracefulRotation) {
+                reconnectAttemptRef.current += 1;
+              }
+              if (reconnectTimerRef.current) {
+                clearTimeout(reconnectTimerRef.current);
+              }
               reconnectTimerRef.current = setTimeout(() => {
                 if (!isUnmountedRef.current) {
                   connectSharedLiveWs(false).catch(() => {
-                    // Handled via wsStatus & connectionError
+                    goAwayRotatingRef.current = false;
                   });
                 }
               }, delay);
             } else {
-              setWsStatus('error');
+              goAwayRotatingRef.current = false;
+              setWsStatus(closeInfo.category === 'normal' ? 'disconnected' : 'error');
               if (liveNonRetryableErrorRef.current) {
                 setConnectionError(liveNonRetryableErrorRef.current);
               }
@@ -2438,6 +2596,7 @@ export default function App() {
     },
     [
       clearTurnTimeout,
+      clearWsConnectionTimers,
       executeValidatedAssistantTool,
       handleApprovePendingAction,
       recordActionDiagnostic,
@@ -2539,6 +2698,7 @@ export default function App() {
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
       }
+      clearWsConnectionTimers();
       settlePendingHandshake(new Error('App unmounted'));
       clearTurnTimeout();
       if (wsRef.current) {
@@ -3444,6 +3604,16 @@ export default function App() {
       const detail = (ev as CustomEvent<IncomingCallStatusSnapshot>).detail;
       if (detail && typeof detail === 'object') {
         setIncomingCallStatus(detail);
+        if (detail.callState === 'ACTIVE' || detail.isActiveCall) {
+          try {
+            window.speechSynthesis?.cancel();
+          } catch {
+            // ignore
+          }
+          if (isLiveActiveRef.current) {
+            stopVoiceCapture(false);
+          }
+        }
       }
     };
 

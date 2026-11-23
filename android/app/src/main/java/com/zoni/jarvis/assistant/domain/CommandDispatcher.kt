@@ -251,11 +251,30 @@ class CommandDispatcher {
     private fun parseYouTubeClickCommand(raw: String, lower: String): VoiceCommand? {
         val clean = raw.trimEnd('।', '.', '!', '?').trim()
 
+        // Pause Video ("ভিডিওটি Pause করো", "Pause the video", "ভিডিও পজ করো", "वीडियो पॉज़ करो")
+        if (Regex("(?:pause|পজ|বিরতি|पॉज़|रोकें)", RegexOption.IGNORE_CASE).containsMatchIn(clean) &&
+            Regex("(?:video|ভিডিও|वीडियो|playback|প্লেব্যাক|button|বাটন|করো|करो|the)", RegexOption.IGNORE_CASE).containsMatchIn(clean)
+        ) {
+            return VoiceCommand.ClickYouTubeVideo(index = null, targetHint = "pause_video")
+        }
+
+        // Stop Video ("ভিডিওটি Stop করো", "Stop the video", "ভিডিও বন্ধ করো", "वीडियो बंद करो")
+        if (Regex("(?:stop|স্টপ|বন্ধ\\s*করো|बंद\\s*करो)", RegexOption.IGNORE_CASE).containsMatchIn(clean) &&
+            Regex("(?:video|ভিডিও|वीडियो|playback|প্লেব্যাক)", RegexOption.IGNORE_CASE).containsMatchIn(clean)
+        ) {
+            return VoiceCommand.ClickYouTubeVideo(index = null, targetHint = "stop_video")
+        }
+
         // Play Button ("Play Button চাপো", "Click the Play button", "প্লে বাটন চাপো")
         if (Regex("(?:play\\s*button|প্লে\\s*বাটন|प्ले\\s*बटन)", RegexOption.IGNORE_CASE).containsMatchIn(clean) &&
             Regex("(?:click|tap|press|চাপো|ক্লিক|ট্যাপ|दबाओ|क्लिक)", RegexOption.IGNORE_CASE).containsMatchIn(clean)
         ) {
             return VoiceCommand.ClickYouTubeVideo(index = null, targetHint = "play_button")
+        }
+
+        // Resume / Play current video ("ভিডিওটি Play করো", "ভিডিও আবার চালাও", "Play the video", "Resume the video")
+        if (Regex("^(?:play|resume)\\s+(?:the\\s+|this\\s+)?video$|^ভিডিও(?:টি|টা)?\\s*(?:(?:play|প্লে|রিজিউম)\\s*করো|আবার\\s*চালাও)$|^वीडियो\\s*(?:प्ले|चलाओ|फिर\\s*से\\s*चलाओ)\\s*(?:करो)?$", RegexOption.IGNORE_CASE).matches(clean)) {
+            return VoiceCommand.ClickYouTubeVideo(index = null, targetHint = "play_video")
         }
 
         // Thumbnail click ("এই ভিডিওর Thumbnail-এ ক্লিক করো", "Click this video's thumbnail")

@@ -38,11 +38,17 @@ export interface OutgoingUpdateConfigMessage {
   lang?: SupportedLanguage;
 }
 
+export interface OutgoingPingMessage {
+  type: 'ping';
+  ts: number;
+}
+
 export type OutgoingLiveWsMessage =
   | OutgoingClientTextMessage
   | OutgoingAudioChunkMessage
   | OutgoingInterruptMessage
-  | OutgoingUpdateConfigMessage;
+  | OutgoingUpdateConfigMessage
+  | OutgoingPingMessage;
 
 export interface IncomingLiveWsMessage {
   type:
@@ -57,6 +63,7 @@ export interface IncomingLiveWsMessage {
     | 'session_resumption'
     | 'go_away'
     | 'session_closed'
+    | 'pong'
     | 'error'
     | 'live_init_failed';
   audio?: string;
@@ -71,6 +78,8 @@ export interface IncomingLiveWsMessage {
   code?: string;
   retryable?: boolean;
   timeLeft?: string;
+  reason?: string;
+  ts?: number;
 }
 
 /**
@@ -239,13 +248,97 @@ export function upsertUserSpeechTurnMessage(
   return [...messages, newUserMsg];
 }
 
+export const HEALTHY_SESSION_RESET_MS = 10_000;
+export const CLIENT_WS_PING_INTERVAL_MS = 25_000;
+export const CLIENT_WS_STALE_TIMEOUT_MS = 60_000;
+
 /**
  * Calculates exponential backoff delay in ms for WebSocket reconnection.
+ * Optional jitterFraction (0..0.5) adds bounded symmetric jitter to prevent reconnect storms.
  */
-export function getReconnectDelayMs(attempt: number, baseMs = 1500, maxMs = 15000): number {
+export function getReconnectDelayMs(
+  attempt: number,
+  baseMs = 1500,
+  maxMs = 15000,
+  jitterFraction = 0,
+  randomFn: () => number = Math.random
+): number {
   const safeAttempt = Math.max(0, Math.min(10, attempt));
-  const delay = baseMs * Math.pow(1.6, safeAttempt);
-  return Math.min(maxMs, Math.round(delay));
+  const rawDelay = Math.min(maxMs, Math.round(baseMs * Math.pow(1.6, safeAttempt)));
+  const safeJitter = Math.max(0, Math.min(0.5, jitterFraction));
+  if (safeJitter <= 0) {
+    return rawDelay;
+  }
+  const offset = (randomFn() * 2 - 1) * safeJitter * rawDelay;
+  return Math.max(250, Math.min(maxMs, Math.round(rawDelay + offset)));
+}
+
+/**
+ * Only reset the reconnect attempt counter after the session remained healthy
+ * long enough to avoid tight rapid-drop reconnect loops.
+ */
+export function shouldResetReconnectAttempts(
+  connectedDurationMs: number,
+  thresholdMs: number = HEALTHY_SESSION_RESET_MS
+): boolean {
+  return Number.isFinite(connectedDurationMs) && connectedDurationMs >= thresholdMs;
+}
+
+export interface LiveWsCloseClassification {
+  retryable: boolean;
+  shouldClearHandle: boolean;
+  category: 'normal' | 'service_restart' | 'transient_drop' | 'auth_or_config' | 'unknown';
+  diagnosticSummary: string;
+}
+
+/**
+ * Classifies a WebSocket close code and reason to decide whether automatic
+ * reconnection is safe and whether a stale resumption handle should be discarded.
+ */
+export function classifyLiveWsCloseCode(
+  code?: number,
+  reason?: string
+): LiveWsCloseClassification {
+  const cleanReason = String(reason || '').trim();
+  if (code === 4001 || code === 4003 || code === 1008) {
+    return {
+      retryable: false,
+      shouldClearHandle: true,
+      category: 'auth_or_config',
+      diagnosticSummary: cleanReason || `Connection rejected by server (code ${code}).`,
+    };
+  }
+  if (code === 1012 || code === 1013 || code === 1001) {
+    return {
+      retryable: true,
+      shouldClearHandle: false,
+      category: 'service_restart',
+      diagnosticSummary: cleanReason || `Live session rotated by server (code ${code}).`,
+    };
+  }
+  if (code === 1000) {
+    return {
+      retryable: false,
+      shouldClearHandle: false,
+      category: 'normal',
+      diagnosticSummary: cleanReason || 'Session closed normally.',
+    };
+  }
+  if (code === 1006 || code === 1011 || code === 1014 || code === undefined) {
+    return {
+      retryable: true,
+      shouldClearHandle: /handle|expired|resume/i.test(cleanReason),
+      category: 'transient_drop',
+      diagnosticSummary:
+        cleanReason || `Transient WebSocket disconnect (code ${code ?? 'unknown'}).`,
+    };
+  }
+  return {
+    retryable: true,
+    shouldClearHandle: /handle|expired|resume/i.test(cleanReason),
+    category: 'unknown',
+    diagnosticSummary: cleanReason || `WebSocket closed (code ${code}).`,
+  };
 }
 
 /**

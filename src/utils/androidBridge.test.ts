@@ -7,6 +7,7 @@ import {
   parseNativeBatteryJson,
   parseNativeRuntimeDiagnosticsJson,
   formatInstalledAppDiscoveryLabel,
+  buildNativeVolumePayload,
 } from './androidBridge';
 
 test('detectAndroidRuntimeMode identifies native Android APK bridge', () => {
@@ -142,4 +143,18 @@ test('REGRESSION: formatInstalledAppDiscoveryLabel safely handles undefined/null
   // Malformed JSON and web preview fallback
   assert.equal(parseNativeRuntimeDiagnosticsJson('{broken'), null);
   assert.equal(formatInstalledAppDiscoveryLabel(null, null, false), 'WEB PREVIEW (APK REQUIRED)');
+});
+
+test('buildNativeVolumePayload preserves plain legacy strings for media and encodes JSON for percent/multi-stream', () => {
+  assert.equal(buildNativeVolumePayload('up'), 'up');
+  assert.equal(buildNativeVolumePayload('mute', { stream: 'media' }), 'mute');
+
+  const setRing = JSON.parse(buildNativeVolumePayload('set', { percent: 65, stream: 'ring' }));
+  assert.deepEqual(setRing, { action: 'set', stream: 'ring', percent: 65 });
+
+  const clamped = JSON.parse(buildNativeVolumePayload('set', { percent: 180, stream: 'alarm' }));
+  assert.deepEqual(clamped, { action: 'set', stream: 'alarm', percent: 100 });
+
+  const clampedLow = JSON.parse(buildNativeVolumePayload('set', { percent: -15, stream: 'call' }));
+  assert.deepEqual(clampedLow, { action: 'set', stream: 'call', percent: 0 });
 });
