@@ -848,13 +848,15 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
                       data-testid="settings-gemini-key-input"
                       type={showDraftKey ? 'text' : 'password'}
                       autoComplete="off"
+                      autoCorrect="off"
+                      autoCapitalize="none"
                       spellCheck={false}
                       value={geminiKeyDraft}
                       onChange={(e) => {
                         setGeminiKeyDraft(e.target.value);
                         setKeyFeedback(null);
                       }}
-                      placeholder="Paste your AIza... Gemini API key"
+                      placeholder="Paste your AIza... or AQ.... Gemini API key"
                       className="w-full py-2 pl-3 pr-9 rounded-lg bg-slate-950 border border-cyan-500/40 text-xs text-cyan-100 font-mono focus:outline-none focus:border-cyan-400"
                     />
                     <button

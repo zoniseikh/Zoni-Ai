@@ -132,16 +132,55 @@ class SecureKeyManager(context: Context) {
         private const val KEY_GEMINI_API_KEY = "gemini_api_key_encrypted"
         private const val KEY_ONBOARDING_COMPLETED = "zoni_onboarding_completed"
 
-        private val GEMINI_KEY_PATTERN = Regex("^[A-Za-z0-9_\\-]{20,256}$")
-        private val INLINE_GOOGLE_KEY_REGEX = Regex("AIza[0-9A-Za-z_\\-]{16,}")
+        private val GEMINI_KEY_PATTERN = Regex("^[A-Za-z0-9._\\-~+=]{16,512}$")
+        private val INVISIBLE_CLIPBOARD_CHARS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060\\uFEFF]")
+        private val ENV_KEY_PREFIX_REGEX =
+            Regex("^(?:export\\s+)?(?:VITE_)?(?:GEMINI|GOOGLE|ZONI)?_?API_KEY\\s*=\\s*(.+)$", RegexOption.IGNORE_CASE)
+        private val INLINE_GOOGLE_KEY_REGEX = Regex("AIza[0-9A-Za-z_\\-]{12,}")
+        private val INLINE_AQ_KEY_REGEX = Regex("AQ\\.[0-9A-Za-z._\\-]{12,}")
         private val QUERY_KEY_REGEX = Regex("([?&]key=)[^&\\s\"']+", RegexOption.IGNORE_CASE)
 
+        private fun normalizePastedKey(rawKey: String?): String {
+            var clean = rawKey.orEmpty()
+                .replace(INVISIBLE_CLIPBOARD_CHARS, "")
+                .replace('\u00A0', ' ')
+                .trim()
+
+            val envMatch = ENV_KEY_PREFIX_REGEX.matchEntire(clean)
+            if (envMatch != null && envMatch.groupValues.size > 1) {
+                clean = envMatch.groupValues[1].trim()
+            }
+
+            if (clean.length >= 2 && (
+                    (clean.startsWith("\"") && clean.endsWith("\"")) ||
+                    (clean.startsWith("'") && clean.endsWith("'")) ||
+                    (clean.startsWith("`") && clean.endsWith("`")) ||
+                    (clean.startsWith("\u201C") && clean.endsWith("\u201D")) ||
+                    (clean.startsWith("\u2018") && clean.endsWith("\u2019"))
+                )
+            ) {
+                clean = clean.substring(1, clean.length - 1).trim()
+            }
+            return clean
+        }
+
         fun validateApiKeyFormat(rawKey: String?): ApiKeyValidationResult {
-            val trimmed = rawKey?.trim().orEmpty()
+            val trimmed = normalizePastedKey(rawKey)
             if (trimmed.isBlank()) {
                 return ApiKeyValidationResult(
                     valid = false,
                     error = "Please enter your Gemini API Key."
+                )
+            }
+            if (trimmed.startsWith("http://", ignoreCase = true) ||
+                trimmed.startsWith("https://", ignoreCase = true) ||
+                trimmed.startsWith("ws://", ignoreCase = true) ||
+                trimmed.startsWith("wss://", ignoreCase = true) ||
+                trimmed.contains("://")
+            ) {
+                return ApiKeyValidationResult(
+                    valid = false,
+                    error = "Enter your Gemini API Key (e.g., AIza... or AQ....), not a server URL."
                 )
             }
             if (trimmed.any { it.isWhitespace() }) {
@@ -150,31 +189,23 @@ class SecureKeyManager(context: Context) {
                     error = "Gemini API Key cannot contain spaces or line breaks."
                 )
             }
-            if (trimmed.startsWith("http://", ignoreCase = true) ||
-                trimmed.startsWith("https://", ignoreCase = true)
-            ) {
+            if (trimmed.length < 16 || trimmed.length > 512) {
                 return ApiKeyValidationResult(
                     valid = false,
-                    error = "Enter your Gemini API Key (starts with AIza...), not a server URL."
-                )
-            }
-            if (trimmed.length < 20) {
-                return ApiKeyValidationResult(
-                    valid = false,
-                    error = "Gemini API Key looks too short. Paste the complete key from Google AI Studio."
+                    error = "Gemini API Key length looks invalid. Paste the complete key from Google AI Studio or Google Cloud."
                 )
             }
             if (!GEMINI_KEY_PATTERN.matches(trimmed)) {
                 return ApiKeyValidationResult(
                     valid = false,
-                    error = "Gemini API Key contains unexpected characters."
+                    error = "Gemini API Key contains invalid characters."
                 )
             }
             return ApiKeyValidationResult(valid = true, normalizedKey = trimmed)
         }
 
         fun maskApiKey(rawKey: String?): String {
-            val clean = rawKey?.trim().orEmpty()
+            val clean = normalizePastedKey(rawKey)
             if (clean.isEmpty()) return ""
             if (clean.length <= 8) {
                 return "${clean.take(2)}••••••"
@@ -184,11 +215,12 @@ class SecureKeyManager(context: Context) {
 
         fun sanitizeSecret(message: String?, apiKey: String? = null): String {
             var safe = message.orEmpty()
-            val secret = apiKey?.trim().orEmpty()
+            val secret = normalizePastedKey(apiKey)
             if (secret.length >= 8) {
                 safe = safe.replace(secret, "[REDACTED_API_KEY]")
             }
             safe = INLINE_GOOGLE_KEY_REGEX.replace(safe, "[REDACTED_API_KEY]")
+            safe = INLINE_AQ_KEY_REGEX.replace(safe, "[REDACTED_API_KEY]")
             safe = QUERY_KEY_REGEX.replace(safe, "$1[REDACTED_API_KEY]")
             return safe
         }

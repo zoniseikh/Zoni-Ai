@@ -28,6 +28,17 @@ class GeminiByokConfigTest {
         assertTrue(valid.valid)
         assertEquals(sampleKey, valid.normalizedKey)
 
+        // Google Cloud / Vertex Express Gemini key format (contains dot)
+        val aqKey = "AQ.Ab8RN6AndroidByokTestKey000000009876"
+        val validAq = SecureKeyManager.validateApiKeyFormat("\uFEFF\"$aqKey\u200B\"")
+        assertTrue(validAq.valid)
+        assertEquals(aqKey, validAq.normalizedKey)
+
+        // Env-prefixed paste
+        val fromEnv = SecureKeyManager.validateApiKeyFormat("GEMINI_API_KEY=$sampleKey")
+        assertTrue(fromEnv.valid)
+        assertEquals(sampleKey, fromEnv.normalizedKey)
+
         assertFalse(SecureKeyManager.validateApiKeyFormat("").valid)
         assertFalse(SecureKeyManager.validateApiKeyFormat("   ").valid)
         assertFalse(SecureKeyManager.validateApiKeyFormat("https://zoni-backend.example.run.app").valid)
@@ -41,9 +52,13 @@ class GeminiByokConfigTest {
         assertEquals("AIza••••••••1234", masked)
         assertFalse(masked.contains("AndroidByokTestKey"))
 
-        val rawError = "Failed connecting to wss://generativelanguage.googleapis.com/ws?key=$sampleKey using $sampleKey"
+        val aqKey = "AQ.Ab8RN6AndroidByokTestKey000000009876"
+        assertEquals("AQ.A••••••••9876", SecureKeyManager.maskApiKey(aqKey))
+
+        val rawError = "Failed connecting to wss://generativelanguage.googleapis.com/ws?key=$sampleKey using $sampleKey and $aqKey"
         val safe = SecureKeyManager.sanitizeSecret(rawError, sampleKey)
         assertFalse(safe.contains(sampleKey))
+        assertFalse(safe.contains(aqKey))
         assertTrue(safe.contains("[REDACTED_API_KEY]"))
     }
 

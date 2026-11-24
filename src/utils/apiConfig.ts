@@ -70,19 +70,59 @@ export function isNativeAndroidWebShell(
 }
 
 /**
+ * Cleans common mobile/desktop clipboard artifacts around a pasted Gemini API key
+ * (invisible zero-width chars, BOM, non-breaking spaces, surrounding quotes, or
+ * `GEMINI_API_KEY=` / `API_KEY=` env prefixes) without altering valid key characters.
+ */
+function normalizePastedGeminiKey(rawKey: string | null | undefined): string {
+  let clean = String(rawKey || '')
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '')
+    .replace(/\u00A0/g, ' ')
+    .trim();
+
+  // Strip common .env / shell variable prefixes (e.g. GEMINI_API_KEY=AIza...)
+  const envPrefixMatch = /^(?:export\s+)?(?:VITE_)?(?:GEMINI|GOOGLE|ZONI)?_?API_KEY\s*=\s*(.+)$/i.exec(clean);
+  if (envPrefixMatch && envPrefixMatch[1]) {
+    clean = envPrefixMatch[1].trim();
+  }
+
+  // Strip matching surrounding straight/smart quotes or backticks
+  if (
+    clean.length >= 2 &&
+    ((clean.startsWith('"') && clean.endsWith('"')) ||
+      (clean.startsWith("'") && clean.endsWith("'")) ||
+      (clean.startsWith('`') && clean.endsWith('`')) ||
+      (clean.startsWith('“') && clean.endsWith('”')) ||
+      (clean.startsWith('‘') && clean.endsWith('’')))
+  ) {
+    clean = clean.slice(1, -1).trim();
+  }
+
+  return clean;
+}
+
+/**
  * Validates the syntax/shape of a user-provided Google Gemini API key before saving.
- * Does NOT call the network; network verification happens in `verifyDirectGeminiApiKey`.
+ * Accepts all official Google Gemini API key formats (both Google AI Studio `AIza...`
+ * keys and Google Cloud / Vertex Express `AQ....` keys containing dots).
+ * Does NOT call the network; live key verification happens in `verifyDirectGeminiApiKey`.
  */
 export function validateGeminiApiKeyFormat(rawKey: string | null | undefined): {
   valid: boolean;
   normalizedKey?: string;
   error?: string;
 } {
-  const trimmed = String(rawKey || '').trim();
+  const trimmed = normalizePastedGeminiKey(rawKey);
   if (!trimmed) {
     return {
       valid: false,
       error: 'Please enter your Gemini API key.',
+    };
+  }
+  if (/^(?:https?|wss?):\/\//i.test(trimmed) || trimmed.includes('://')) {
+    return {
+      valid: false,
+      error: 'Enter your Gemini API key (e.g., AIza... or AQ....), not a server URL.',
     };
   }
   if (/\s/.test(trimmed)) {
@@ -91,22 +131,16 @@ export function validateGeminiApiKeyFormat(rawKey: string | null | undefined): {
       error: 'Gemini API keys cannot contain spaces or line breaks.',
     };
   }
-  if (trimmed.length < 20 || trimmed.length > 256) {
+  if (trimmed.length < 16 || trimmed.length > 512) {
     return {
       valid: false,
-      error: 'Gemini API key length looks invalid. Paste the full key from Google AI Studio.',
+      error: 'Gemini API key length looks invalid. Paste the full key from Google AI Studio or Google Cloud.',
     };
   }
-  if (!/^[A-Za-z0-9_\-]+$/.test(trimmed)) {
+  if (!/^[A-Za-z0-9._\-~+=]+$/.test(trimmed)) {
     return {
       valid: false,
       error: 'Gemini API key contains invalid characters.',
-    };
-  }
-  if (!trimmed.startsWith('AIza')) {
-    return {
-      valid: false,
-      error: 'Google Gemini API keys typically start with "AIza". Please check your key.',
     };
   }
   return {
@@ -120,7 +154,7 @@ export function validateGeminiApiKeyFormat(rawKey: string | null | undefined): {
  * saved API key is never shown in UI, diagnostics, or logs after saving.
  */
 export function maskGeminiApiKey(rawKey: string | null | undefined): string {
-  const clean = String(rawKey || '').trim();
+  const clean = normalizePastedGeminiKey(rawKey);
   if (!clean) return '';
   if (clean.length <= 8) {
     return `${clean.slice(0, 2)}••••`;
@@ -149,8 +183,9 @@ export function sanitizeGeminiSecret(
     text = text.split(explicitKey.trim()).join('[REDACTED_API_KEY]');
   }
 
-  // Redact any Google AIza... API key pattern
+  // Redact Google AI Studio (AIza...) and Google Cloud / Express (AQ....) API key patterns
   text = text.replace(/AIza[0-9A-Za-z_\-]{12,}/g, '[REDACTED_API_KEY]');
+  text = text.replace(/AQ\.[0-9A-Za-z._\-]{12,}/g, '[REDACTED_API_KEY]');
   // Redact key=... query parameter values
   text = text.replace(/([?&]key=)[^&\s"'`]+/gi, '$1[REDACTED_API_KEY]');
   // Redact x-goog-api-key headers if ever echoed

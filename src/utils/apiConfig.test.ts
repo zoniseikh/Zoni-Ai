@@ -93,28 +93,52 @@ function makeMockWindow(opts: {
   return { win, storage, events, getNativeKey: () => nativeKey };
 }
 
-test('validateGeminiApiKeyFormat accepts valid AIza keys and rejects empty, spaces, URLs, and short keys', () => {
+test('validateGeminiApiKeyFormat accepts AIza and AQ. keys, cleans clipboard artifacts, and rejects URLs/spaces/short keys', () => {
   const ok = validateGeminiApiKeyFormat(`  ${VALID_TEST_KEY_1}  `);
   assert.equal(ok.valid, true);
   assert.equal(ok.normalizedKey, VALID_TEST_KEY_1);
 
+  // Google Cloud / Vertex Express Gemini API key format (starts with AQ. and contains a dot)
+  const aqKey = 'AQ.Ab8RN6TestExpressGeminiKey0000000000009876';
+  const okAq = validateGeminiApiKeyFormat(aqKey);
+  assert.equal(okAq.valid, true);
+  assert.equal(okAq.normalizedKey, aqKey);
+
+  // Mobile clipboard artifacts: zero-width spaces, BOM, quotes, and GEMINI_API_KEY= prefix
+  const withBomAndQuotes = validateGeminiApiKeyFormat(`\uFEFF"${VALID_TEST_KEY_1}\u200B"`);
+  assert.equal(withBomAndQuotes.valid, true);
+  assert.equal(withBomAndQuotes.normalizedKey, VALID_TEST_KEY_1);
+
+  const withEnvPrefix = validateGeminiApiKeyFormat(`GEMINI_API_KEY="${aqKey}"`);
+  assert.equal(withEnvPrefix.valid, true);
+  assert.equal(withEnvPrefix.normalizedKey, aqKey);
+
+  // Reject empty, internal spaces, server URLs, short strings, and invalid symbols
   assert.equal(validateGeminiApiKeyFormat('').valid, false);
   assert.equal(validateGeminiApiKeyFormat('   ').valid, false);
   assert.equal(validateGeminiApiKeyFormat('AIzaSyWith Space Inside 123456789').valid, false);
-  assert.equal(validateGeminiApiKeyFormat('https://zoni-backend.example.run.app').valid, false);
+
+  const urlErr = validateGeminiApiKeyFormat('https://zoni-backend.example.run.app');
+  assert.equal(urlErr.valid, false);
+  assert.ok(urlErr.error && /not a server URL/i.test(urlErr.error));
+
   assert.equal(validateGeminiApiKeyFormat('AIzaShort').valid, false);
-  assert.equal(validateGeminiApiKeyFormat('not-a-google-key-1234567890123456').valid, false);
+  assert.equal(validateGeminiApiKeyFormat('AIzaSyInvalid$Chars<>1234567890').valid, false);
 });
 
-test('maskGeminiApiKey and sanitizeGeminiSecret never reveal the full saved API key', () => {
+test('maskGeminiApiKey and sanitizeGeminiSecret never reveal the full saved API key (AIza or AQ.)', () => {
   const masked = maskGeminiApiKey(VALID_TEST_KEY_1);
   assert.equal(masked, 'AIza••••••••1234');
   assert.ok(!masked.includes('TestExampleKey'));
 
-  const rawErr = `WebSocket wss://generativelanguage.googleapis.com/ws?key=${VALID_TEST_KEY_1} failed with x-goog-api-key: ${VALID_TEST_KEY_1} (${VALID_TEST_KEY_2})`;
+  const aqKey = 'AQ.Ab8RN6TestExpressGeminiKey0000000000009876';
+  assert.equal(maskGeminiApiKey(aqKey), 'AQ.A••••••••9876');
+
+  const rawErr = `WebSocket wss://generativelanguage.googleapis.com/ws?key=${VALID_TEST_KEY_1} failed with x-goog-api-key: ${VALID_TEST_KEY_1} (${VALID_TEST_KEY_2}) and ${aqKey}`;
   const scrubbed = sanitizeGeminiSecret(rawErr, VALID_TEST_KEY_1);
   assert.ok(!scrubbed.includes(VALID_TEST_KEY_1));
   assert.ok(!scrubbed.includes(VALID_TEST_KEY_2));
+  assert.ok(!scrubbed.includes(aqKey));
   assert.ok(scrubbed.includes('[REDACTED_API_KEY]'));
 });
 

@@ -815,6 +815,8 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                       data-testid="setup-gemini-key-input"
                       type={showDraftKey ? 'text' : 'password'}
                       autoComplete="off"
+                      autoCorrect="off"
+                      autoCapitalize="none"
                       spellCheck={false}
                       value={geminiKeyInput}
                       onChange={(e) => {
@@ -828,7 +830,7 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                           target.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         }, 250);
                       }}
-                      placeholder="AIzaSy..."
+                      placeholder="AIzaSy... or AQ...."
                       className="w-full py-2.5 pl-3.5 pr-10 rounded-xl bg-slate-950 border border-cyan-500/40 text-xs sm:text-sm text-cyan-100 font-mono placeholder:text-slate-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50"
                     />
                     <button
