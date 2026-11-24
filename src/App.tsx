@@ -2904,7 +2904,7 @@ export default function App() {
         const inputCtx = new AudioCtxClass({ sampleRate: 16000 });
         inputAudioCtxRef.current = inputCtx;
         const source = inputCtx.createMediaStreamSource(stream);
-        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+        const processor = inputCtx.createScriptProcessor(2048, 1, 1);
         scriptProcessorRef.current = processor;
 
         processor.onaudioprocess = (e) => {
