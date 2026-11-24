@@ -422,8 +422,8 @@ function mapGeminiError(
       retryable: false,
       message:
         lang === 'bn-BD'
-          ? 'সার্ভারে GEMINI_API_KEY কনফিগার করা নেই। অনুগ্রহ করে Cloud Run বা ব্যাকএন্ডে GEMINI_API_KEY সেট করুন।'
-          : 'GEMINI_API_KEY is not configured on the backend server. Please configure GEMINI_API_KEY on your hosted backend.',
+          ? 'সার্ভারে GEMINI_API_KEY কনফিগার করা নেই। অনুগ্রহ করে Settings > Secrets থেকে API key সেট করুন।'
+          : 'GEMINI_API_KEY is not configured on the server. Please check the API key in Settings > Secrets.',
     };
   }
   if (lower.includes('api_key_invalid') || lower.includes('api key not valid') || lower.includes('permission_denied') || lower.includes('401') || lower.includes('403')) {
@@ -433,8 +433,8 @@ function mapGeminiError(
       retryable: false,
       message:
         lang === 'bn-BD'
-          ? 'সার্ভারের Gemini API Key সঠিক নয় বা অনুমোদিত নয়। অনুগ্রহ করে ব্যাকএন্ড কী যাচাই করুন।'
-          : 'Server Gemini API key is invalid or unauthorized. Please verify GEMINI_API_KEY on the backend server.',
+          ? 'সার্ভারের Gemini API Key সঠিক নয় বা অনুমোদিত নয়। অনুগ্রহ করে Settings > Secrets থেকে যাচাই করুন।'
+          : 'Server Gemini API key is invalid or unauthorized. Please check your API key in Settings > Secrets.',
     };
   }
   if (lower.includes('503') || lower.includes('unavailable') || lower.includes('high demand') || lower.includes('overloaded')) {
@@ -838,13 +838,17 @@ app.post('/api/chat/tool-result', async (req: Request, res: Response) => {
   }
 });
 
+const ALLOWED_TTS_VOICES = new Set(['Kore', 'Aoede', 'Puck', 'Charon', 'Fenrir', 'Zephyr']);
+
 // High-Fidelity Text-to-Speech Endpoint using gemini-3.8-flash-lite-tts
 app.post('/api/tts', async (req: Request, res: Response) => {
   try {
-    const { text, voice = 'Kore', lang = 'bn-BD' } = req.body;
-    if (!text) {
+    const { text, voice = 'Kore', lang = 'bn-BD' } = req.body || {};
+    const cleanText = typeof text === 'string' ? text.trim().slice(0, 2000) : '';
+    if (!cleanText) {
       return res.status(400).json({ error: 'Text is required for TTS.' });
     }
+    const safeVoice = ALLOWED_TTS_VOICES.has(String(voice)) ? String(voice) : 'Kore';
 
     const styleDescription =
       lang === 'bn-BD'
@@ -861,8 +865,11 @@ app.post('/api/tts', async (req: Request, res: Response) => {
           role: 'user',
           parts: [
             {
-              text: `${styleDescription}. Speak: "${text}"`,
-            },
+              text: cleanText,
+              speechMetadata: {
+                style: styleDescription,
+              },
+            } as any,
           ],
         },
       ],
@@ -870,27 +877,29 @@ app.post('/api/tts', async (req: Request, res: Response) => {
         responseModalities: ['AUDIO'],
         speechConfig: {
           voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: voice },
+            prebuiltVoiceConfig: { voiceName: safeVoice },
           },
         },
       },
     });
 
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    const inlineAudio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+    const base64Audio = inlineAudio?.data;
     if (!base64Audio) {
       return res.status(500).json({ error: 'Audio synthesis did not return audio data.' });
     }
 
     res.json({
       audio: base64Audio,
-      mimeType: 'audio/wav',
+      mimeType: inlineAudio?.mimeType || 'audio/wav',
     });
   } catch (err: any) {
-    const cleanErr = sanitizeErrorMessage(err);
-    console.warn('Gemini audio synthesis notice:', cleanErr);
-    res.status(500).json({
+    const mapped = mapGeminiError(err, String(req.body?.lang || 'bn-BD'));
+    console.warn('Gemini audio synthesis notice:', mapped.message);
+    res.status(mapped.status).json({
       audio: null,
-      error: 'Audio generation failed. Local TTS fallback is disabled.',
+      code: mapped.code,
+      error: mapped.message || 'Audio generation failed.',
     });
   }
 });
@@ -937,7 +946,9 @@ function sanitizeErrorMessage(err: any, fallback: string = 'Unknown Live API err
   if (apiKey && apiKey.length > 4) {
     cleaned = cleaned.split(apiKey).join('[REDACTED]');
   }
-  return cleaned.replace(/key=[A-Za-z0-9_\-]+/gi, 'key=[REDACTED]');
+  cleaned = cleaned.replace(/AIza[0-9A-Za-z_\-]{12,}/g, '[REDACTED]');
+  cleaned = cleaned.replace(/AQ\.[0-9A-Za-z._\-]{12,}/g, '[REDACTED]');
+  return cleaned.replace(/key=[A-Za-z0-9._\-~+=]+/gi, 'key=[REDACTED]');
 }
 
 // Gemini Live real-time bidirectional voice + Chat Box connection handler
@@ -1320,16 +1331,26 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
               }
             }
 
-            // 2. Real-time Spoken Input Audio Transcription (User Spoke)
-            const userTranscription =
+            // 2. Real-time Spoken Input Audio Transcription (separate interim vs final)
+            const finalUserText = String(
               message.serverContent?.inputTranscription?.text ||
+                message.inputTranscription?.text ||
+                ''
+            ).trim();
+            const interimUserText = String(
               message.serverContent?.interimInputTranscription?.text ||
-              message.inputTranscription?.text;
+                message.interimInputTranscription?.text ||
+                ''
+            ).trim();
+
+            const userTranscription = finalUserText || interimUserText;
+            const isFinalTranscript = Boolean(finalUserText);
 
             if (userTranscription) {
               sendToClient({
                 type: 'user_transcript',
                 text: userTranscription,
+                isFinal: isFinalTranscript,
                 turnId: userSpeechTurnId,
               });
 

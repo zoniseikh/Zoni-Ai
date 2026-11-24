@@ -60,6 +60,7 @@ export interface IncomingLiveWsMessage {
     | 'interrupted'
     | 'turnComplete'
     | 'flashlight'
+    | 'native_tool_request'
     | 'session_resumption'
     | 'go_away'
     | 'session_closed'
@@ -68,8 +69,12 @@ export interface IncomingLiveWsMessage {
     | 'live_init_failed';
   audio?: string;
   text?: string;
+  isFinal?: boolean;
   turnId?: number;
   enable?: boolean;
+  toolCallId?: string;
+  actionType?: string;
+  arguments?: Record<string, unknown>;
   newHandle?: string;
   resumable?: boolean;
   resumed?: boolean;

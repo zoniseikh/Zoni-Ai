@@ -13,10 +13,13 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { AlertTriangle, PhoneIncoming, PhoneOff, RefreshCw, Settings2, X } from 'lucide-react';
 import { OfflineIndicator } from './components/PWAInstallButton';
 import {
+  FastEndOfSpeechDetector,
   LiveAudioPlayer,
+  computePcmRms,
   pcm16ToBase64,
   playProceduralSfx,
   getAudioContext,
+  resampleFloat32Pcm,
   stopAllBrowserSpeech,
 } from './utils/audio';
 import {
@@ -52,6 +55,7 @@ import {
   DIRECT_LIVE_MODEL_CANDIDATES,
   analyzeScreenDirectGemini,
   buildDirectLiveAudioMessage,
+  buildDirectLiveAudioStreamEndMessage,
   buildDirectLiveClientTextMessage,
   buildDirectLiveSetupMessage,
   buildDirectLiveToolResponseMessage,
@@ -570,6 +574,9 @@ export default function App() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const useFastVadConfigRef = useRef<boolean>(true);
+  const fastEosDetectorRef = useRef<FastEndOfSpeechDetector>(new FastEndOfSpeechDetector());
+  const isAssistantSpeakingRef = useRef<boolean>(false);
   const lastFlashlightActionRef = useRef<{ payload: string; time: number } | null>(null);
   const liveToolsReadyRef = useRef<boolean>(false);
   const liveToolExecutedInTurnRef = useRef<boolean>(false);
@@ -1968,6 +1975,7 @@ export default function App() {
                 systemInstruction,
                 resumptionHandle: resumptionHandleRef.current,
                 includeTools: true,
+                includeFastVad: useFastVadConfigRef.current,
               });
               ws.send(JSON.stringify(setupPayload));
             } catch (setupErr) {
@@ -2285,7 +2293,7 @@ export default function App() {
                         ]);
                       }
                     })();
-                  }, 300);
+                  }, ev.isFinal ? 120 : 300);
 
                   if (isFlashlightOnCommand(ev.text)) {
                     if (
@@ -2320,6 +2328,8 @@ export default function App() {
                 if (ev.type === 'audio' && ev.audio) {
                   clearTurnTimeout();
                   receivedAudioInTurnRef.current = true;
+                  isAssistantSpeakingRef.current = true;
+                  fastEosDetectorRef.current.reset();
                   if (pendingChatFallbackRef.current) {
                     pendingChatFallbackRef.current.answered = true;
                   }
@@ -2376,6 +2386,8 @@ export default function App() {
                 if (ev.type === 'interrupted') {
                   clearTurnTimeout();
                   stopAllSpeechPlayback();
+                  isAssistantSpeakingRef.current = false;
+                  fastEosDetectorRef.current.reset();
                   receivedAudioInTurnRef.current = false;
                   currentTurnIdRef.current += 1;
                   setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
@@ -2384,6 +2396,8 @@ export default function App() {
 
                 if (ev.type === 'turn_complete') {
                   clearTurnTimeout();
+                  isAssistantSpeakingRef.current = false;
+                  fastEosDetectorRef.current.reset();
                   currentTurnIdRef.current += 1;
                   userSpeechTurnIdRef.current += 1;
                   receivedAudioInTurnRef.current = false;
@@ -2399,7 +2413,7 @@ export default function App() {
 
                   setTimeout(() => {
                     setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
-                  }, 400);
+                  }, 120);
                 }
               }
             } catch (e) {
@@ -2421,6 +2435,25 @@ export default function App() {
 
             const cleanReason = sanitizeGeminiSecret(closeEvent?.reason || '', apiKey);
             const closeInfo = classifyLiveWsCloseCode(closeEvent?.code, cleanReason);
+
+            // If a Live model rejected fast VAD config before setupComplete, retry once without it
+            const vadConfigRejected =
+              !wasReady &&
+              useFastVadConfigRef.current &&
+              (closeEvent?.code === 1007 || closeEvent?.code === 1008) &&
+              /realtimeInputConfig|automaticActivityDetection|Invalid JSON payload/i.test(cleanReason);
+
+            if (vadConfigRejected) {
+              useFastVadConfigRef.current = false;
+              setWsStatus('reconnecting');
+              settlePendingHandshake(new Error('Adjusting Gemini Live VAD configuration...'));
+              reconnectTimerRef.current = setTimeout(() => {
+                if (!isUnmountedRef.current) {
+                  connectSharedLiveWs(false).catch(() => {});
+                }
+              }, 200);
+              return;
+            }
 
             // If a Live model wasn't found/supported before setupComplete, try next Live candidate once
             const modelNotSupported =
@@ -2879,6 +2912,7 @@ export default function App() {
             sampleRate: 16000,
             echoCancellation: true,
             noiseSuppression: true,
+            autoGainControl: true,
           },
         });
 
@@ -2901,14 +2935,32 @@ export default function App() {
         mediaStreamRef.current = stream;
 
         const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
-        const inputCtx = new AudioCtxClass({ sampleRate: 16000 });
+        let inputCtx: AudioContext;
+        try {
+          inputCtx = new AudioCtxClass({ sampleRate: 16000, latencyHint: 'interactive' });
+        } catch {
+          inputCtx = new AudioCtxClass({ sampleRate: 16000 });
+        }
+        if (inputCtx.state === 'suspended') {
+          await inputCtx.resume().catch(() => {});
+        }
         inputAudioCtxRef.current = inputCtx;
+        const actualSampleRate = inputCtx.sampleRate || 16000;
+        // ~43–64ms ultra-low-latency audio frames regardless of Android hardware sample rate
+        const processorBufferSize = actualSampleRate <= 24000 ? 1024 : 2048;
         const source = inputCtx.createMediaStreamSource(stream);
-        const processor = inputCtx.createScriptProcessor(2048, 1, 1);
+        const processor = inputCtx.createScriptProcessor(processorBufferSize, 1, 1);
+        const silentSink = inputCtx.createGain();
+        silentSink.gain.value = 0;
         scriptProcessorRef.current = processor;
+        fastEosDetectorRef.current.reset();
+        isAssistantSpeakingRef.current = false;
 
         processor.onaudioprocess = (e) => {
-          if (isMicMutedRef.current) return;
+          if (isMicMutedRef.current) {
+            fastEosDetectorRef.current.reset();
+            return;
+          }
           if (
             !wsRef.current ||
             wsRef.current.readyState !== WebSocket.OPEN ||
@@ -2922,10 +2974,27 @@ export default function App() {
             );
             return;
           }
-          const channelData = e.inputBuffer.getChannelData(0);
-          const base64Audio = pcm16ToBase64(channelData);
+          const rawChannelData = e.inputBuffer.getChannelData(0);
+          // Always resample to exact 16,000 Hz PCM so Android WebView 48kHz hardware
+          // mics never stretch speech 3x slower or break Gemini Live VAD.
+          const pcm16k = resampleFloat32Pcm(rawChannelData, actualSampleRate, 16000);
+          const base64Audio = pcm16ToBase64(pcm16k);
           try {
             wsRef.current.send(JSON.stringify(buildDirectLiveAudioMessage(base64Audio)));
+
+            const frameDurationMs = (pcm16k.length / 16000) * 1000;
+            const rms = computePcmRms(pcm16k);
+            const assistantTalking =
+              isAssistantSpeakingRef.current || Boolean(liveAudioPlayerRef.current?.isPlaying());
+            const vad = fastEosDetectorRef.current.processFrame(
+              rms,
+              frameDurationMs,
+              assistantTalking
+            );
+            if (vad.shouldSignalAudioStreamEnd && wsRef.current?.readyState === WebSocket.OPEN) {
+              // Immediately flush Gemini Live's audio buffer so Zoni replies right away
+              wsRef.current.send(JSON.stringify(buildDirectLiveAudioStreamEndMessage()));
+            }
           } catch {
             stopVoiceCapture(true);
             setAssistantState('error');
@@ -2934,7 +3003,8 @@ export default function App() {
         };
 
         source.connect(processor);
-        processor.connect(inputCtx.destination);
+        processor.connect(silentSink);
+        silentSink.connect(inputCtx.destination);
 
         setIsLiveActive(true);
         isLiveActiveRef.current = true;

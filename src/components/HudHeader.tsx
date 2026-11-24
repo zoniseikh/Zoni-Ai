@@ -96,20 +96,6 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
   };
 
   const liveBadge = (() => {
-    if (backendHealth?.checked && !backendHealth.geminiConfigured) {
-      const isMissing = backendHealth.statusText === 'API KEY REQUIRED';
-      return {
-        text: isMissing ? 'API KEY REQUIRED' : backendHealth.statusText || 'KEY ISSUE',
-        cls: isMissing
-          ? 'border-amber-500/40 text-amber-300'
-          : 'border-rose-500/40 text-rose-300',
-        icon: (
-          <ShieldAlert
-            className={`w-3.5 h-3.5 ${isMissing ? 'text-amber-400' : 'text-rose-400'}`}
-          />
-        ),
-      };
-    }
     if (wsStatus === 'connected') {
       return {
         text: 'GEMINI LIVE ONLINE',
@@ -124,15 +110,29 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
         icon: <Radio className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />,
       };
     }
+    if (backendHealth?.checked && !backendHealth.reachable) {
+      return {
+        text: backendHealth.statusText || 'SERVER OFFLINE',
+        cls: 'border-rose-500/40 text-rose-300',
+        icon: <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />,
+      };
+    }
+    if (backendHealth?.checked && !backendHealth.geminiConfigured) {
+      return {
+        text: backendHealth.statusText || 'AI SERVICE STANDBY',
+        cls: 'border-amber-500/40 text-amber-300',
+        icon: <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />,
+      };
+    }
     if (wsStatus === 'error') {
       return {
-        text: 'DIRECT CHAT READY',
+        text: 'CHAT READY',
         cls: 'border-amber-500/40 text-amber-300',
         icon: <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />,
       };
     }
     return {
-      text: 'LIVE STANDBY',
+      text: backendHealth?.geminiConfigured ? 'AI READY' : 'LIVE STANDBY',
       cls: 'border-cyan-500/30 text-cyan-300',
       icon: <ShieldCheck className="w-3.5 h-3.5 text-cyan-400" />,
     };
@@ -197,7 +197,7 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
           type="button"
           onClick={() => onOpenPermissionsModal?.()}
           className={`flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-900/60 border transition-colors hover:brightness-110 ${liveBadge.cls}`}
-          title="Click to manage your Gemini API Key & Live connection"
+          title="Click to check Gemini Live & permissions setup"
         >
           {liveBadge.icon}
           <span className="font-mono text-[11px]">{liveBadge.text}</span>
@@ -302,7 +302,7 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
               if (vitals.soundFxEnabled) playProceduralSfx('click');
               onOpenPermissionsModal();
             }}
-            aria-label="Open Gemini API Key and Permissions Setup"
+            aria-label="Open Connection and Permissions Setup"
             className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg border text-xs font-hud tracking-wider transition-all ${
               permissionsReport?.microphone === 'denied' ||
               permissionsReport?.geolocation === 'denied' ||
@@ -312,7 +312,7 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
                 ? 'border-emerald-500/50 bg-emerald-950/40 text-emerald-300 shadow-[0_0_10px_rgba(16,185,129,0.2)]'
                 : 'border-amber-500/50 bg-amber-950/40 text-amber-300 shadow-[0_0_10px_rgba(245,158,11,0.2)]'
             }`}
-            title="Gemini API Key & Permissions Hub: Configure your Gemini API Key, Microphone, Location, and Notifications"
+            title="Permissions & Setup Hub: Check Connection Status, Microphone, Location, and Notifications"
           >
             <ShieldCheck className="w-3.5 h-3.5 text-cyan-400" />
             <span className="hidden lg:inline">PERMISSIONS</span>

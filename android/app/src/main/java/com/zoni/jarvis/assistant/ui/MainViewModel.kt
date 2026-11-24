@@ -232,6 +232,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             is LiveServerEvent.AudioChunk -> {
                 val st = _uiState.value
                 if (!st.settings.voiceMuted && (st.isLiveActive || st.settings.voiceAutoPlay)) {
+                    audioEngine.setAssistantSpeaking(true)
                     _uiState.update { it.copy(assistantState = AssistantState.SPEAKING) }
                     audioEngine.playPcm24kBase64(event.base64Pcm24k)
                 }
@@ -266,13 +267,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             is LiveServerEvent.Interrupted -> {
+                audioEngine.setAssistantSpeaking(false)
                 audioEngine.stopAllPlayback()
+                audioEngine.resetEndOfSpeechDetector()
                 currentAssistantTurnId = event.turnId + 1
                 _uiState.update {
                     it.copy(assistantState = if (it.isLiveActive) AssistantState.LISTENING else AssistantState.IDLE)
                 }
             }
             is LiveServerEvent.TurnComplete -> {
+                audioEngine.setAssistantSpeaking(false)
+                audioEngine.resetEndOfSpeechDetector()
                 currentAssistantTurnId = event.turnId + 1
                 userSpeechTurnId += 1
                 _uiState.update {
@@ -316,7 +321,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             return false
         }
-        val started = audioEngine.startMicrophoneCapture { base64Chunk ->
+        val started = audioEngine.startMicrophoneCapture(
+            onSpeechEnded = { liveClient.sendAudioStreamEnd() }
+        ) { base64Chunk ->
             liveClient.sendAudioChunk(base64Chunk)
         }
         if (started) {

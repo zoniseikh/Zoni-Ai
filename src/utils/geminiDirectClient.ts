@@ -1107,6 +1107,7 @@ export function buildDirectLiveSetupMessage(options: {
   systemInstruction: string;
   resumptionHandle?: string;
   includeTools?: boolean;
+  includeFastVad?: boolean;
 }): Record<string, any> {
   const rawModel = (options.model || DIRECT_LIVE_MODEL_CANDIDATES[0]).trim();
   const qualifiedModel = rawModel.startsWith('models/') ? rawModel : `models/${rawModel}`;
@@ -1133,6 +1134,18 @@ export function buildDirectLiveSetupMessage(options: {
       : {},
   };
 
+  if (options.includeFastVad !== false) {
+    setup.realtimeInputConfig = {
+      automaticActivityDetection: {
+        disabled: false,
+        startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
+        endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
+        prefixPaddingMs: 100,
+        silenceDurationMs: 300,
+      },
+    };
+  }
+
   if (options.includeTools !== false) {
     setup.tools = [
       {
@@ -1151,6 +1164,19 @@ export function buildDirectLiveAudioMessage(base64Pcm16k: string): Record<string
         mimeType: 'audio/pcm;rate=16000',
         data: base64Pcm16k,
       },
+    },
+  };
+}
+
+/**
+ * Signals to Google Gemini Live that the user's current audio utterance has
+ * paused/ended so the server flushes its audio buffer and begins replying
+ * immediately instead of waiting for long ambient silence timeouts.
+ */
+export function buildDirectLiveAudioStreamEndMessage(): Record<string, any> {
+  return {
+    realtimeInput: {
+      audioStreamEnd: true,
     },
   };
 }

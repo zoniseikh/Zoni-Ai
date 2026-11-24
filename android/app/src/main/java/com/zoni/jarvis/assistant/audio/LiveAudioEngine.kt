@@ -35,6 +35,8 @@ class LiveAudioEngine(
     private val onAudioFocusLost: (Int) -> Unit = {}
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val playbackDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val audioManager: AudioManager? =
         context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
@@ -45,6 +47,12 @@ class LiveAudioEngine(
 
     private var audioTrack: AudioTrack? = null
     private val playbackLock = Any()
+
+    @Volatile
+    private var isAssistantSpeakingNow: Boolean = false
+
+    @Volatile
+    private var resetEosRequested: Boolean = false
 
     private var focusRequest: AudioFocusRequest? = null
     private var hasAudioFocus: Boolean = false
@@ -118,8 +126,22 @@ class LiveAudioEngine(
         hasAudioFocus = false
     }
 
+    fun setAssistantSpeaking(speaking: Boolean) {
+        isAssistantSpeakingNow = speaking
+        if (speaking) {
+            resetEosRequested = true
+        }
+    }
+
+    fun resetEndOfSpeechDetector() {
+        resetEosRequested = true
+    }
+
     @SuppressLint("MissingPermission")
-    fun startMicrophoneCapture(onBase64PcmChunk: (String) -> Unit): Boolean {
+    fun startMicrophoneCapture(
+        onSpeechEnded: () -> Unit = {},
+        onBase64PcmChunk: (String) -> Unit
+    ): Boolean {
         stopMicrophoneCapture()
         requestVoiceAudioFocus()
 
@@ -159,6 +181,11 @@ class LiveAudioEngine(
 
             captureJob = scope.launch {
                 val readBuffer = ByteArray(CHUNK_BYTES)
+                var noiseFloor = 0.015f
+                var inSpeech = false
+                var speechAccumMs = 0L
+                var silenceAccumMs = 0L
+
                 while (isActive) {
                     val read = recorder.read(readBuffer, 0, readBuffer.size)
                     if (read > 0 && !isMicMuted) {
@@ -167,7 +194,45 @@ class LiveAudioEngine(
                         val chunk = if (read == readBuffer.size) readBuffer else readBuffer.copyOf(read)
                         val b64 = Base64.encodeToString(chunk, Base64.NO_WRAP)
                         onBase64PcmChunk(b64)
+
+                        // Fast adaptive end-of-speech detection (~380ms post-speech silence)
+                        val frameMs = ((read / 2) * 1000L) / INPUT_SAMPLE_RATE
+                        if (resetEosRequested || isAssistantSpeakingNow) {
+                            inSpeech = false
+                            speechAccumMs = 0L
+                            silenceAccumMs = 0L
+                            resetEosRequested = false
+                        } else {
+                            val startThreshold = maxOf(0.055f, noiseFloor * 2.8f)
+                            val continueThreshold = maxOf(0.035f, noiseFloor * 1.9f)
+                            if (!inSpeech) {
+                                if (amp >= startThreshold) {
+                                    inSpeech = true
+                                    speechAccumMs = frameMs
+                                    silenceAccumMs = 0L
+                                } else {
+                                    noiseFloor = (noiseFloor * 0.94f + amp * 0.06f).coerceIn(0.008f, 0.09f)
+                                }
+                            } else if (amp >= continueThreshold) {
+                                speechAccumMs += frameMs
+                                silenceAccumMs = 0L
+                            } else {
+                                silenceAccumMs += frameMs
+                                if (silenceAccumMs >= 380L) {
+                                    val hadSpeech = speechAccumMs >= 120L
+                                    inSpeech = false
+                                    speechAccumMs = 0L
+                                    silenceAccumMs = 0L
+                                    if (hadSpeech) {
+                                        onSpeechEnded()
+                                    }
+                                }
+                            }
+                        }
                     } else if (isMicMuted) {
+                        inSpeech = false
+                        speechAccumMs = 0L
+                        silenceAccumMs = 0L
                         onAmplitudeChanged(0f)
                     }
                 }
@@ -222,7 +287,7 @@ class LiveAudioEngine(
             )
             if (minBuf <= 0) return null
 
-            val track = AudioTrack.Builder()
+            val trackBuilder = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_ASSISTANT)
@@ -236,9 +301,14 @@ class LiveAudioEngine(
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .build()
                 )
-                .setBufferSizeInBytes(maxOf(minBuf * 2, 16384))
+                .setBufferSizeInBytes(maxOf(minBuf, 4800))
                 .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+            }
+
+            val track = trackBuilder.build()
 
             track.play()
             audioTrack = track
@@ -248,7 +318,7 @@ class LiveAudioEngine(
 
     fun playPcm24kBase64(base64Pcm: String) {
         if (isVoiceMuted || base64Pcm.isBlank()) return
-        scope.launch {
+        scope.launch(playbackDispatcher) {
             try {
                 val pcmBytes = Base64.decode(base64Pcm, Base64.DEFAULT)
                 if (pcmBytes.isEmpty()) return@launch
@@ -308,7 +378,7 @@ class LiveAudioEngine(
     companion object {
         const val INPUT_SAMPLE_RATE = 16000
         const val OUTPUT_SAMPLE_RATE = 24000
-        // ~128ms chunks at 16kHz 16-bit mono (4096 bytes)
-        const val CHUNK_BYTES = 4096
+        // ~64ms low-latency chunks at 16kHz 16-bit mono (2048 bytes)
+        const val CHUNK_BYTES = 2048
     }
 }

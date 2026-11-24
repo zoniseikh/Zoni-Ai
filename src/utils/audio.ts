@@ -4,14 +4,21 @@
 
 let sharedAudioContext: AudioContext | null = null;
 let sharedAnalyser: AnalyserNode | null = null;
+let sharedAnalyserConnected = false;
 
 export function getAudioContext(): AudioContext {
   if (!sharedAudioContext || sharedAudioContext.state === 'closed') {
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-    sharedAudioContext = new AudioContextClass();
+    try {
+      sharedAudioContext = new AudioContextClass({ latencyHint: 'interactive' });
+    } catch {
+      sharedAudioContext = new AudioContextClass();
+    }
+    sharedAnalyser = null;
+    sharedAnalyserConnected = false;
   }
   if (sharedAudioContext.state === 'suspended') {
-    sharedAudioContext.resume();
+    sharedAudioContext.resume().catch(() => {});
   }
   return sharedAudioContext;
 }
@@ -22,6 +29,7 @@ export function getAudioAnalyser(): AnalyserNode {
     sharedAnalyser = ctx.createAnalyser();
     sharedAnalyser.fftSize = 64;
     sharedAnalyser.smoothingTimeConstant = 0.8;
+    sharedAnalyserConnected = false;
   }
   return sharedAnalyser;
 }
@@ -115,6 +123,131 @@ export function playProceduralSfx(type: 'click' | 'boot' | 'pulse' | 'love' | 'a
 }
 
 /**
+ * Resamples Float32 mono PCM to targetSampleRate (default 16000 Hz).
+ * Crucial for Android WebView where `new AudioContext({ sampleRate: 16000 })`
+ * frequently falls back to hardware 48000 Hz or 44100 Hz; without resampling,
+ * Gemini Live receives 3x stretched slow-motion audio and cannot detect
+ * end-of-speech promptly.
+ */
+export function resampleFloat32Pcm(
+  samples: Float32Array,
+  sourceSampleRate: number,
+  targetSampleRate: number = 16000
+): Float32Array {
+  if (
+    !samples.length ||
+    !Number.isFinite(sourceSampleRate) ||
+    sourceSampleRate <= 0 ||
+    Math.abs(sourceSampleRate - targetSampleRate) < 1
+  ) {
+    return samples;
+  }
+
+  const ratio = sourceSampleRate / targetSampleRate;
+  const outputLength = Math.max(1, Math.round(samples.length / ratio));
+  const result = new Float32Array(outputLength);
+
+  for (let i = 0; i < outputLength; i++) {
+    const srcPos = i * ratio;
+    const idx0 = Math.floor(srcPos);
+    const idx1 = Math.min(idx0 + 1, samples.length - 1);
+    const frac = srcPos - idx0;
+    result[i] = samples[idx0] * (1 - frac) + samples[idx1] * frac;
+  }
+
+  return result;
+}
+
+/**
+ * Computes normalized RMS energy (0..1) of a Float32 PCM buffer.
+ */
+export function computePcmRms(samples: Float32Array): number {
+  if (!samples.length) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    sumSq += s * s;
+  }
+  return Math.sqrt(sumSq / samples.length);
+}
+
+/**
+ * Lightweight adaptive end-of-speech detector for Gemini Live voice turns.
+ * Tracks room ambient noise floor and fires `shouldSignalAudioStreamEnd: true`
+ * once per user utterance as soon as ~400ms of post-speech silence occurs so
+ * Gemini Live flushes its buffer and starts replying immediately.
+ */
+export class FastEndOfSpeechDetector {
+  private noiseFloor = 0.004;
+  private inSpeech = false;
+  private speechAccumMs = 0;
+  private silenceAccumMs = 0;
+
+  constructor(
+    private readonly options: {
+      minSpeechRms?: number;
+      minSpeechMs?: number;
+      silenceEndMs?: number;
+    } = {}
+  ) {}
+
+  public reset(): void {
+    this.inSpeech = false;
+    this.speechAccumMs = 0;
+    this.silenceAccumMs = 0;
+  }
+
+  public processFrame(
+    rms: number,
+    frameDurationMs: number,
+    isAssistantSpeaking: boolean
+  ): { isSpeech: boolean; shouldSignalAudioStreamEnd: boolean } {
+    if (isAssistantSpeaking) {
+      this.reset();
+      return { isSpeech: false, shouldSignalAudioStreamEnd: false };
+    }
+
+    const minSpeechRms = this.options.minSpeechRms ?? 0.015;
+    const minSpeechMs = this.options.minSpeechMs ?? 120;
+    const silenceEndMs = this.options.silenceEndMs ?? 380;
+
+    const startThreshold = Math.max(minSpeechRms, this.noiseFloor * 2.8);
+    const continueThreshold = Math.max(minSpeechRms * 0.65, this.noiseFloor * 1.9);
+
+    if (!this.inSpeech) {
+      if (rms >= startThreshold) {
+        this.inSpeech = true;
+        this.speechAccumMs = frameDurationMs;
+        this.silenceAccumMs = 0;
+        return { isSpeech: true, shouldSignalAudioStreamEnd: false };
+      }
+      // Adapt ambient noise floor slowly when idle (clamped so loud spikes don't desensitize)
+      this.noiseFloor = Math.min(
+        0.025,
+        Math.max(0.002, this.noiseFloor * 0.94 + rms * 0.06)
+      );
+      return { isSpeech: false, shouldSignalAudioStreamEnd: false };
+    }
+
+    if (rms >= continueThreshold) {
+      this.speechAccumMs += frameDurationMs;
+      this.silenceAccumMs = 0;
+      return { isSpeech: true, shouldSignalAudioStreamEnd: false };
+    }
+
+    // Speech dropped to silence
+    this.silenceAccumMs += frameDurationMs;
+    if (this.silenceAccumMs >= silenceEndMs) {
+      const hadRealSpeech = this.speechAccumMs >= minSpeechMs;
+      this.reset();
+      return { isSpeech: false, shouldSignalAudioStreamEnd: hadRealSpeech };
+    }
+
+    return { isSpeech: false, shouldSignalAudioStreamEnd: false };
+  }
+}
+
+/**
  * Converts Float32 audio buffer from microphone into 16-bit PCM Base64 string
  */
 export function pcm16ToBase64(float32Array: Float32Array): string {
@@ -144,14 +277,27 @@ export class LiveAudioPlayer {
   private ensureContext(): { ctx: AudioContext; analyser: AnalyserNode } {
     if (!this.audioCtx || this.audioCtx.state === 'closed') {
       this.audioCtx = getAudioContext();
+      this.analyser = null;
     }
     if (!this.analyser) {
       this.analyser = getAudioAnalyser();
     }
+    if (!sharedAnalyserConnected) {
+      try {
+        this.analyser.connect(this.audioCtx.destination);
+        sharedAnalyserConnected = true;
+      } catch {
+        // already connected
+      }
+    }
     if (this.audioCtx.state === 'suspended') {
-      this.audioCtx.resume();
+      this.audioCtx.resume().catch(() => {});
     }
     return { ctx: this.audioCtx, analyser: this.analyser };
+  }
+
+  public isPlaying(): boolean {
+    return this.activeSources.length > 0;
   }
 
   public playPcmChunk(base64Pcm: string, sampleRate = 24000) {
@@ -174,9 +320,7 @@ export class LiveAudioPlayer {
 
       const source = ctx.createBufferSource();
       source.buffer = buffer;
-      // Connect source -> analyser -> destination
       source.connect(analyser);
-      analyser.connect(ctx.destination);
 
       const currentTime = ctx.currentTime;
       const startTime = Math.max(currentTime, this.nextPlayTime);
@@ -209,7 +353,6 @@ export class LiveAudioPlayer {
         const source = ctx.createBufferSource();
         source.buffer = buffer;
         source.connect(analyser);
-        analyser.connect(ctx.destination);
         source.start(0);
         this.activeSources.push(source);
         source.onended = () => {

@@ -81,6 +81,9 @@ class GeminiByokConfigTest {
         val setup = setupJson.getJSONObject("setup")
         assertEquals("models/gemini-2.5-flash-native-audio-preview-12-2025", setup.getString("model"))
         assertEquals("resume-123", setup.getJSONObject("sessionResumption").getString("handle"))
+        val aad = setup.getJSONObject("realtimeInputConfig").getJSONObject("automaticActivityDetection")
+        assertEquals("END_SENSITIVITY_HIGH", aad.getString("endOfSpeechSensitivity"))
+        assertEquals(300, aad.getInt("silenceDurationMs"))
         assertEquals(
             "Kore",
             setup.getJSONObject("generationConfig")
@@ -91,9 +94,12 @@ class GeminiByokConfigTest {
         )
 
         val audioJson = JSONObject(ZoniLiveSessionClient.buildDirectAudioPayload("AAAA"))
-        val mediaChunk = audioJson.getJSONObject("realtimeInput").getJSONArray("mediaChunks").getJSONObject(0)
-        assertEquals("audio/pcm;rate=16000", mediaChunk.getString("mimeType"))
-        assertEquals("AAAA", mediaChunk.getString("data"))
+        val audio = audioJson.getJSONObject("realtimeInput").getJSONObject("audio")
+        assertEquals("audio/pcm;rate=16000", audio.getString("mimeType"))
+        assertEquals("AAAA", audio.getString("data"))
+
+        val streamEndJson = JSONObject(ZoniLiveSessionClient.buildDirectAudioStreamEndPayload())
+        assertTrue(streamEndJson.getJSONObject("realtimeInput").getBoolean("audioStreamEnd"))
 
         val textJson = JSONObject(ZoniLiveSessionClient.buildDirectClientTextPayload("Hello Zoni"))
         val clientContent = textJson.getJSONObject("clientContent")

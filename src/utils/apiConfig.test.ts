@@ -1,78 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  BROWSER_BYOK_STORAGE_KEY,
   LEGACY_BACKEND_URL_STORAGE,
-  cleanupLegacyBackendStorage,
-  deleteGeminiApiKey,
-  getGeminiApiKeyForRequest,
-  getGeminiApiKeyStatus,
-  getGeminiConfigError,
-  isNativeAndroidWebShell,
-  maskGeminiApiKey,
-  sanitizeGeminiSecret,
-  saveGeminiApiKey,
-  validateGeminiApiKeyFormat,
+  LEGACY_BROWSER_KEY_STORAGE,
+  LEGACY_USER_KEY_STORAGE,
+  buildServerApiUrl,
+  buildServerLiveWsUrl,
+  cleanupLegacyClientStorage,
+  fetchServerStatus,
+  getServerBaseUrl,
+  sanitizeErrorText,
 } from './apiConfig';
 
-const VALID_TEST_KEY_1 = 'AIzaSyTestExampleKey00000000000000001234';
-const VALID_TEST_KEY_2 = 'AIzaSyReplacementKey99999999999999995678';
-
 function makeMockWindow(opts: {
-  hostname?: string;
+  origin?: string;
+  host?: string;
   protocol?: string;
-  storedBrowserKey?: string;
-  legacyBackendUrl?: string;
-  nativeAndroidBridge?: boolean;
-  initialNativeKey?: string;
-  keystoreBacked?: boolean;
-} = {}): {
-  win: Window;
-  storage: Map<string, string>;
-  events: string[];
-  getNativeKey: () => string;
-} {
-  const storage = new Map<string, string>();
-  if (opts.storedBrowserKey) {
-    storage.set(BROWSER_BYOK_STORAGE_KEY, opts.storedBrowserKey);
-  }
-  if (opts.legacyBackendUrl) {
-    storage.set(LEGACY_BACKEND_URL_STORAGE, opts.legacyBackendUrl);
-  }
-
-  let nativeKey = opts.initialNativeKey || '';
-  const events: string[] = [];
-  const hostname = opts.hostname || 'localhost';
-  const protocol = opts.protocol || 'http:';
-
-  const bridge = opts.nativeAndroidBridge
-    ? {
-        saveGeminiApiKey: (key: string) => {
-          nativeKey = key.trim();
-          return true;
-        },
-        deleteGeminiApiKey: () => {
-          nativeKey = '';
-          return true;
-        },
-        getGeminiApiKeyForRequest: () => nativeKey,
-        getGeminiApiKeyStatusJson: () =>
-          JSON.stringify({
-            configured: Boolean(nativeKey),
-            maskedPreview: nativeKey ? maskGeminiApiKey(nativeKey) : '',
-            keystoreBacked: opts.keystoreBacked !== false,
-            isKeystoreBacked: opts.keystoreBacked !== false,
-            storageKind: opts.keystoreBacked !== false ? 'android_keystore' : 'android_private_prefs',
-          }),
-      }
-    : undefined;
+  initialStorage?: Record<string, string>;
+} = {}): { win: Window; storage: Map<string, string> } {
+  const storage = new Map<string, string>(Object.entries(opts.initialStorage || {}));
+  const protocol = opts.protocol || 'https:';
+  const host = opts.host || 'zoni.example.run.app';
+  const origin = opts.origin || `${protocol}//${host}`;
 
   const win = {
     location: {
-      hostname,
+      origin,
+      host,
       protocol,
-      host: hostname === 'localhost' ? 'localhost:3000' : hostname,
-      origin: `${protocol}//${hostname}`,
     },
     localStorage: {
       getItem: (k: string) => storage.get(k) ?? null,
@@ -83,137 +38,118 @@ function makeMockWindow(opts: {
         storage.delete(k);
       },
     },
-    dispatchEvent: (ev: Event) => {
-      events.push(ev.type);
-      return true;
-    },
-    ZoniAndroidBridge: bridge,
   } as unknown as Window;
 
-  return { win, storage, events, getNativeKey: () => nativeKey };
+  return { win, storage };
 }
 
-test('validateGeminiApiKeyFormat accepts AIza and AQ. keys, cleans clipboard artifacts, and rejects URLs/spaces/short keys', () => {
-  const ok = validateGeminiApiKeyFormat(`  ${VALID_TEST_KEY_1}  `);
-  assert.equal(ok.valid, true);
-  assert.equal(ok.normalizedKey, VALID_TEST_KEY_1);
-
-  // Google Cloud / Vertex Express Gemini API key format (starts with AQ. and contains a dot)
-  const aqKey = 'AQ.Ab8RN6TestExpressGeminiKey0000000000009876';
-  const okAq = validateGeminiApiKeyFormat(aqKey);
-  assert.equal(okAq.valid, true);
-  assert.equal(okAq.normalizedKey, aqKey);
-
-  // Mobile clipboard artifacts: zero-width spaces, BOM, quotes, and GEMINI_API_KEY= prefix
-  const withBomAndQuotes = validateGeminiApiKeyFormat(`\uFEFF"${VALID_TEST_KEY_1}\u200B"`);
-  assert.equal(withBomAndQuotes.valid, true);
-  assert.equal(withBomAndQuotes.normalizedKey, VALID_TEST_KEY_1);
-
-  const withEnvPrefix = validateGeminiApiKeyFormat(`GEMINI_API_KEY="${aqKey}"`);
-  assert.equal(withEnvPrefix.valid, true);
-  assert.equal(withEnvPrefix.normalizedKey, aqKey);
-
-  // Reject empty, internal spaces, server URLs, short strings, and invalid symbols
-  assert.equal(validateGeminiApiKeyFormat('').valid, false);
-  assert.equal(validateGeminiApiKeyFormat('   ').valid, false);
-  assert.equal(validateGeminiApiKeyFormat('AIzaSyWith Space Inside 123456789').valid, false);
-
-  const urlErr = validateGeminiApiKeyFormat('https://zoni-backend.example.run.app');
-  assert.equal(urlErr.valid, false);
-  assert.ok(urlErr.error && /not a server URL/i.test(urlErr.error));
-
-  assert.equal(validateGeminiApiKeyFormat('AIzaShort').valid, false);
-  assert.equal(validateGeminiApiKeyFormat('AIzaSyInvalid$Chars<>1234567890').valid, false);
-});
-
-test('maskGeminiApiKey and sanitizeGeminiSecret never reveal the full saved API key (AIza or AQ.)', () => {
-  const masked = maskGeminiApiKey(VALID_TEST_KEY_1);
-  assert.equal(masked, 'AIza••••••••1234');
-  assert.ok(!masked.includes('TestExampleKey'));
-
-  const aqKey = 'AQ.Ab8RN6TestExpressGeminiKey0000000000009876';
-  assert.equal(maskGeminiApiKey(aqKey), 'AQ.A••••••••9876');
-
-  const rawErr = `WebSocket wss://generativelanguage.googleapis.com/ws?key=${VALID_TEST_KEY_1} failed with x-goog-api-key: ${VALID_TEST_KEY_1} (${VALID_TEST_KEY_2}) and ${aqKey}`;
-  const scrubbed = sanitizeGeminiSecret(rawErr, VALID_TEST_KEY_1);
-  assert.ok(!scrubbed.includes(VALID_TEST_KEY_1));
-  assert.ok(!scrubbed.includes(VALID_TEST_KEY_2));
-  assert.ok(!scrubbed.includes(aqKey));
-  assert.ok(scrubbed.includes('[REDACTED_API_KEY]'));
-});
-
-test('fresh startup with missing key requires ONLY Gemini API key and never requires any backend URL', () => {
-  const { win } = makeMockWindow();
-  const status = getGeminiApiKeyStatus(win);
-  assert.equal(status.configured, false);
-  assert.equal(status.maskedPreview, '');
-  assert.equal(status.storageKind, 'none');
-
-  const configErr = getGeminiConfigError(win, 'en-US');
-  assert.ok(configErr && configErr.includes('Gemini API Key'));
-  assert.ok(configErr && configErr.includes('No backend server URL is required'));
-  assert.equal(getGeminiApiKeyForRequest(win), '');
-});
-
-test('browser preview save -> replace -> delete lifecycle enforces explicit security notice and purges legacy backend URL', () => {
-  const { win, storage, events } = makeMockWindow({
-    legacyBackendUrl: 'https://legacy.example.run.app',
-  });
-
-  // Save valid key
-  const saved = saveGeminiApiKey(VALID_TEST_KEY_1, win);
-  assert.equal(saved.ok, true);
-  assert.equal(saved.status.configured, true);
-  assert.equal(saved.status.maskedPreview, 'AIza••••••••1234');
-  assert.equal(saved.status.storageKind, 'browser_preview_local_storage');
-  assert.ok(saved.status.securityNotice.includes('NOT equivalent to Android Keystore'));
-  assert.equal(storage.has(LEGACY_BACKEND_URL_STORAGE), false);
-  assert.equal(getGeminiConfigError(win), null);
-  assert.equal(getGeminiApiKeyForRequest(win), VALID_TEST_KEY_1);
-
-  // Replace key
-  const replaced = saveGeminiApiKey(VALID_TEST_KEY_2, win);
-  assert.equal(replaced.ok, true);
-  assert.equal(replaced.status.maskedPreview, 'AIza••••••••5678');
-  assert.equal(getGeminiApiKeyForRequest(win), VALID_TEST_KEY_2);
-
-  // Reject invalid replacement without losing existing key
-  const bad = saveGeminiApiKey('https://not-an-api-key.run.app', win);
-  assert.equal(bad.ok, false);
-  assert.equal(getGeminiApiKeyForRequest(win), VALID_TEST_KEY_2);
-
-  // Delete key
-  const afterDelete = deleteGeminiApiKey(win);
-  assert.equal(afterDelete.configured, false);
-  assert.equal(afterDelete.maskedPreview, '');
-  assert.equal(getGeminiApiKeyForRequest(win), '');
-  assert.ok(events.filter((e) => e === 'zoni:gemini-key-updated').length >= 3);
-});
-
-test('Android native bridge stores key in Android Keystore and purges WebView localStorage copies', () => {
-  const { win, storage, getNativeKey } = makeMockWindow({
-    hostname: 'appassets.androidplatform.net',
+test('buildServerApiUrl and buildServerLiveWsUrl route all Gemini REST and Live traffic through the server with zero API keys', () => {
+  const { win: httpsWin } = makeMockWindow({
     protocol: 'https:',
-    nativeAndroidBridge: true,
-    storedBrowserKey: VALID_TEST_KEY_1,
-    legacyBackendUrl: 'https://legacy.example.run.app',
-    keystoreBacked: true,
+    host: 'ais-pre-example.run.app',
+  });
+  assert.equal(getServerBaseUrl(httpsWin), 'https://ais-pre-example.run.app');
+  assert.equal(buildServerApiUrl('/api/chat', httpsWin), 'https://ais-pre-example.run.app/api/chat');
+  assert.equal(buildServerApiUrl('api/tts', httpsWin), 'https://ais-pre-example.run.app/api/tts');
+
+  const wsUrl = buildServerLiveWsUrl(
+    {
+      mode: 'romantic',
+      selectedAffectionName: 'Boss',
+      voice: 'Kore',
+      lang: 'bn-BD',
+      handle: 'resume-abc',
+    },
+    httpsWin
+  );
+  assert.ok(wsUrl.startsWith('wss://ais-pre-example.run.app/live?'));
+  assert.ok(wsUrl.includes('mode=romantic'));
+  assert.ok(wsUrl.includes('selectedAffectionName=Boss'));
+  assert.ok(wsUrl.includes('voice=Kore'));
+  assert.ok(wsUrl.includes('lang=bn-BD'));
+  assert.ok(wsUrl.includes('handle=resume-abc'));
+  assert.ok(!wsUrl.includes('generativelanguage.googleapis.com'));
+  assert.ok(!wsUrl.includes('key='));
+
+  const { win: httpWin } = makeMockWindow({
+    protocol: 'http:',
+    host: 'localhost:3000',
+  });
+  assert.equal(
+    buildServerLiveWsUrl({ mode: 'playful' }, httpWin),
+    'ws://localhost:3000/live?mode=playful'
+  );
+});
+
+test('cleanupLegacyClientStorage clears any old browser API key or backend URL entries', () => {
+  const { win, storage } = makeMockWindow({
+    initialStorage: {
+      [LEGACY_BROWSER_KEY_STORAGE]: 'old-key',
+      [LEGACY_USER_KEY_STORAGE]: 'old-user-key',
+      [LEGACY_BACKEND_URL_STORAGE]: 'https://old.example.run.app',
+      keep_me: 'preserved',
+    },
   });
 
-  assert.equal(isNativeAndroidWebShell(win), true);
-  cleanupLegacyBackendStorage(win);
+  cleanupLegacyClientStorage(win);
+  assert.equal(storage.has(LEGACY_BROWSER_KEY_STORAGE), false);
+  assert.equal(storage.has(LEGACY_USER_KEY_STORAGE), false);
   assert.equal(storage.has(LEGACY_BACKEND_URL_STORAGE), false);
+  assert.equal(storage.get('keep_me'), 'preserved');
+});
 
-  const saved = saveGeminiApiKey(VALID_TEST_KEY_2, win);
-  assert.equal(saved.ok, true);
-  assert.equal(saved.status.storageKind, 'android_keystore');
-  assert.equal(saved.status.maskedPreview, 'AIza••••••••5678');
-  assert.equal(saved.status.isNativeAndroid, true);
-  assert.equal(getNativeKey(), VALID_TEST_KEY_2);
-  // Must purge WebView localStorage copy so raw key only lives in Android Keystore
-  assert.equal(storage.has(BROWSER_BYOK_STORAGE_KEY), false);
+test('fetchServerStatus reports healthy server-side Gemini readiness and handles unreachable/unconfigured states', async () => {
+  const { win } = makeMockWindow({ protocol: 'http:', host: 'localhost:3000' });
 
-  const afterDelete = deleteGeminiApiKey(win);
-  assert.equal(afterDelete.configured, false);
-  assert.equal(getNativeKey(), '');
+  const healthyFetch = (async (input: RequestInfo | URL) => {
+    assert.equal(String(input), 'http://localhost:3000/api/status');
+    return new Response(
+      JSON.stringify({
+        status: 'online',
+        geminiConfigured: true,
+        geminiLiveSupported: true,
+        assistantToolsCount: 36,
+        currentTimeIST: '12:00:00 PM (12:00:00)',
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  }) as typeof fetch;
+
+  const healthy = await fetchServerStatus(healthyFetch, win);
+  assert.equal(healthy.checked, true);
+  assert.equal(healthy.reachable, true);
+  assert.equal(healthy.geminiConfigured, true);
+  assert.equal(healthy.statusText, 'SERVER AI READY');
+  assert.equal(healthy.toolsCount, 36);
+
+  const missingKeyFetch = (async () =>
+    new Response(
+      JSON.stringify({
+        status: 'degraded',
+        geminiConfigured: false,
+        configurationError: 'GEMINI_API_KEY is not configured on this backend server.',
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    )) as typeof fetch;
+
+  const missing = await fetchServerStatus(missingKeyFetch, win);
+  assert.equal(missing.reachable, true);
+  assert.equal(missing.geminiConfigured, false);
+  assert.ok(missing.configurationError?.includes('GEMINI_API_KEY'));
+
+  const offlineFetch = (async () => {
+    throw new Error('Failed to fetch');
+  }) as typeof fetch;
+
+  const offline = await fetchServerStatus(offlineFetch, win);
+  assert.equal(offline.reachable, false);
+  assert.equal(offline.statusText, 'SERVER OFFLINE');
+});
+
+test('sanitizeErrorText scrubs any accidental key patterns', () => {
+  const raw = 'Error calling endpoint?key=AIzaSySecret00000000000000001234 and AQ.Ab8RN6Secret0000000000009876';
+  const safe = sanitizeErrorText(raw);
+  assert.ok(!safe.includes('AIzaSySecret'));
+  assert.ok(!safe.includes('AQ.Ab8RN6Secret'));
+  assert.ok(safe.includes('[REDACTED]'));
 });

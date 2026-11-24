@@ -73,6 +73,9 @@ class ZoniLiveSessionClient(
     private var isRotatingSession = false
 
     @Volatile
+    private var useFastVadConfig = true
+
+    @Volatile
     private var nonRetryableError: String? = null
 
     @Volatile
@@ -156,7 +159,8 @@ class ZoniLiveSessionClient(
                     affectionName = lastAffectionName,
                     voice = lastVoice,
                     language = lastLanguage,
-                    resumptionHandle = resumptionHandle
+                    resumptionHandle = resumptionHandle,
+                    includeFastVad = useFastVadConfig
                 )
                 ws.send(setupPayload)
             }
@@ -211,6 +215,18 @@ class ZoniLiveSessionClient(
                 webSocket = null
 
                 val safeReason = SecureKeyManager.sanitizeSecret(reason, lastApiKey)
+                val looksLikeVadConfigIssue = !isSessionReady && (code == 1007 || code == 1008) &&
+                    useFastVadConfig &&
+                    (safeReason.contains("realtimeInputConfig", ignoreCase = true) ||
+                        safeReason.contains("automaticActivityDetection", ignoreCase = true) ||
+                        safeReason.contains("Invalid JSON payload", ignoreCase = true))
+
+                if (!isClosedManually && looksLikeVadConfigIssue) {
+                    useFastVadConfig = false
+                    scheduleReconnect(isGracefulRotation = true)
+                    return
+                }
+
                 val looksLikeModelIssue = (code == 1008 || code == 1007) &&
                     (safeReason.contains("model", ignoreCase = true) ||
                         safeReason.contains("not found", ignoreCase = true) ||
@@ -382,6 +398,11 @@ class ZoniLiveSessionClient(
         webSocket?.send(buildDirectAudioPayload(base64Pcm16k))
     }
 
+    fun sendAudioStreamEnd() {
+        if (!isSessionReady) return
+        webSocket?.send(buildDirectAudioStreamEndPayload())
+    }
+
     fun sendClientText(text: String, clientMsgId: String = "msg-${System.currentTimeMillis()}") {
         val trimmed = text.trim().take(4000)
         if (trimmed.isEmpty()) return
@@ -482,7 +503,8 @@ class ZoniLiveSessionClient(
             affectionName: String,
             voice: VoiceProfile,
             language: SupportedLanguage,
-            resumptionHandle: String? = null
+            resumptionHandle: String? = null,
+            includeFastVad: Boolean = true
         ): String {
             val normalizedModel = if (model.startsWith("models/")) model else "models/$model"
             val instruction =
@@ -515,6 +537,21 @@ class ZoniLiveSessionClient(
                 .put("inputAudioTranscription", JSONObject())
                 .put("outputAudioTranscription", JSONObject())
 
+            if (includeFastVad) {
+                setup.put(
+                    "realtimeInputConfig",
+                    JSONObject().put(
+                        "automaticActivityDetection",
+                        JSONObject()
+                            .put("disabled", false)
+                            .put("startOfSpeechSensitivity", "START_SENSITIVITY_HIGH")
+                            .put("endOfSpeechSensitivity", "END_SENSITIVITY_HIGH")
+                            .put("prefixPaddingMs", 100)
+                            .put("silenceDurationMs", 300)
+                    )
+                )
+            }
+
             if (!resumptionHandle.isNullOrBlank()) {
                 setup.put("sessionResumption", JSONObject().put("handle", resumptionHandle.trim()))
             }
@@ -527,13 +564,20 @@ class ZoniLiveSessionClient(
                 .put(
                     "realtimeInput",
                     JSONObject().put(
-                        "mediaChunks",
-                        JSONArray().put(
-                            JSONObject()
-                                .put("mimeType", "audio/pcm;rate=16000")
-                                .put("data", base64Pcm16k)
-                        )
+                        "audio",
+                        JSONObject()
+                            .put("mimeType", "audio/pcm;rate=16000")
+                            .put("data", base64Pcm16k)
                     )
+                )
+                .toString()
+        }
+
+        fun buildDirectAudioStreamEndPayload(): String {
+            return JSONObject()
+                .put(
+                    "realtimeInput",
+                    JSONObject().put("audioStreamEnd", true)
                 )
                 .toString()
         }

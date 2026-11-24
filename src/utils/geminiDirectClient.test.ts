@@ -6,6 +6,7 @@ import {
   GEMINI_REST_BASE_URL,
   analyzeScreenDirectGemini,
   buildDirectLiveAudioMessage,
+  buildDirectLiveAudioStreamEndMessage,
   buildDirectLiveClientTextMessage,
   buildDirectLiveSetupMessage,
   buildDirectLiveToolResponseMessage,
@@ -246,11 +247,23 @@ test('Direct Gemini Live WebSocket helpers build official setup/audio/text/tool 
   assert.equal(setup.setup.model, 'models/gemini-2.5-flash-native-audio-preview-12-2025');
   assert.equal(setup.setup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, 'Kore');
   assert.equal(setup.setup.sessionResumption.handle, 'handle-xyz');
+  assert.equal(setup.setup.realtimeInputConfig.automaticActivityDetection.endOfSpeechSensitivity, 'END_SENSITIVITY_HIGH');
+  assert.equal(setup.setup.realtimeInputConfig.automaticActivityDetection.silenceDurationMs, 300);
   assert.equal(setup.setup.tools[0].functionDeclarations.length, 36);
+
+  const setupNoVad = buildDirectLiveSetupMessage({
+    model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+    systemInstruction: 'You are Zoni AI.',
+    includeFastVad: false,
+  });
+  assert.equal(setupNoVad.setup.realtimeInputConfig, undefined);
 
   const audioMsg = buildDirectLiveAudioMessage('AAAA');
   assert.equal(audioMsg.realtimeInput.audio.mimeType, 'audio/pcm;rate=16000');
   assert.equal(audioMsg.realtimeInput.audio.data, 'AAAA');
+
+  const streamEndMsg = buildDirectLiveAudioStreamEndMessage();
+  assert.equal(streamEndMsg.realtimeInput.audioStreamEnd, true);
 
   const textMsg = buildDirectLiveClientTextMessage('Hello Zoni');
   assert.equal(textMsg.clientContent.turnComplete, true);
