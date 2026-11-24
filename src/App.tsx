@@ -2205,27 +2205,29 @@ export default function App() {
 
                 if (ev.type === 'user_transcript' && ev.text) {
                   const speechTurnId = userSpeechTurnIdRef.current;
-                  const incomingText = String(ev.text || '').trim();
-                  const isFinalTranscript = ev.isFinal === true;
+                  const incomingChunk = String(ev.text || '').trim();
 
-                  if (incomingText) {
-                    // Gemini interim transcription is a live snapshot; final transcription
-                    // replaces it so partial words are never concatenated into the command.
-                    currentSpeechTranscriptRef.current = incomingText;
+                  if (incomingChunk) {
+                    const prevUtterance = currentSpeechTranscriptRef.current;
+                    currentSpeechTranscriptRef.current =
+                      !prevUtterance || incomingChunk.startsWith(prevUtterance)
+                        ? incomingChunk
+                        : `${prevUtterance} ${incomingChunk}`.trim();
                   }
 
+                  // Interim ও final—দুই transcript-ই UI-তে দেখাও।
                   setMessages((prev) =>
                     upsertUserSpeechTurnMessage(
                       prev,
-                      incomingText,
+                      ev.text!,
                       speechTurnId,
                       activeLanguageRef.current
                     )
                   );
 
-                  // Interim text is for UI feedback only. Execute only after Gemini marks
-                  // the transcription final, preventing premature/duplicate actions.
-                  if (!isFinalTranscript) {
+                  // Interim transcript আসার সময় কোনো task execute করবে না।
+                  // কেবল Gemini-এর final transcript পাওয়ার পর execution schedule হবে।
+                  if (ev.isFinal !== true) {
                     continue;
                   }
 
@@ -2234,45 +2236,17 @@ export default function App() {
                     voiceTranscriptDebounceRef.current = null;
                   }
 
-                  const utteranceSnapshot = incomingText || currentSpeechTranscriptRef.current;
-                  currentSpeechTranscriptRef.current = utteranceSnapshot;
-
-                  // Handle flashlight commands only on the final transcript.
-                  if (isFlashlightOnCommand(utteranceSnapshot)) {
-                    if (
-                      recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
-                        enable: true,
-                      })
-                    ) {
-                      toggleFlashlight(true);
-                      const feedback =
-                        activeLanguageRef.current === 'bn-BD'
-                          ? 'টর্চ লাইট জ্বালানো হয়েছে।'
-                          : 'Flashlight turned on.';
-                      setLatestTranscript(feedback);
-                    }
+                  const utteranceSnapshot = currentSpeechTranscriptRef.current.trim();
+                  if (!utteranceSnapshot) {
                     continue;
                   }
 
-                  if (isFlashlightOffCommand(utteranceSnapshot)) {
-                    if (
-                      recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
-                        enable: false,
-                      })
-                    ) {
-                      toggleFlashlight(false);
-                      const feedback =
-                        activeLanguageRef.current === 'bn-BD'
-                          ? 'টর্চ লাইট বন্ধ করা হয়েছে।'
-                          : 'Flashlight turned off.';
-                      setLatestTranscript(feedback);
-                    }
-                    continue;
-                  }
-
+                  // Final transcript-এর পর ছোট debounce—আগের 900ms অপেক্ষা কমানো হলো।
                   voiceTranscriptDebounceRef.current = setTimeout(() => {
                     voiceTranscriptDebounceRef.current = null;
+
                     if (isUnmountedRef.current || liveToolExecutedInTurnRef.current) return;
+
                     const cleanSpoken = utteranceSnapshot.trim();
                     if (!cleanSpoken) return;
 
@@ -2283,7 +2257,7 @@ export default function App() {
                     }
                     if (plan.steps.length === 0) return;
 
-                    // Keep explicit approval/review flows out of automatic execution.
+                    // Pending approval/review কখনো auto-execute করবে না।
                     if (
                       plan.steps.length === 1 &&
                       (plan.steps[0].tool === 'approve_pending_action' ||
@@ -2294,9 +2268,11 @@ export default function App() {
 
                     void (async () => {
                       const outcomes: string[] = [];
+
                       for (const step of plan.steps) {
                         const mapped = mapTaskStepToAssistantTool(step, cleanSpoken);
                         if (!mapped) continue;
+
                         if (
                           !recentActionDeduplicatorRef.current.shouldExecute(
                             mapped.name,
@@ -2305,8 +2281,19 @@ export default function App() {
                         ) {
                           continue;
                         }
-                        const report = await executeValidatedAssistantTool(mapped.name, mapped.args);
-                        recordActionDiagnostic('deterministic_native', mapped.name, mapped.args, report);
+
+                        const report = await executeValidatedAssistantTool(
+                          mapped.name,
+                          mapped.args
+                        );
+
+                        recordActionDiagnostic(
+                          'deterministic_native',
+                          mapped.name,
+                          mapped.args,
+                          report
+                        );
+
                         outcomes.push(
                           formatLocalizedActionOutcome(
                             report,
@@ -2315,6 +2302,7 @@ export default function App() {
                           )
                         );
                       }
+
                       if (outcomes.length > 0) {
                         const combined = outcomes.join(' ');
                         setLatestTranscript(combined);
@@ -2331,6 +2319,36 @@ export default function App() {
                       }
                     })();
                   }, 150);
+
+                  // Flashlight command-ও final transcript থেকেই যাচাই করো।
+                  if (isFlashlightOnCommand(utteranceSnapshot)) {
+                    if (
+                      recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
+                        enable: true,
+                      })
+                    ) {
+                      toggleFlashlight(true);
+                      const feedback =
+                        activeLanguageRef.current === 'bn-BD'
+                          ? 'টর্চ লাইট জ্বালানো হয়েছে।'
+                          : 'Flashlight turned on.';
+                      setLatestTranscript(feedback);
+                    }
+                  } else if (isFlashlightOffCommand(utteranceSnapshot)) {
+                    if (
+                      recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
+                        enable: false,
+                      })
+                    ) {
+                      toggleFlashlight(false);
+                      const feedback =
+                        activeLanguageRef.current === 'bn-BD'
+                          ? 'টর্চ লাইট বন্ধ করা হয়েছে।'
+                          : 'Flashlight turned off.';
+                      setLatestTranscript(feedback);
+                    }
+                  }
+
                   continue;
                 }
 
@@ -3265,11 +3283,4 @@ export default function App() {
         const appendDirectTurn = (replyText: string) => {
           setMessages((prev) => [
             ...prev,
-            { id: clientMsgId, role: 'user', text: cleanText, timestamp: new Date(), lang: activeLanguage },
-            { id: `${clientMsgId}-reply`, role: 'assistant', text: replyText, timestamp: new Date(), lang: activeLanguage },
-          ]);
-          setLatestTranscript(replyText);
-          setAssistantState('idle');
-        };
-
-     
+            { id: clientMsgId, role: 'user', text: cleanText, 
