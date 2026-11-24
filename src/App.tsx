@@ -2285,7 +2285,7 @@ export default function App() {
                         ]);
                       }
                     })();
-                  }, 500);
+                  }, 300);
 
                   if (isFlashlightOnCommand(ev.text)) {
                     if (
