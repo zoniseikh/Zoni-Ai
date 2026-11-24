@@ -2205,29 +2205,73 @@ export default function App() {
 
                 if (ev.type === 'user_transcript' && ev.text) {
                   const speechTurnId = userSpeechTurnIdRef.current;
-                  const incomingChunk = String(ev.text || '').trim();
-                  if (incomingChunk) {
-                    const prevUtterance = currentSpeechTranscriptRef.current;
-                    currentSpeechTranscriptRef.current =
-                      !prevUtterance || incomingChunk.startsWith(prevUtterance)
-                        ? incomingChunk
-                        : `${prevUtterance} ${incomingChunk}`.trim();
+                  const incomingText = String(ev.text || '').trim();
+                  const isFinalTranscript = ev.isFinal === true;
+
+                  if (incomingText) {
+                    // Gemini interim transcription is a live snapshot; final transcription
+                    // replaces it so partial words are never concatenated into the command.
+                    currentSpeechTranscriptRef.current = incomingText;
                   }
 
                   setMessages((prev) =>
                     upsertUserSpeechTurnMessage(
                       prev,
-                      ev.text!,
+                      incomingText,
                       speechTurnId,
                       activeLanguageRef.current
                     )
                   );
 
+                  // Interim text is for UI feedback only. Execute only after Gemini marks
+                  // the transcription final, preventing premature/duplicate actions.
+                  if (!isFinalTranscript) {
+                    continue;
+                  }
+
                   if (voiceTranscriptDebounceRef.current) {
                     clearTimeout(voiceTranscriptDebounceRef.current);
+                    voiceTranscriptDebounceRef.current = null;
                   }
-                  const utteranceSnapshot = currentSpeechTranscriptRef.current;
+
+                  const utteranceSnapshot = incomingText || currentSpeechTranscriptRef.current;
+                  currentSpeechTranscriptRef.current = utteranceSnapshot;
+
+                  // Handle flashlight commands only on the final transcript.
+                  if (isFlashlightOnCommand(utteranceSnapshot)) {
+                    if (
+                      recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
+                        enable: true,
+                      })
+                    ) {
+                      toggleFlashlight(true);
+                      const feedback =
+                        activeLanguageRef.current === 'bn-BD'
+                          ? 'টর্চ লাইট জ্বালানো হয়েছে।'
+                          : 'Flashlight turned on.';
+                      setLatestTranscript(feedback);
+                    }
+                    continue;
+                  }
+
+                  if (isFlashlightOffCommand(utteranceSnapshot)) {
+                    if (
+                      recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
+                        enable: false,
+                      })
+                    ) {
+                      toggleFlashlight(false);
+                      const feedback =
+                        activeLanguageRef.current === 'bn-BD'
+                          ? 'টর্চ লাইট বন্ধ করা হয়েছে।'
+                          : 'Flashlight turned off.';
+                      setLatestTranscript(feedback);
+                    }
+                    continue;
+                  }
+
                   voiceTranscriptDebounceRef.current = setTimeout(() => {
+                    voiceTranscriptDebounceRef.current = null;
                     if (isUnmountedRef.current || liveToolExecutedInTurnRef.current) return;
                     const cleanSpoken = utteranceSnapshot.trim();
                     if (!cleanSpoken) return;
@@ -2239,6 +2283,7 @@ export default function App() {
                     }
                     if (plan.steps.length === 0) return;
 
+                    // Keep explicit approval/review flows out of automatic execution.
                     if (
                       plan.steps.length === 1 &&
                       (plan.steps[0].tool === 'approve_pending_action' ||
@@ -2285,35 +2330,7 @@ export default function App() {
                         ]);
                       }
                     })();
-                  }, 900);
-
-                  if (isFlashlightOnCommand(ev.text)) {
-                    if (
-                      recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
-                        enable: true,
-                      })
-                    ) {
-                      toggleFlashlight(true);
-                      const feedback =
-                        activeLanguageRef.current === 'bn-BD'
-                          ? 'টর্চ লাইট জ্বালানো হয়েছে।'
-                          : 'Flashlight turned on.';
-                      setLatestTranscript(feedback);
-                    }
-                  } else if (isFlashlightOffCommand(ev.text)) {
-                    if (
-                      recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
-                        enable: false,
-                      })
-                    ) {
-                      toggleFlashlight(false);
-                      const feedback =
-                        activeLanguageRef.current === 'bn-BD'
-                          ? 'টর্চ লাইট বন্ধ করা হয়েছে।'
-                          : 'Flashlight turned off.';
-                      setLatestTranscript(feedback);
-                    }
-                  }
+                  }, 150);
                   continue;
                 }
 
@@ -3255,802 +3272,4 @@ export default function App() {
           setAssistantState('idle');
         };
 
-        // Routine actions execute directly without a pending approval step.
-        const singleTool = taskPlan.steps.length === 1 ? taskPlan.steps[0].tool : null;
-        if (singleTool === 'approve_pending_action' || singleTool === 'review_pending_draft') {
-          appendDirectTurn(
-            activeLanguage === 'bn-BD'
-              ? `${selectedAffectionName}, এখন কোনো আলাদা অনুমতির দরকার নেই — সরাসরি বলুন কাকে কল বা মেসেজ করতে হবে।`
-              : `No separate approval step is required, ${selectedAffectionName} — just tell me directly who to call or message.`
-          );
-          return;
-        }
-
-        setMessages((prev) => [
-          ...prev,
-          { id: clientMsgId, role: 'user', text: cleanText, timestamp: new Date(), lang: activeLanguage },
-        ]);
-        setAssistantState('thinking');
-
-        const outcomes: string[] = [];
-        for (const step of taskPlan.steps) {
-          const mapped = mapTaskStepToAssistantTool(step, cleanText);
-          if (mapped) {
-            recentActionDeduplicatorRef.current.markExecuted(mapped.name, mapped.args);
-            const report = await executeValidatedAssistantTool(mapped.name, mapped.args);
-            recordActionDiagnostic('deterministic_native', mapped.name, mapped.args, report);
-            outcomes.push(
-              formatLocalizedActionOutcome(report, activeLanguage, selectedAffectionName)
-            );
-          } else if (step.tool === 'vibrate') {
-            executeAssistantActionDirectly({ type: 'vibrate', label: 'Vibrate' });
-            outcomes.push(activeLanguage === 'bn-BD' ? 'ভাইব্রেশন চালানো হয়েছে।' : 'Vibration triggered.');
-          } else if (step.tool === 'web_search') {
-            const q = String(step.args.query || '').trim();
-            outcomes.push(
-              activeLanguage === 'bn-BD'
-                ? `"${q}" সার্চ করার জন্য প্রস্তুত।`
-                : `Ready to search for "${q}".`
-            );
-          }
-        }
-
-        if (outcomes.length > 0) {
-          const combined = outcomes.join(' ');
-          setMessages((prev) => [
-            ...prev,
-            { id: `${clientMsgId}-reply`, role: 'assistant', text: combined, timestamp: new Date(), lang: activeLanguage },
-          ]);
-          setLatestTranscript(combined);
-          setAssistantState('idle');
-          return;
-        }
-      }
-
-      // Direct hardware flashlight deduplication fallback
-      const detectedIntent = detectAssistantIntent(cleanText);
-      if (detectedIntent && detectedIntent.type === 'flashlight') {
-        const now = Date.now();
-        const statePayload = detectedIntent.payload || 'on';
-        if (
-          !lastFlashlightActionRef.current ||
-          lastFlashlightActionRef.current.payload !== statePayload ||
-          now - lastFlashlightActionRef.current.time >= 1500
-        ) {
-          lastFlashlightActionRef.current = { payload: statePayload, time: now };
-          executeAssistantActionDirectly(detectedIntent);
-        }
-      }
-
-      // 3. Display user message immediately in the shared conversation UI
-      const userMsg: ChatMessage = {
-        id: clientMsgId,
-        role: 'user',
-        text: cleanText,
-        timestamp: new Date(),
-        lang: activeLanguage,
-      };
-      setMessages((prev) => [...prev, userMsg]);
-
-      // Advance user speech turn counter so any subsequent voice speech appears after this message
-      userSpeechTurnIdRef.current += 1;
-
-      // Unlock audio context on user submit gesture so Gemini Live audio response plays seamlessly
-      getAudioContext();
-      stopAllSpeechPlayback();
-      receivedAudioInTurnRef.current = false;
-      setAssistantState('thinking');
-
-      // Check if browser is offline
-      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-        setWsStatus('disconnected');
-        const dtQuery = detectDateTimeQuery(cleanText);
-        if (dtQuery) {
-          let directReply = '';
-          if (dtQuery === 'time') directReply = formatBengaliSpokenTime();
-          else if (dtQuery === 'date') directReply = formatBengaliDate();
-          else if (dtQuery === 'weekday') directReply = formatBengaliWeekday();
-          setLatestTranscript(directReply);
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `offline-dt-${Date.now()}`,
-              role: 'assistant',
-              text: directReply,
-              timestamp: new Date(),
-              lang: 'bn-BD',
-            },
-          ]);
-          setAssistantState('idle');
-          return;
-        }
-
-        setAssistantState('error');
-        const offlineErr =
-          activeLanguage === 'bn-BD'
-            ? `ইন্টারনেট সংযোগ নেই ${selectedAffectionName}। অনুগ্রহ করে নেটওয়ার্ক চেক করুন।`
-            : `No internet connection, ${selectedAffectionName}. Please check your network and try again.`;
-        setLatestTranscript(offlineErr);
-        return;
-      }
-
-      // Check user-owned Gemini API key before sending remote Gemini requests
-      const configError = getGeminiConfigError(undefined, activeLanguage);
-      if (configError) {
-        setConnectionError(configError);
-        setLatestTranscript(configError);
-        setAssistantState('error');
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `${clientMsgId}-config-err`,
-            role: 'assistant',
-            text: configError,
-            timestamp: new Date(),
-            lang: activeLanguage,
-          },
-        ]);
-        return;
-      }
-
-      const historySnapshot = messagesRef.current.slice(-10).map((m) => ({
-        role: m.role,
-        text: m.text,
-      }));
-
-      pendingChatFallbackRef.current = {
-        clientMsgId,
-        text: cleanText,
-        historySnapshot,
-        answered: false,
-        fallbackStarted: false,
-      };
-
-      // 4. Explicit Action-Intent Routing Policy (Root Cause 4):
-      // Separate device-action intents from ordinary chat & route immediately to HTTP /api/chat function calling
-      // whenever Live WS is unavailable or lacks declared tools — never silently falling back to ordinary conversation.
-      const liveWsOpenAndReady =
-        wsRef.current?.readyState === WebSocket.OPEN && isSessionReadyRef.current;
-      const intentRoute = decideIntentExecutionRoute(cleanText, {
-        liveWsReadyWithTools: Boolean(liveWsOpenAndReady && liveToolsReadyRef.current),
-        isDateTimeQuery: Boolean(detectDateTimeQuery(cleanText)),
-      });
-
-      const useFallbackImmediately =
-        intentRoute === 'http_function_calling' ||
-        Boolean(liveNonRetryableErrorRef.current) ||
-        shouldUseHttpChatFallback(
-          wsRef.current?.readyState,
-          isSessionReadyRef.current,
-          wsStatusRef.current
-        );
-
-      if (useFallbackImmediately) {
-        await sendViaHttpChatFallback(cleanText, clientMsgId, historySnapshot);
-        return;
-      }
-
-      const sentDirectly = sendOverSharedWs(payload);
-      if (!sentDirectly) {
-        await sendViaHttpChatFallback(cleanText, clientMsgId, historySnapshot);
-        return;
-      }
-
-      // Safety fallback timeout: if Live WS produces no transcript/audio within 12s, fall back once to /api/chat
-      clearTurnTimeout();
-      turnTimeoutRef.current = setTimeout(() => {
-        const pending = pendingChatFallbackRef.current;
-        if (
-          pending &&
-          pending.clientMsgId === clientMsgId &&
-          !pending.answered &&
-          !pending.fallbackStarted
-        ) {
-          void sendViaHttpChatFallback(cleanText, clientMsgId, historySnapshot);
-        }
-      }, 12000);
-    },
-    [
-      selectedAffectionName,
-      activeLanguage,
-      switchLanguage,
-      stopAllSpeechPlayback,
-      sendOverSharedWs,
-      sendViaHttpChatFallback,
-      clearTurnTimeout,
-      executeValidatedAssistantTool,
-      handleApprovePendingAction,
-      recordActionDiagnostic,
-    ]
-  );
-
-  // Replay speech audio from transcript (uses active Direct Live WS or Direct Gemini TTS)
-  const handleReplayAudio = async (text: string) => {
-    if (vitals.soundFxEnabled) playProceduralSfx('click');
-    stopAllSpeechPlayback();
-
-    const apiKey = getGeminiApiKeyForRequest();
-    const configError = !apiKey ? getGeminiConfigError(undefined, activeLanguage) : null;
-    if (configError) {
-      setConnectionError(configError);
-      setLatestTranscript(configError);
-      return;
-    }
-
-    if (
-      wsRef.current &&
-      wsRef.current.readyState === WebSocket.OPEN &&
-      isSessionReadyRef.current
-    ) {
-      setAssistantState('speaking');
-      sendOverSharedWs({
-        type: 'client_text',
-        text: `[System directive: Replay this response to ${selectedAffectionName} in ${activeLanguage} using your Gemini Live voice: "${text}"]`,
-        clientMsgId: `replay-${Date.now()}`,
-      });
-      return;
-    }
-
-    // Direct Gemini TTS fallback when Live WS is offline
-    setAssistantState('speaking');
-    try {
-      const audioBase64 = await synthesizeDirectGeminiTts({
-        apiKey,
-        text,
-        voice: vitals.selectedVoice,
-        lang: activeLanguage,
-      });
-      liveAudioPlayerRef.current?.playPcmChunk(audioBase64, 24000);
-      setTimeout(() => {
-        setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
-      }, 1200);
-    } catch (err: any) {
-      setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
-      setConnectionError(sanitizeGeminiSecret(err, apiKey) || 'Unable to replay voice audio.');
-    }
-  };
-
-  // Interruption
-  const handleInterrupt = () => {
-    clearTurnTimeout();
-    stopAllSpeechPlayback();
-    sendOverSharedWs({ type: 'interrupt' });
-    setAssistantState(isLiveActive ? 'listening' : 'idle');
-  };
-
-  // Reactor Click Action
-  const handleReactorClick = async () => {
-    if (vitals.soundFxEnabled) playProceduralSfx('love');
-    if (!isLiveActive) {
-      if (permissionsReport.microphone !== 'granted') {
-        const res = await requestMicrophoneAccess();
-        const fresh = await checkAllPermissions();
-        setPermissionsReport(fresh);
-        if (res.status === 'granted') {
-          startVoiceCapture();
-        } else {
-          setIsPermissionsModalOpen(true);
-        }
-      } else {
-        startVoiceCapture();
-      }
-    } else {
-      handleInterrupt();
-    }
-  };
-
-  // Toggle Auto-Play Settings
-  const handleToggleAutoPlay = () => {
-    if (vitals.soundFxEnabled) playProceduralSfx('click');
-    const nextVal = !voiceAutoPlay;
-    setVoiceAutoPlay(nextVal);
-    localStorage.setItem('zoni_voice_autoplay', String(nextVal));
-  };
-
-  // Toggle Mute Settings
-  const handleToggleVoiceMute = () => {
-    if (vitals.soundFxEnabled) playProceduralSfx('click');
-    const nextMute = !voiceMuted;
-    setVoiceMuted(nextMute);
-    localStorage.setItem('zoni_voice_muted', String(nextMute));
-    if (nextMute) {
-      stopAllSpeechPlayback();
-    }
-  };
-
-  const handleToggleSoundFx = useCallback(() => {
-    setVitals((v) => {
-      const nextVal = !v.soundFxEnabled;
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('zoni_sound_fx_enabled', String(nextVal));
-      }
-      return { ...v, soundFxEnabled: nextVal };
-    });
-  }, []);
-
-  const handleManualReconnectLive = useCallback(() => {
-    setConnectionError(null);
-    void checkBackendHealth().then((snap) => {
-      if (!isUnmountedRef.current && snap.geminiConfigured) {
-        connectSharedLiveWs(true).catch(() => {
-          // Surfacing via connectionError
-        });
-      }
-    });
-  }, [checkBackendHealth, connectSharedLiveWs]);
-
-  useEffect(() => {
-    handleSendMessageRef.current = handleSendMessage;
-  }, [handleSendMessage]);
-
-  const voiceLifecycleState: VoiceLifecycleState = deriveVoiceLifecycleState({
-    wsStatus,
-    assistantState,
-    isLiveActive,
-    isDisconnecting: isDisconnectingLive,
-    wakeWordStatus,
-  });
-
-  useEffect(() => {
-    notifyNativeVoiceSessionState(voiceLifecycleState);
-  }, [voiceLifecycleState]);
-
-  useEffect(() => {
-    const syncNativeStatuses = () => {
-      const ww = getNativeWakeWordStatus();
-      if (ww) setWakeWordStatus(ww);
-      const cs = getNativeIncomingCallStatus();
-      if (cs) setIncomingCallStatus(cs);
-    };
-    syncNativeStatuses();
-
-    const onWakeWordStatus = (ev: Event) => {
-      const detail = (ev as CustomEvent<WakeWordStatusSnapshot>).detail;
-      if (detail && typeof detail === 'object') {
-        setWakeWordStatus(detail);
-      }
-    };
-
-    const onCallStateChanged = (ev: Event) => {
-      const detail = (ev as CustomEvent<IncomingCallStatusSnapshot>).detail;
-      if (detail && typeof detail === 'object') {
-        setIncomingCallStatus(detail);
-        if (detail.callState === 'ACTIVE' || detail.isActiveCall) {
-          try {
-            window.speechSynthesis?.cancel();
-          } catch {
-            // ignore
-          }
-          if (isLiveActiveRef.current) {
-            stopVoiceCapture(false);
-          }
-        }
-      }
-    };
-
-    const onVoiceStateChanged = () => {
-      const ww = getNativeWakeWordStatus();
-      if (ww) setWakeWordStatus(ww);
-    };
-
-    const onWakeWordDetected = (ev: Event) => {
-      const detail = (ev as CustomEvent<{ wakeWord?: string; confidence?: number; remainingCommand?: string }>).detail || {};
-      const phrase = detail.wakeWord || wakeWordStatus?.wakePhrase || 'Zoni';
-      const cleanedRemainder = stripWakePhraseFromCommand(detail.remainingCommand || '', phrase);
-
-      if (cleanedRemainder) {
-        // Execute only the stripped command; never pass bare wake word as a command
-        handleSendMessageRef.current?.(cleanedRemainder);
-        return;
-      }
-
-      if (!isLiveActiveRef.current && !liveStartInFlightRef.current) {
-        setLatestTranscript(
-          activeLanguageRef.current === 'bn-BD'
-            ? `"${phrase}" ওয়েক ওয়ার্ড শনাক্ত হয়েছে — Gemini Live চালু হচ্ছে...`
-            : `Wake word "${phrase}" detected — activating Gemini Live...`
-        );
-        void startVoiceCapture();
-      }
-    };
-
-    window.addEventListener('zoni:wake-word-status', onWakeWordStatus);
-    window.addEventListener('zoni:call-state-changed', onCallStateChanged);
-    window.addEventListener('zoni:voice-state-changed', onVoiceStateChanged);
-    window.addEventListener('zoni:wake-word-detected', onWakeWordDetected);
-
-    return () => {
-      window.removeEventListener('zoni:wake-word-status', onWakeWordStatus);
-      window.removeEventListener('zoni:call-state-changed', onCallStateChanged);
-      window.removeEventListener('zoni:voice-state-changed', onVoiceStateChanged);
-      window.removeEventListener('zoni:wake-word-detected', onWakeWordDetected);
-    };
-  }, [startVoiceCapture, wakeWordStatus?.wakePhrase]);
-
-  const handleStartBackgroundWakeWord = useCallback(() => {
-    const result = startNativeBackgroundWakeWord();
-    const fresh = getNativeWakeWordStatus();
-    if (fresh) {
-      setWakeWordStatus(fresh);
-    } else {
-      setWakeWordStatus((prev) => ({
-        wakeWordEnabled: false,
-        backgroundServiceRunning: false,
-        listening: false,
-        wakePhrase: prev?.wakePhrase || 'Zoni',
-        voiceState: 'IDLE',
-        micPermissionGranted: false,
-        notificationPermissionGranted: false,
-        detectorEngine: 'on_device_two_stage_acoustic_gate',
-        lastDetectedAtMs: prev?.lastDetectedAtMs ?? 0,
-        lastConfidence: prev?.lastConfidence ?? 0,
-        lastError:
-          result.message ||
-          '24-hour background wake word listening requires the installed ZONI Android APK.',
-      }));
-    }
-    if (!result.success && result.message) {
-      setLatestTranscript(result.message);
-    }
-  }, []);
-
-  const handleStopBackgroundWakeWord = useCallback(() => {
-    stopNativeBackgroundWakeWord();
-    const fresh = getNativeWakeWordStatus();
-    if (fresh) {
-      setWakeWordStatus(fresh);
-    } else {
-      setWakeWordStatus((prev) =>
-        prev
-          ? {
-              ...prev,
-              wakeWordEnabled: false,
-              backgroundServiceRunning: false,
-              listening: false,
-              voiceState: 'DISABLED',
-            }
-          : null
-      );
-    }
-  }, []);
-
-  const handleUpdateWakePhrase = useCallback((phrase: string) => {
-    const cleaned = phrase.trim() || 'Zoni';
-    setNativeWakePhrase(cleaned);
-    const fresh = getNativeWakeWordStatus();
-    if (fresh) {
-      setWakeWordStatus(fresh);
-    } else {
-      setWakeWordStatus((prev) => ({
-        wakeWordEnabled: prev?.wakeWordEnabled ?? false,
-        backgroundServiceRunning: prev?.backgroundServiceRunning ?? false,
-        listening: prev?.listening ?? false,
-        wakePhrase: cleaned,
-        voiceState: prev?.voiceState || 'IDLE',
-        micPermissionGranted: prev?.micPermissionGranted ?? false,
-        notificationPermissionGranted: prev?.notificationPermissionGranted ?? false,
-        detectorEngine: prev?.detectorEngine || 'on_device_two_stage_acoustic_gate',
-        lastDetectedAtMs: prev?.lastDetectedAtMs ?? 0,
-        lastConfidence: prev?.lastConfidence ?? 0,
-        lastError: prev?.lastError || '',
-      }));
-    }
-  }, []);
-
-  const handleRefreshCallStatus = useCallback(() => {
-    const fresh = getNativeIncomingCallStatus();
-    if (fresh) {
-      setIncomingCallStatus(fresh);
-      setCallControlNotice(null);
-    } else {
-      setCallControlNotice('Live Telecom call state requires the installed Android APK.');
-    }
-  }, []);
-
-  const handleCallControlAction = useCallback(
-    async (action: 'answer_incoming_call' | 'reject_incoming_call' | 'end_active_call') => {
-      const report = await executeValidatedAssistantTool(action, {});
-      setCallControlNotice(report.message);
-      setLatestTranscript(report.message);
-      const fresh = getNativeIncomingCallStatus();
-      if (fresh) setIncomingCallStatus(fresh);
-    },
-    [executeValidatedAssistantTool]
-  );
-
-  const handleRequestCallPermissions = useCallback(() => {
-    const bridge = getNativeAndroidBridge();
-    if (bridge?.requestRuntimePermission) {
-      bridge.requestRuntimePermission('call_control');
-      setCallControlNotice('Requested Android phone call permissions (READ_PHONE_STATE & ANSWER_PHONE_CALLS).');
-    } else {
-      setCallControlNotice('Android phone permissions can only be requested inside the installed APK.');
-    }
-  }, []);
-
-  const handleRequestDialerRole = useCallback(() => {
-    const started = requestNativeCallControlRole();
-    setCallControlNotice(
-      started
-        ? 'Opened Android Call Control / Default Dialer role request.'
-        : 'Default Dialer role prompt is available only inside the installed Android APK.'
-    );
-  }, []);
-
-  return (
-    <div className="relative min-h-screen w-full bg-slate-950 text-cyan-50 flex flex-col justify-between overflow-x-hidden selection:bg-pink-500/30 selection:text-pink-200">
-      {/* Background Animated Sci-Fi Ambient Glow & Grid */}
-      <div className="fixed inset-0 pointer-events-none hud-grid opacity-35 z-0" />
-      <div className="fixed -top-40 -left-40 w-96 h-96 rounded-full bg-cyan-600/10 blur-[130px] pointer-events-none" />
-      <div className="fixed -bottom-40 -right-40 w-96 h-96 rounded-full bg-pink-600/10 blur-[130px] pointer-events-none" />
-
-      {/* Top Jarvis Status Bar with Language Selector and Audio Controls */}
-      <HudHeader
-        vitals={vitals}
-        permissionsReport={permissionsReport}
-        wsStatus={wsStatus}
-        backendHealth={backendHealth}
-        onToggleSoundFx={handleToggleSoundFx}
-        onToggleChatDrawer={() => setIsChatDrawerOpen(!isChatDrawerOpen)}
-        onOpenSettings={() => setIsSettingsModalOpen(true)}
-        onOpenApkModal={() => setIsApkModalOpen(true)}
-        onOpenCallingModal={() => setIsCallingModalOpen(true)}
-        onOpenPermissionsModal={() => setIsPermissionsModalOpen(true)}
-        onSelectLanguage={switchLanguage}
-        onToggleAutoPlay={handleToggleAutoPlay}
-        onToggleVoiceMute={handleToggleVoiceMute}
-        isChatOpen={isChatDrawerOpen}
-      />
-
-      {/* Main Command Center Stage - Clean, Uncluttered, Focused on Arc Reactor */}
-      <main className="relative flex-1 flex flex-col items-center justify-center p-3 sm:p-6 z-10 max-w-4xl mx-auto w-full">
-        {/* Center: The Iconic Jarvis Arc Reactor Core */}
-        <div className="w-full flex flex-col items-center justify-center my-auto">
-          <ArcReactor
-            state={assistantState}
-            mode={vitals.activeMode}
-            selectedAffectionName={selectedAffectionName}
-            userNickname={selectedAffectionName}
-            isLiveActive={isLiveActive}
-            latestTranscript={latestTranscript}
-            onReactorClick={handleReactorClick}
-          />
-        </div>
-
-        {/* Live Incoming / Active Phone Call Control Strip (Shown ONLY when Android Telecom reports RINGING or ACTIVE) */}
-        {(incomingCallStatus?.isIncomingRinging || incomingCallStatus?.isActiveCall) && (
-          <div
-            data-testid="live-call-control-strip"
-            className="w-full max-w-2xl mt-3 px-4 py-3 rounded-2xl bg-emerald-950/90 border border-emerald-400/60 text-emerald-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-[0_0_25px_rgba(16,185,129,0.25)]"
-          >
-            <div className="flex items-center gap-2.5 min-w-0">
-              <PhoneIncoming className="w-5 h-5 text-emerald-300 shrink-0" />
-              <div className="min-w-0">
-                <div className="font-sci-fi text-xs font-bold tracking-wider uppercase text-emerald-200">
-                  {incomingCallStatus.isIncomingRinging ? 'INCOMING PHONE CALL' : 'ACTIVE PHONE CALL'}
-                </div>
-                <div className="text-xs text-emerald-100/90 truncate">
-                  {incomingCallStatus.callerDisplayName ||
-                    incomingCallStatus.callerNumber ||
-                    incomingCallStatus.callState}
-                </div>
-              </div>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              {incomingCallStatus.isIncomingRinging && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => void handleCallControlAction('answer_incoming_call')}
-                    className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-hud text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <PhoneIncoming className="w-3.5 h-3.5" />
-                    <span>ANSWER</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleCallControlAction('reject_incoming_call')}
-                    className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-hud text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <PhoneOff className="w-3.5 h-3.5" />
-                    <span>REJECT</span>
-                  </button>
-                </>
-              )}
-              {incomingCallStatus.isActiveCall && (
-                <button
-                  type="button"
-                  onClick={() => void handleCallControlAction('end_active_call')}
-                  className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-hud text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-                >
-                  <PhoneOff className="w-3.5 h-3.5" />
-                  <span>END CALL</span>
-                </button>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* Interactive Review / Edit / Cancel / Approve Card for WhatsApp, SMS & Calls */}
-        <ActionConfirmationCard
-          draft={pendingActionDraft}
-          activeLanguage={activeLanguage}
-          onApprove={handleApprovePendingAction}
-          onCancel={handleCancelPendingAction}
-        />
-
-        {/* Authoritative Connection / Backend Configuration Error Banner */}
-        {connectionError && (
-          <div
-            role="alert"
-            className="w-full max-w-2xl mt-3 px-3.5 py-2.5 rounded-xl bg-rose-950/85 border border-rose-500/50 text-rose-100 text-xs font-hud flex flex-col sm:flex-row sm:items-center justify-between gap-2 shadow-[0_0_20px_rgba(244,63,94,0.2)]"
-          >
-            <div className="flex items-start gap-2 min-w-0">
-              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-              <span className="leading-snug break-words">{connectionError}</span>
-            </div>
-            <div className="flex items-center gap-1.5 shrink-0">
-              <button
-                type="button"
-                onClick={handleManualReconnectLive}
-                className="px-2.5 py-1 rounded-lg bg-rose-900/70 hover:bg-rose-800/80 border border-rose-400/40 text-rose-100 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
-              >
-                <RefreshCw className="w-3 h-3" />
-                <span>Retry</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setIsPermissionsModalOpen(true)}
-                className="px-2.5 py-1 rounded-lg bg-cyan-950/80 hover:bg-cyan-900/80 border border-cyan-400/40 text-cyan-200 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
-              >
-                <Settings2 className="w-3 h-3" />
-                <span>Setup</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setConnectionError(null)}
-                aria-label="Dismiss error banner"
-                className="p-1 rounded hover:bg-rose-900/60 text-rose-300 cursor-pointer"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
-        )}
-      </main>
-
-      {/* Bottom Control Dock: Live Voice Link & Typing Input */}
-      <footer className="relative z-20 flex justify-center w-full">
-        <ControlDock
-          state={assistantState}
-          isLiveActive={isLiveActive}
-          isMicMuted={isMicMuted}
-          activeLanguage={activeLanguage}
-          onToggleLiveMode={handleToggleLiveMode}
-          onToggleMicMute={() => setIsMicMuted(!isMicMuted)}
-          onSendMessage={handleSendMessage}
-          onInterrupt={handleInterrupt}
-          soundFxEnabled={vitals.soundFxEnabled}
-        />
-      </footer>
-
-      {/* Transcript Archive Drawer */}
-      <ChatTranscriptDrawer
-        isOpen={isChatDrawerOpen}
-        onClose={() => setIsChatDrawerOpen(false)}
-        messages={messages}
-        onReplayAudio={handleReplayAudio}
-        onClearMessages={() => setMessages([])}
-        selectedAffectionName={selectedAffectionName}
-        userNickname={selectedAffectionName}
-      />
-
-      {/* Native Android SIM Calling Hub Modal */}
-      <SimCallingModal
-        isOpen={isCallingModalOpen}
-        onClose={() => setIsCallingModalOpen(false)}
-        soundFxEnabled={vitals.soundFxEnabled}
-        selectedAffectionName={selectedAffectionName}
-        activeLanguage={activeLanguage}
-        incomingCallStatus={incomingCallStatus}
-        onAnswerIncomingCall={() => void handleCallControlAction('answer_incoming_call')}
-        onRejectIncomingCall={() => void handleCallControlAction('reject_incoming_call')}
-        onEndActiveCall={() => void handleCallControlAction('end_active_call')}
-        onRefreshCallStatus={handleRefreshCallStatus}
-        onRequestCallPermissions={handleRequestCallPermissions}
-        onRequestDialerRole={handleRequestDialerRole}
-        callControlNotice={callControlNotice}
-      />
-
-      {/* APK & Mobile Assistant Export Hub Modal */}
-      <ApkExportModal
-        isOpen={isApkModalOpen}
-        onClose={() => setIsApkModalOpen(false)}
-        soundFxEnabled={vitals.soundFxEnabled}
-        deferredPrompt={deferredPrompt}
-        onInstallPwa={handleInstallPwa}
-        selectedAffectionName={selectedAffectionName}
-      />
-
-      {/* Clean Zoni Jarvis Settings Modal (Soul Core, Personality Matrix, Voice Modulator, Wake Word, Telemetry, Device Action Diagnostics) */}
-      <ErrorBoundary
-        variant="modal"
-        title="SETTINGS INTERFACE RECOVERY"
-        onDismiss={() => setIsSettingsModalOpen(false)}
-      >
-        <ZoniSettingsModal
-          isOpen={isSettingsModalOpen}
-          onClose={() => setIsSettingsModalOpen(false)}
-          vitals={vitals}
-          selectedAffectionName={selectedAffectionName}
-          isLiveActive={isLiveActive}
-          wsStatus={wsStatus}
-          backendHealth={backendHealth}
-          deviceDiagnostics={deviceDiagnostics}
-          wakeWordStatus={wakeWordStatus}
-          voiceLifecycleState={voiceLifecycleState}
-          onStartBackgroundWakeWord={handleStartBackgroundWakeWord}
-          onStopBackgroundWakeWord={handleStopBackgroundWakeWord}
-          onUpdateWakePhrase={handleUpdateWakePhrase}
-          onToggleLiveMode={handleToggleLiveMode}
-          onOpenBatterySettings={() => {
-            const bridge = getNativeAndroidBridge();
-            if (bridge?.openSystemSettings) {
-              bridge.openSystemSettings('battery');
-            } else {
-              setIsSettingsModalOpen(false);
-              setIsPermissionsModalOpen(true);
-            }
-          }}
-          onRequestMicPermission={() => {
-            const bridge = getNativeAndroidBridge();
-            if (bridge?.requestRuntimePermission) {
-              bridge.requestRuntimePermission('microphone');
-            } else {
-              void requestMicrophoneAccess();
-            }
-          }}
-          onSelectMode={handleSelectMode}
-          onUpdateAffectionName={handleUpdateAffectionName}
-          onSelectVoice={handleSelectVoice}
-          onToggleSoundFx={handleToggleSoundFx}
-          onReconnectLive={handleManualReconnectLive}
-          onRefreshDiagnostics={refreshDeviceDiagnostics}
-          onOpenAccessibilitySettings={() => {
-            const bridge = getNativeAndroidBridge();
-            if (bridge?.openSystemSettings) {
-              bridge.openSystemSettings('accessibility');
-            } else {
-              setIsSettingsModalOpen(false);
-              setIsPermissionsModalOpen(true);
-            }
-          }}
-          onOpenBackendSetup={() => {
-            setIsSettingsModalOpen(false);
-            setIsPermissionsModalOpen(true);
-          }}
-          onGeminiKeyChanged={handleManualReconnectLive}
-        />
-      </ErrorBoundary>
-
-      {/* Backend Health, Permissions & Background Setup Wizard Modal */}
-      <PermissionsSetupModal
-        isOpen={isPermissionsModalOpen}
-        onClose={() => setIsPermissionsModalOpen(false)}
-        report={permissionsReport}
-        onUpdateReport={(updated) => setPermissionsReport(updated)}
-        onMicInitialized={handleMicInitialized}
-        onLocationInitialized={handleLocationInitialized}
-        onNotificationInitialized={handleNotificationInitialized}
-        soundFxEnabled={vitals.soundFxEnabled}
-        activeLanguage={activeLanguage}
-        selectedAffectionName={selectedAffectionName}
-        backendHealth={backendHealth}
-        onRefreshBackendHealth={checkBackendHealth}
-        onBackendUrlChanged={handleManualReconnectLive}
-      />
-      {/* Offline connectivity indicator */}
-      <OfflineIndicator />
-    </div>
-  );
-}
+     
