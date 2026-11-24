@@ -2215,7 +2215,7 @@ export default function App() {
                         : `${prevUtterance} ${incomingChunk}`.trim();
                   }
 
-                  // Interim ও final—দুই transcript-ই UI-তে দেখাও।
+                  // Keep interim and final transcript visible in the chat.
                   setMessages((prev) =>
                     upsertUserSpeechTurnMessage(
                       prev,
@@ -2225,8 +2225,7 @@ export default function App() {
                     )
                   );
 
-                  // Interim transcript আসার সময় কোনো task execute করবে না।
-                  // কেবল Gemini-এর final transcript পাওয়ার পর execution schedule হবে।
+                  // Interim text is display-only; execute after Gemini finalizes it.
                   if (ev.isFinal !== true) {
                     continue;
                   }
@@ -2241,10 +2240,9 @@ export default function App() {
                     continue;
                   }
 
-                  // Final transcript-এর পর ছোট debounce—আগের 900ms অপেক্ষা কমানো হলো।
+                  // Short post-final debounce: 150ms instead of 900ms.
                   voiceTranscriptDebounceRef.current = setTimeout(() => {
                     voiceTranscriptDebounceRef.current = null;
-
                     if (isUnmountedRef.current || liveToolExecutedInTurnRef.current) return;
 
                     const cleanSpoken = utteranceSnapshot.trim();
@@ -2257,7 +2255,6 @@ export default function App() {
                     }
                     if (plan.steps.length === 0) return;
 
-                    // Pending approval/review কখনো auto-execute করবে না।
                     if (
                       plan.steps.length === 1 &&
                       (plan.steps[0].tool === 'approve_pending_action' ||
@@ -2268,11 +2265,9 @@ export default function App() {
 
                     void (async () => {
                       const outcomes: string[] = [];
-
                       for (const step of plan.steps) {
                         const mapped = mapTaskStepToAssistantTool(step, cleanSpoken);
                         if (!mapped) continue;
-
                         if (
                           !recentActionDeduplicatorRef.current.shouldExecute(
                             mapped.name,
@@ -2281,19 +2276,8 @@ export default function App() {
                         ) {
                           continue;
                         }
-
-                        const report = await executeValidatedAssistantTool(
-                          mapped.name,
-                          mapped.args
-                        );
-
-                        recordActionDiagnostic(
-                          'deterministic_native',
-                          mapped.name,
-                          mapped.args,
-                          report
-                        );
-
+                        const report = await executeValidatedAssistantTool(mapped.name, mapped.args);
+                        recordActionDiagnostic('deterministic_native', mapped.name, mapped.args, report);
                         outcomes.push(
                           formatLocalizedActionOutcome(
                             report,
@@ -2302,7 +2286,6 @@ export default function App() {
                           )
                         );
                       }
-
                       if (outcomes.length > 0) {
                         const combined = outcomes.join(' ');
                         setLatestTranscript(combined);
@@ -2320,7 +2303,7 @@ export default function App() {
                     })();
                   }, 150);
 
-                  // Flashlight command-ও final transcript থেকেই যাচাই করো।
+                  // Flashlight shortcuts also use only the final transcript.
                   if (isFlashlightOnCommand(utteranceSnapshot)) {
                     if (
                       recentActionDeduplicatorRef.current.shouldExecute('flashlight_control', {
@@ -2348,7 +2331,6 @@ export default function App() {
                       setLatestTranscript(feedback);
                     }
                   }
-
                   continue;
                 }
 
@@ -3283,4 +3265,12 @@ export default function App() {
         const appendDirectTurn = (replyText: string) => {
           setMessages((prev) => [
             ...prev,
-            { id: clientMsgId, role: 'user', text: cleanText, 
+            { id: clientMsgId, role: 'user', text: cleanText, timestamp: new Date(), lang: activeLanguage },
+            { id: `${clientMsgId}-reply`, role: 'assistant', text: replyText, timestamp: new Date(), lang: activeLanguage },
+          ]);
+          setLatestTranscript(replyText);
+          setAssistantState('idle');
+        };
+
+        // Routine actions execute directly without a pending approval step.
+        const sin
