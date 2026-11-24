@@ -150,6 +150,7 @@ export interface DirectLiveParsedEvent {
     | 'unknown';
   audio?: string;
   text?: string;
+  isFinal?: boolean;
   functionCalls?: Array<{ id?: string; name?: string; args?: Record<string, unknown> }>;
   newHandle?: string;
   resumable?: boolean;
@@ -1252,13 +1253,32 @@ export function parseDirectLiveServerMessage(
 
   const sc = message.serverContent;
   if (sc && typeof sc === 'object') {
-    const userText =
+    // Keep interim and final user transcriptions separate.
+    // App.tsx can use final transcription to trigger an action promptly.
+    const finalUserText = String(
       sc.inputTranscription?.text ||
-      sc.interimInputTranscription?.text ||
       message.inputTranscription?.text ||
-      '';
-    if (typeof userText === 'string' && userText.trim()) {
-      events.push({ type: 'user_transcript', text: userText });
+      ''
+    ).trim();
+
+    const interimUserText = String(
+      sc.interimInputTranscription?.text ||
+      message.interimInputTranscription?.text ||
+      ''
+    ).trim();
+
+    if (finalUserText) {
+      events.push({
+        type: 'user_transcript',
+        text: finalUserText,
+        isFinal: true,
+      });
+    } else if (interimUserText) {
+      events.push({
+        type: 'user_transcript',
+        text: interimUserText,
+        isFinal: false,
+      });
     }
 
     const parts = sc.modelTurn?.parts;
