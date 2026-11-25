@@ -609,6 +609,54 @@ class ZoniWebAppInterface(
             .toString()
     }
 
+    // --- Optional Consent-Based On-Device Speaker Verification (Local AES-256-GCM Encrypted Only) ---
+
+    @JavascriptInterface
+    fun getSpeakerVerificationStatusJson(): String {
+        val cfg = preferences.getSpeakerVerificationConfigSync()
+        val profile = preferences.getSpeakerVoiceprintSync()
+        return JSONObject()
+            .put("enabled", cfg.enabled)
+            .put("strictMode", cfg.strictMode)
+            .put("acceptThreshold", cfg.acceptThreshold.toDouble())
+            .put("uncertainThreshold", cfg.uncertainThreshold.toDouble())
+            .put("enrolled", profile != null && profile.sampleCount >= cfg.requiredEnrollmentSamples)
+            .put("sampleCount", profile?.sampleCount ?: 0)
+            .put("enrolledAtMs", profile?.enrolledAtMs ?: 0L)
+            .put("encryptedLocalOnly", preferences.isKeystoreBacked())
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun saveSpeakerVoiceprintJson(voiceprintJson: String): Boolean {
+        val parsed = com.zoni.jarvis.assistant.audio.SpeakerVoiceprint.fromJson(voiceprintJson)
+            ?: return false
+        return preferences.saveSpeakerVoiceprintSync(parsed)
+    }
+
+    @JavascriptInterface
+    fun setSpeakerVerificationConfigJson(configJson: String): String {
+        return try {
+            val obj = JSONObject(configJson)
+            val enabled = obj.optBoolean("enabled", false)
+            val strictMode = obj.optBoolean("strictMode", false)
+            val acceptThreshold = obj.optDouble("acceptThreshold", 0.78).toFloat()
+            val uncertainThreshold = obj.optDouble("uncertainThreshold", 0.56).toFloat()
+            preferences.setSpeakerVerificationConfigSync(
+                enabled = enabled,
+                strictMode = strictMode,
+                acceptThreshold = acceptThreshold,
+                uncertainThreshold = uncertainThreshold
+            )
+            getSpeakerVerificationStatusJson()
+        } catch (_: Exception) {
+            getSpeakerVerificationStatusJson()
+        }
+    }
+
+    @JavascriptInterface
+    fun clearSpeakerVoiceprint(): Boolean = preferences.clearSpeakerVoiceprintSync()
+
     @JavascriptInterface
     fun getDeviceInfoJson(): String = JSONObject()
         .put("manufacturer", Build.MANUFACTURER)

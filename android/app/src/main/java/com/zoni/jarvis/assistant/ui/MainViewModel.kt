@@ -105,6 +105,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var initializedConnection = false
     private var pendingVoiceStart = false
     private val persistedLiveMessageIds = HashSet<String>()
+    private val voiceLatencyTracker = com.zoni.jarvis.assistant.audio.VoiceLatencyTracker()
+    private var lastFastLocalCommandKey: String = ""
+    private var lastFastLocalCommandAtMs: Long = 0L
+    private var recordedFirstAudioForTurn: Boolean = false
 
     init {
         networkMonitor.start()
@@ -268,24 +272,75 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             is LiveServerEvent.UserTranscript -> {
                 val speechId = "live-user-speech-${event.turnId}"
+                var mergedTranscript = event.text.trim()
                 _uiState.update { state ->
                     val list = state.messages.toMutableList()
                     val idx = list.indexOfFirst { it.id == speechId }
                     if (idx >= 0) {
-                        val merged = MobileAssistantEngine.mergeTranscriptChunk(list[idx].text, event.text)
-                        list[idx] = list[idx].copy(text = merged)
+                        mergedTranscript = MobileAssistantEngine.mergeTranscriptChunk(list[idx].text, event.text)
+                        list[idx] = list[idx].copy(text = mergedTranscript)
                     } else {
-                        list.add(ChatMessage(id = speechId, role = MessageRole.USER, text = event.text.trim(), lang = state.settings.activeLanguage))
+                        list.add(ChatMessage(id = speechId, role = MessageRole.USER, text = mergedTranscript, lang = state.settings.activeLanguage))
                     }
                     state.copy(messages = list)
                 }
-                if (MobileAssistantEngine.isFlashlightOnCommand(event.text)) {
-                    hardware.setFlashlight(true)
-                } else if (MobileAssistantEngine.isFlashlightOffCommand(event.text)) {
-                    hardware.setFlashlight(false)
+
+                // Measure classification + execute safe deterministic local hardware/app commands directly
+                // without waiting for a Gemini cloud round-trip (strictly deduplicated within 2.5s window).
+                voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.COMMAND_CLASSIFICATION)
+                val parsedCmd = commandDispatcher.parseCommand(mergedTranscript)
+                voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.COMMAND_CLASSIFICATION)
+
+                val nowMs = System.currentTimeMillis()
+                val cmdKey = parsedCmd::class.simpleName + ":" + mergedTranscript.lowercase()
+                val isNewFastCmd = (cmdKey != lastFastLocalCommandKey) || (nowMs - lastFastLocalCommandAtMs > 2500L)
+                if (isNewFastCmd) {
+                    var executedFastLocal = false
+                    when (parsedCmd) {
+                        is com.zoni.jarvis.assistant.domain.VoiceCommand.Flashlight -> {
+                            voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
+                            hardware.setFlashlight(parsedCmd.enable)
+                            voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
+                            executedFastLocal = true
+                        }
+                        is com.zoni.jarvis.assistant.domain.VoiceCommand.Volume -> {
+                            voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
+                            hardware.adjustVolume(parsedCmd.action)
+                            voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
+                            executedFastLocal = true
+                        }
+                        is com.zoni.jarvis.assistant.domain.VoiceCommand.OpenCamera -> {
+                            voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
+                            hardware.openCamera()
+                            voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
+                            executedFastLocal = true
+                        }
+                        is com.zoni.jarvis.assistant.domain.VoiceCommand.OpenSettings -> {
+                            voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
+                            hardware.openSystemSettings(parsedCmd.target)
+                            voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
+                            executedFastLocal = true
+                        }
+                        is com.zoni.jarvis.assistant.domain.VoiceCommand.LaunchApp -> {
+                            voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
+                            hardware.launchInstalledApp(parsedCmd.appName)
+                            voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
+                            executedFastLocal = true
+                        }
+                        else -> Unit
+                    }
+                    if (executedFastLocal) {
+                        lastFastLocalCommandKey = cmdKey
+                        lastFastLocalCommandAtMs = nowMs
+                        voiceLatencyTracker.finishTurn(executedLocally = true)
+                    }
                 }
             }
             is LiveServerEvent.AudioChunk -> {
+                if (!recordedFirstAudioForTurn) {
+                    recordedFirstAudioForTurn = true
+                    voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.VOICE_RESPONSE)
+                }
                 val st = _uiState.value
                 if (!st.settings.voiceMuted && (st.isLiveActive || st.settings.voiceAutoPlay)) {
                     audioEngine.setAssistantSpeaking(true)
@@ -352,6 +407,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 currentAssistantTurnId = event.turnId + 1
                 userSpeechTurnId += 1
+                recordedFirstAudioForTurn = false
+                voiceLatencyTracker.finishTurn(executedLocally = false)
                 _uiState.update {
                     it.copy(
                         affectionLevel = (it.affectionLevel + 1).coerceAtMost(100),
@@ -394,7 +451,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return false
         }
         val started = audioEngine.startMicrophoneCapture(
-            onSpeechEnded = { liveClient.sendAudioStreamEnd() }
+            onSpeechEnded = {
+                recordedFirstAudioForTurn = false
+                voiceLatencyTracker.beginTurn()
+                voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.VOICE_RESPONSE)
+                liveClient.sendAudioStreamEnd()
+            }
         ) { base64Chunk ->
             liveClient.sendAudioChunk(base64Chunk)
         }

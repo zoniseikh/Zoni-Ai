@@ -158,9 +158,67 @@ class ZoniPreferences(private val context: Context) {
 
     fun isKeystoreBacked(): Boolean = secureKeyManager.isUsingAndroidKeystore()
 
+    // --- Optional Consent-Based On-Device Speaker Verification Profile (Encrypted at Rest) ---
+
+    fun getSpeakerVerificationConfigSync(): com.zoni.jarvis.assistant.audio.SpeakerVerificationConfig {
+        return com.zoni.jarvis.assistant.audio.SpeakerVerificationConfig(
+            enabled = syncPrefs.getBoolean(SYNC_SPEAKER_VERIFY_ENABLED, false),
+            strictMode = syncPrefs.getBoolean(SYNC_SPEAKER_VERIFY_STRICT, false),
+            acceptThreshold = syncPrefs.getFloat(SYNC_SPEAKER_ACCEPT_THRESHOLD, 0.78f).coerceIn(0.55f, 0.95f),
+            uncertainThreshold = syncPrefs.getFloat(SYNC_SPEAKER_UNCERTAIN_THRESHOLD, 0.56f).coerceIn(0.35f, 0.85f)
+        )
+    }
+
+    fun setSpeakerVerificationConfigSync(
+        enabled: Boolean,
+        strictMode: Boolean = false,
+        acceptThreshold: Float = 0.78f,
+        uncertainThreshold: Float = 0.56f
+    ) {
+        syncPrefs.edit()
+            .putBoolean(SYNC_SPEAKER_VERIFY_ENABLED, enabled)
+            .putBoolean(SYNC_SPEAKER_VERIFY_STRICT, strictMode)
+            .putFloat(SYNC_SPEAKER_ACCEPT_THRESHOLD, acceptThreshold.coerceIn(0.55f, 0.95f))
+            .putFloat(SYNC_SPEAKER_UNCERTAIN_THRESHOLD, uncertainThreshold.coerceIn(0.35f, 0.85f))
+            .apply()
+    }
+
+    fun saveSpeakerVoiceprintSync(voiceprint: com.zoni.jarvis.assistant.audio.SpeakerVoiceprint): Boolean {
+        val rawJson = voiceprint.toJson()
+        val (stored, encrypted) = secureKeyManager.encryptLocalMemoryText(rawJson)
+        syncPrefs.edit()
+            .putString(SYNC_SPEAKER_VOICEPRINT_PAYLOAD, stored)
+            .putBoolean(SYNC_SPEAKER_VOICEPRINT_ENCRYPTED, encrypted)
+            .apply()
+        return true
+    }
+
+    fun getSpeakerVoiceprintSync(): com.zoni.jarvis.assistant.audio.SpeakerVoiceprint? {
+        val stored = syncPrefs.getString(SYNC_SPEAKER_VOICEPRINT_PAYLOAD, null) ?: return null
+        val isEncrypted = syncPrefs.getBoolean(SYNC_SPEAKER_VOICEPRINT_ENCRYPTED, false)
+        val rawJson = secureKeyManager.decryptLocalMemoryText(stored, isEncrypted)
+        return com.zoni.jarvis.assistant.audio.SpeakerVoiceprint.fromJson(rawJson)
+    }
+
+    fun clearSpeakerVoiceprintSync(): Boolean {
+        syncPrefs.edit()
+            .remove(SYNC_SPEAKER_VOICEPRINT_PAYLOAD)
+            .remove(SYNC_SPEAKER_VOICEPRINT_ENCRYPTED)
+            .putBoolean(SYNC_SPEAKER_VERIFY_ENABLED, false)
+            .putBoolean(SYNC_SPEAKER_VERIFY_STRICT, false)
+            .apply()
+        return true
+    }
+
     companion object {
         private const val SYNC_WAKE_WORD_ENABLED = "zoni_sync_wake_word_enabled"
         private const val SYNC_BG_LISTENING_ENABLED = "zoni_sync_bg_listening_enabled"
         private const val SYNC_WAKE_PHRASE = "zoni_sync_wake_phrase"
+        private const val SYNC_SPEAKER_VERIFY_ENABLED = "zoni_sync_speaker_verify_enabled"
+        private const val SYNC_SPEAKER_VERIFY_STRICT = "zoni_sync_speaker_verify_strict"
+        private const val SYNC_SPEAKER_ACCEPT_THRESHOLD = "zoni_sync_speaker_accept_threshold"
+        private const val SYNC_SPEAKER_UNCERTAIN_THRESHOLD = "zoni_sync_speaker_uncertain_threshold"
+        private const val SYNC_SPEAKER_VOICEPRINT_PAYLOAD = "zoni_sync_speaker_voiceprint_payload"
+        private const val SYNC_SPEAKER_VOICEPRINT_ENCRYPTED = "zoni_sync_speaker_voiceprint_encrypted"
     }
 }

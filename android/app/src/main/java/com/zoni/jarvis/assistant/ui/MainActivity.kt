@@ -93,6 +93,7 @@ class MainActivity : ComponentActivity() {
     private var dashboardWebView: WebView? = null
     private var pendingWebPermissionRequest: PermissionRequest? = null
     private var pendingWakePayloadJson: String? = null
+    private var lastDispatchedWakeEventAtMs: Long = 0L
     private var webViewReloadEpoch = mutableIntStateOf(0)
 
     private val micPermissionLauncher = registerForActivityResult(
@@ -218,14 +219,24 @@ class MainActivity : ComponentActivity() {
         }
         lifecycleScope.launch {
             ZoniForegroundService.wakeWordEvents.collect { event ->
+                if (event.detectedAtMs > 0L && event.detectedAtMs == lastDispatchedWakeEventAtMs) {
+                    return@collect
+                }
+                lastDispatchedWakeEventAtMs = event.detectedAtMs
                 val payload = JSONObject()
                     .put("wakePhrase", event.wakePhrase)
                     .put("matchedVariant", event.matchedVariant)
                     .put("confidence", event.confidence.toDouble())
                     .put("remainingCommand", event.remainingCommand)
                     .put("detectedAtMs", event.detectedAtMs)
+                    .put("verificationLatencyMs", event.verificationLatencyMs)
+                    .put("recognitionMode", event.recognitionMode)
                     .toString()
-                dispatchNativeEvent("zoni:wake-word-detected", payload)
+                if (dashboardWebView != null) {
+                    dispatchNativeEvent("zoni:wake-word-detected", payload)
+                } else {
+                    pendingWakePayloadJson = payload
+                }
             }
         }
         lifecycleScope.launch {
@@ -643,13 +654,21 @@ class MainActivity : ComponentActivity() {
         }
 
         if (shouldAutoVoice) {
+            val eventTs = intent.getLongExtra(EXTRA_WAKE_EVENT_TIMESTAMP, 0L)
+            if (wakeTriggered && eventTs > 0L && eventTs == lastDispatchedWakeEventAtMs) {
+                // Already delivered via ZoniForegroundService.wakeWordEvents — avoid duplicate activation
+                return
+            }
+            if (eventTs > 0L) {
+                lastDispatchedWakeEventAtMs = eventTs
+            }
             if (hasBundledReactDashboard()) {
                 val payload = JSONObject()
                     .put("wakePhrase", "Zoni")
                     .put("matchedVariant", if (wakeTriggered) "zoni" else "assist_intent")
                     .put("confidence", 1.0)
                     .put("remainingCommand", remainingCmd)
-                    .put("detectedAtMs", System.currentTimeMillis())
+                    .put("detectedAtMs", if (eventTs > 0L) eventTs else System.currentTimeMillis())
                     .toString()
                 if (dashboardWebView != null) {
                     dispatchNativeEvent("zoni:wake-word-detected", payload)
@@ -701,6 +720,7 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_AUTO_VOICE = "extra_auto_voice"
         const val EXTRA_WAKE_WORD_TRIGGERED = "extra_wake_word_triggered"
         const val EXTRA_WAKE_REMAINING_COMMAND = "extra_wake_remaining_command"
+        const val EXTRA_WAKE_EVENT_TIMESTAMP = "extra_wake_event_timestamp"
         const val EXTRA_RESUME_WAKE_WORD = "extra_resume_wake_word"
     }
 }

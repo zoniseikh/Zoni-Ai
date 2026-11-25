@@ -65,8 +65,10 @@ export interface WakeWordStatusSnapshot {
   micPermissionGranted: boolean;
   notificationPermissionGranted: boolean;
   detectorEngine: string;
+  recognitionMode?: string;
   lastDetectedAtMs: number;
   lastConfidence: number;
+  lastVerificationLatencyMs?: number;
   lastError: string;
 }
 
@@ -105,14 +107,20 @@ const DEFAULT_ZONI_VARIANTS: ReadonlyArray<readonly [string, number]> = [
   ['জোনী', 0.98],
   ['জনি', 0.96],
   ['জনী', 0.95],
+  ['জুনি', 0.93],
+  ['জুনী', 0.92],
+  ['যোনি', 0.92],
+  ['যনী', 0.9],
   ['জোনি এআই', 1.0],
   ['জনি এআই', 0.98],
+  ['জোনি এ আই', 0.98],
   ['ज़ोनी', 1.0],
   ['जोनी', 0.96],
   ['ज़ोनी एआई', 1.0],
   ['zony', 0.92],
   ['zonie', 0.92],
   ['zoney', 0.9],
+  ['zooni', 0.89],
   ['joni', 0.86],
   ['jonie', 0.84],
   ['jony', 0.84],
@@ -133,6 +141,8 @@ const REJECTED_SIMILAR_WORDS = new Set([
   'bony',
   'bonny',
   'donny',
+  'bonnie',
+  'ronnie',
   'moni',
   'mini',
   'boni',
@@ -160,9 +170,16 @@ const OPTIONAL_PREFIXES = [
   'hello ',
   'ওহে ',
   'হেই ',
+  'হে ',
   'হ্যালো ',
+  'ও ',
+  'এই ',
+  'অ্যাই ',
+  'শোনো ',
+  'আরে ',
   'हे ',
   'ओए ',
+  'अरे ',
 ];
 
 export function normalizeWakeText(raw: string): string {
@@ -387,3 +404,251 @@ export function deriveVoiceLifecycleState(params: {
   if (wsStatus === 'connected') return 'CONNECTED';
   return 'IDLE';
 }
+
+/**
+ * Pure TypeScript mirror of `RollingPcmRingBuffer` in `ZoniWakeWordEngine.kt`.
+ * Maintains a rolling 2.0s 16kHz PCM buffer and slices strictly `[preRoll + utterance]`
+ * so preceding room conversation does not contaminate wake-word transcription.
+ */
+export class RollingPcmRingBuffer {
+  private readonly buffer: Int16Array;
+  private writeIndex = 0;
+  private filledSamples = 0;
+
+  constructor(capacitySamples: number = 32000) {
+    this.buffer = new Int16Array(Math.max(1600, capacitySamples));
+  }
+
+  public clear(): void {
+    this.writeIndex = 0;
+    this.filledSamples = 0;
+  }
+
+  public write(samples: Int16Array, count: number = samples.length): void {
+    const safeCount = Math.max(0, Math.min(count, samples.length));
+    for (let i = 0; i < safeCount; i++) {
+      this.buffer[this.writeIndex] = samples[i];
+      this.writeIndex = (this.writeIndex + 1) % this.buffer.length;
+      if (this.filledSamples < this.buffer.length) this.filledSamples++;
+    }
+  }
+
+  public snapshotSamples(maxSamples: number = this.filledSamples): Int16Array {
+    const take = Math.max(0, Math.min(maxSamples, this.filledSamples));
+    if (take === 0) return new Int16Array(0);
+    const out = new Int16Array(take);
+    const start = (this.writeIndex - take + this.buffer.length) % this.buffer.length;
+    for (let i = 0; i < take; i++) {
+      out[i] = this.buffer[(start + i) % this.buffer.length];
+    }
+    return out;
+  }
+
+  public snapshotUtteranceSamples(
+    utteranceWithTrailingSamples: number,
+    preRollSamples: number = 4800 // 300ms at 16kHz
+  ): Int16Array {
+    const desired = Math.min(
+      this.filledSamples,
+      Math.max(0, utteranceWithTrailingSamples) + Math.max(0, preRollSamples)
+    );
+    return this.snapshotSamples(desired);
+  }
+
+  public sizeSamples(): number {
+    return this.filledSamples;
+  }
+}
+
+export interface AcousticWakeGateConfig {
+  minUtteranceMs: number;
+  maxUtteranceMs: number;
+  trailingSilenceMs: number;
+  energyMultiplier: number;
+  minRmsThreshold: number;
+}
+
+export const DEFAULT_ACOUSTIC_WAKE_GATE_CONFIG: AcousticWakeGateConfig = {
+  minUtteranceMs: 150,
+  maxUtteranceMs: 1450,
+  trailingSilenceMs: 220,
+  energyMultiplier: 2.15,
+  minRmsThreshold: 0.013,
+};
+
+export interface AcousticFrameAnalysis {
+  rms: number;
+  zcr: number;
+  isVoiceFrame: boolean;
+  candidateReady: boolean;
+  utteranceDurationMs: number;
+  earlyOnsetDetected: boolean;
+  utteranceSpanSamples: number;
+}
+
+/**
+ * Pure TypeScript mirror of Stage-1 `AcousticWakeGate` in `ZoniWakeWordEngine.kt`.
+ */
+export class AcousticWakeGate {
+  private noiseFloorRms = 0.008;
+  private inSpeech = false;
+  private speechDurationMs = 0;
+  private silenceDurationMs = 0;
+  private totalSpanSamples = 0;
+  private peakRms = 0;
+  private voicedFrames = 0;
+  private earlyOnsetFired = false;
+
+  constructor(
+    private readonly config: AcousticWakeGateConfig = DEFAULT_ACOUSTIC_WAKE_GATE_CONFIG,
+    private readonly sampleRateHz: number = 16000
+  ) {}
+
+  public reset(): void {
+    this.inSpeech = false;
+    this.speechDurationMs = 0;
+    this.silenceDurationMs = 0;
+    this.totalSpanSamples = 0;
+    this.peakRms = 0;
+    this.voicedFrames = 0;
+    this.earlyOnsetFired = false;
+  }
+
+  public processPcm16Frame(samples: Int16Array, count: number = samples.length): AcousticFrameAnalysis {
+    if (count <= 0) {
+      return {
+        rms: 0,
+        zcr: 0,
+        isVoiceFrame: false,
+        candidateReady: false,
+        utteranceDurationMs: 0,
+        earlyOnsetDetected: false,
+        utteranceSpanSamples: 0,
+      };
+    }
+
+    const frameMs = Math.max(1, Math.floor((count * 1000) / this.sampleRateHz));
+    let sumSq = 0;
+    let zeroCrossings = 0;
+    let prev = samples[0];
+    for (let i = 0; i < count; i++) {
+      const s = samples[i];
+      const norm = s / 32768;
+      sumSq += norm * norm;
+      if ((s >= 0 && prev < 0) || (s < 0 && prev >= 0)) {
+        zeroCrossings++;
+      }
+      prev = s;
+    }
+
+    const rms = Math.sqrt(sumSq / count);
+    const zcr = zeroCrossings / count;
+    const speechLikeZcr = zcr >= 0.01 && zcr <= 0.42;
+    const dynamicThreshold = Math.max(
+      this.config.minRmsThreshold,
+      this.noiseFloorRms * this.config.energyMultiplier
+    );
+    const isVoice = rms >= dynamicThreshold && speechLikeZcr;
+
+    if (!isVoice) {
+      this.noiseFloorRms = Math.max(0.003, Math.min(0.08, this.noiseFloorRms * 0.94 + rms * 0.06));
+    }
+
+    let candidateReady = false;
+    let completedDuration = 0;
+    let completedSpanSamples = 0;
+    let earlyOnset = false;
+
+    if (isVoice) {
+      if (!this.inSpeech) {
+        this.inSpeech = true;
+        this.speechDurationMs = 0;
+        this.silenceDurationMs = 0;
+        this.totalSpanSamples = 0;
+        this.peakRms = rms;
+        this.voicedFrames = 0;
+        this.earlyOnsetFired = false;
+      }
+      this.speechDurationMs += frameMs;
+      this.silenceDurationMs = 0;
+      this.totalSpanSamples += count;
+      this.peakRms = Math.max(this.peakRms, rms);
+      this.voicedFrames++;
+
+      if (
+        !this.earlyOnsetFired &&
+        this.speechDurationMs >= 80 &&
+        this.voicedFrames >= 2 &&
+        this.peakRms >= dynamicThreshold * 1.1
+      ) {
+        this.earlyOnsetFired = true;
+        earlyOnset = true;
+      }
+    } else if (this.inSpeech) {
+      this.silenceDurationMs += frameMs;
+      this.totalSpanSamples += count;
+      if (this.silenceDurationMs >= this.config.trailingSilenceMs) {
+        const dur = this.speechDurationMs;
+        const validDuration =
+          dur >= this.config.minUtteranceMs && dur <= this.config.maxUtteranceMs;
+        const strongEnough = this.peakRms >= dynamicThreshold * 1.08 && this.voicedFrames >= 3;
+        if (validDuration && strongEnough) {
+          candidateReady = true;
+          completedDuration = dur;
+          completedSpanSamples = this.totalSpanSamples;
+        }
+        this.reset();
+      } else if (this.speechDurationMs > this.config.maxUtteranceMs) {
+        this.reset();
+      }
+    }
+
+    return {
+      rms,
+      zcr,
+      isVoiceFrame: isVoice,
+      candidateReady,
+      utteranceDurationMs: completedDuration,
+      earlyOnsetDetected: earlyOnset,
+      utteranceSpanSamples: completedSpanSamples,
+    };
+  }
+}
+
+const ACTIVE_CONVERSATION_STATES = new Set<VoiceLifecycleState>([
+  'WAKE_WORD_DETECTED',
+  'ACTIVATING',
+  'CONNECTING',
+  'CONNECTED',
+  'LISTENING',
+  'PROCESSING',
+  'SPEAKING',
+]);
+
+export function shouldAcceptWakeTrigger(
+  currentState: VoiceLifecycleState,
+  lastAcceptedAtMs: number,
+  nowMs: number = Date.now(),
+  cooldownMs: number = 2800
+): boolean {
+  if (ACTIVE_CONVERSATION_STATES.has(currentState)) return false;
+  if (lastAcceptedAtMs > 0 && nowMs - lastAcceptedAtMs < cooldownMs) return false;
+  return true;
+}
+
+export function computeMicRecoveryBackoffMs(consecutiveFailures: number): number {
+  const step = Math.max(1, Math.min(5, Math.floor(consecutiveFailures)));
+  switch (step) {
+    case 1:
+      return 600;
+    case 2:
+      return 1200;
+    case 3:
+      return 2500;
+    case 4:
+      return 4500;
+    default:
+      return 6000;
+  }
+}
+

@@ -103,6 +103,12 @@ export interface NativeAndroidBridge {
 
   // Network Quality Snapshot (Low-Internet Optimization)
   getNetworkQualityJson?: () => string;
+
+  // Optional Consent-Based On-Device Speaker Verification (Local AES-256-GCM Encrypted)
+  getSpeakerVerificationStatusJson?: () => string;
+  saveSpeakerVoiceprintJson?: (voiceprintJson: string) => boolean;
+  setSpeakerVerificationConfigJson?: (configJson: string) => string;
+  clearSpeakerVoiceprint?: () => boolean;
 }
 
 export type AndroidRuntimeMode =
@@ -1216,5 +1222,83 @@ export function getNativeNetworkQuality(): NativeNetworkQualitySnapshot | null {
     return null;
   }
 }
+
+export interface NativeSpeakerVerificationStatus {
+  enabled: boolean;
+  strictMode: boolean;
+  acceptThreshold: number;
+  uncertainThreshold: number;
+  enrolled: boolean;
+  sampleCount: number;
+  enrolledAtMs: number;
+  encryptedLocalOnly: boolean;
+}
+
+export function getNativeSpeakerVerificationStatus(): NativeSpeakerVerificationStatus | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getSpeakerVerificationStatusJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.getSpeakerVerificationStatusJson());
+    return {
+      enabled: Boolean(parsed?.enabled),
+      strictMode: Boolean(parsed?.strictMode),
+      acceptThreshold: Number(parsed?.acceptThreshold ?? 0.78),
+      uncertainThreshold: Number(parsed?.uncertainThreshold ?? 0.56),
+      enrolled: Boolean(parsed?.enrolled),
+      sampleCount: Number(parsed?.sampleCount ?? 0),
+      enrolledAtMs: Number(parsed?.enrolledAtMs ?? 0),
+      encryptedLocalOnly: Boolean(parsed?.encryptedLocalOnly),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function saveNativeSpeakerVoiceprint(voiceprintJson: string): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.saveSpeakerVoiceprintJson) return false;
+  try {
+    return Boolean(bridge.saveSpeakerVoiceprintJson(voiceprintJson));
+  } catch {
+    return false;
+  }
+}
+
+export function setNativeSpeakerVerificationConfig(config: {
+  enabled: boolean;
+  strictMode?: boolean;
+  acceptThreshold?: number;
+  uncertainThreshold?: number;
+}): NativeSpeakerVerificationStatus | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.setSpeakerVerificationConfigJson) return null;
+  try {
+    const raw = bridge.setSpeakerVerificationConfigJson(JSON.stringify(config));
+    const parsed = JSON.parse(raw);
+    return {
+      enabled: Boolean(parsed?.enabled),
+      strictMode: Boolean(parsed?.strictMode),
+      acceptThreshold: Number(parsed?.acceptThreshold ?? 0.78),
+      uncertainThreshold: Number(parsed?.uncertainThreshold ?? 0.56),
+      enrolled: Boolean(parsed?.enrolled),
+      sampleCount: Number(parsed?.sampleCount ?? 0),
+      enrolledAtMs: Number(parsed?.enrolledAtMs ?? 0),
+      encryptedLocalOnly: Boolean(parsed?.encryptedLocalOnly),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function clearNativeSpeakerVoiceprint(): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.clearSpeakerVoiceprint) return false;
+  try {
+    return Boolean(bridge.clearSpeakerVoiceprint());
+  } catch {
+    return false;
+  }
+}
+
 
 

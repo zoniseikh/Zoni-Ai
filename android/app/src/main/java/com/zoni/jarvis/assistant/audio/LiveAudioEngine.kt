@@ -10,6 +10,7 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.util.Base64
@@ -19,6 +20,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.json.JSONObject
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
@@ -94,8 +97,281 @@ class NativeEndOfSpeechDetector(
 }
 
 /**
+ * Pure JVM-testable first-order 85 Hz high-pass filter for 16 kHz 16-bit PCM.
+ * Removes DC offset, electrical hum, fan thump, and handling rumble without distorting speech formants.
+ */
+class SpeechHighPassFilter(
+    private val alpha: Float = 0.967f
+) {
+    private var prevInput: Float = 0f
+    private var prevOutput: Float = 0f
+
+    fun reset() {
+        prevInput = 0f
+        prevOutput = 0f
+    }
+
+    fun processPcm16LeInPlace(pcm16Le: ByteArray, length: Int) {
+        var i = 0
+        while (i + 1 < length) {
+            val low = pcm16Le[i].toInt() and 0xFF
+            val high = pcm16Le[i + 1].toInt()
+            val sample = ((high shl 8) or low).toShort().toFloat()
+            val filtered = alpha * (prevOutput + sample - prevInput)
+            prevInput = sample
+            prevOutput = filtered
+            val clamped = filtered.toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+            pcm16Le[i] = (clamped and 0xFF).toByte()
+            pcm16Le[i + 1] = ((clamped shr 8) and 0xFF).toByte()
+            i += 2
+        }
+    }
+}
+
+/**
+ * Pure JVM-testable Near-Field Speech Gate with 300ms Pre-Roll Buffer and Playback Echo-Tail Guard.
+ *
+ * Prevents:
+ * - Streaming silence and steady ambient noise to Gemini Live.
+ * - Interpreting Zoni's own TTS/Live playback (and its 260ms room reverberation tail) as user commands.
+ * - First-syllable loss by flushing the buffered 300ms pre-roll frames cleanly on speech onset.
+ *
+ * Note: Single-microphone noise suppression & near-field gating reduce ambient noise and softer distant
+ * talkers, but cannot completely isolate overlapping nearby speakers at similar loudness without optional
+ * speaker verification or wake-word confirmation.
+ */
+data class NearFieldGateDecision(
+    val shouldTransmitCurrentFrame: Boolean,
+    val preRollFramesToFlush: List<ByteArray>,
+    val isSpeechActive: Boolean,
+    val suppressedByPlaybackEcho: Boolean,
+    val shouldSignalAudioStreamEnd: Boolean,
+    val rms: Float,
+    val zcr: Float,
+    val noiseFloorRms: Float
+)
+
+class NearFieldVoiceGate(
+    private val minSpeechRms: Float = 0.017f,
+    private val snrStartMultiplier: Float = 2.65f,
+    private val snrContinueMultiplier: Float = 1.75f,
+    private val minSpeechMs: Long = 130L,
+    private val silenceEndMs: Long = 400L,
+    private val hangoverMs: Long = 220L,
+    private val echoTailHoldoverMs: Long = 260L,
+    private val maxPreRollFrames: Int = 6 // 6 * 50ms = 300ms pre-roll
+) {
+    private var noiseFloorRms: Float = 0.005f
+    private var inSpeech: Boolean = false
+    private var speechAccumMs: Long = 0L
+    private var silenceAccumMs: Long = 0L
+    private var echoTailRemainingMs: Long = 0L
+    private var wasAssistantSpeaking: Boolean = false
+    private val preRollQueue = ArrayDeque<ByteArray>()
+
+    fun reset() {
+        inSpeech = false
+        speechAccumMs = 0L
+        silenceAccumMs = 0L
+        preRollQueue.clear()
+    }
+
+    fun getNoiseFloorRms(): Float = noiseFloorRms
+
+    fun processPcm16LeFrame(
+        pcm16Le: ByteArray,
+        length: Int,
+        frameDurationMs: Long,
+        isAssistantSpeaking: Boolean
+    ): NearFieldGateDecision {
+        val safeMs = frameDurationMs.coerceAtLeast(1L)
+        val (rms, zcr) = computeRmsAndZcr(pcm16Le, length)
+
+        // 1. Suppress assistant playback audio + room reverberation tail
+        if (isAssistantSpeaking) {
+            wasAssistantSpeaking = true
+            echoTailRemainingMs = echoTailHoldoverMs
+            reset()
+            return NearFieldGateDecision(
+                shouldTransmitCurrentFrame = false,
+                preRollFramesToFlush = emptyList(),
+                isSpeechActive = false,
+                suppressedByPlaybackEcho = true,
+                shouldSignalAudioStreamEnd = false,
+                rms = rms,
+                zcr = zcr,
+                noiseFloorRms = noiseFloorRms
+            )
+        }
+
+        if (wasAssistantSpeaking && echoTailRemainingMs > 0L) {
+            echoTailRemainingMs = (echoTailRemainingMs - safeMs).coerceAtLeast(0L)
+            if (echoTailRemainingMs == 0L) {
+                wasAssistantSpeaking = false
+            }
+            reset()
+            return NearFieldGateDecision(
+                shouldTransmitCurrentFrame = false,
+                preRollFramesToFlush = emptyList(),
+                isSpeechActive = false,
+                suppressedByPlaybackEcho = true,
+                shouldSignalAudioStreamEnd = false,
+                rms = rms,
+                zcr = zcr,
+                noiseFloorRms = noiseFloorRms
+            )
+        }
+
+        val speechLikeZcr = zcr in 0.008f..0.44f
+        val startThreshold = max(minSpeechRms, noiseFloorRms * snrStartMultiplier)
+        val continueThreshold = max(minSpeechRms * 0.62f, noiseFloorRms * snrContinueMultiplier)
+        val frameCopy = if (length == pcm16Le.size) pcm16Le.copyOf() else pcm16Le.copyOf(length)
+
+        if (!inSpeech) {
+            if (rms >= startThreshold && speechLikeZcr) {
+                inSpeech = true
+                speechAccumMs = safeMs
+                silenceAccumMs = 0L
+                val flushed = preRollQueue.toList()
+                preRollQueue.clear()
+                return NearFieldGateDecision(
+                    shouldTransmitCurrentFrame = true,
+                    preRollFramesToFlush = flushed,
+                    isSpeechActive = true,
+                    suppressedByPlaybackEcho = false,
+                    shouldSignalAudioStreamEnd = false,
+                    rms = rms,
+                    zcr = zcr,
+                    noiseFloorRms = noiseFloorRms
+                )
+            }
+
+            // Idle non-speech frame: adapt ambient noise floor smoothly and retain only 300ms pre-roll
+            noiseFloorRms = (noiseFloorRms * 0.94f + rms * 0.06f).coerceIn(0.002f, 0.032f)
+            preRollQueue.addLast(frameCopy)
+            while (preRollQueue.size > maxPreRollFrames) {
+                preRollQueue.removeFirst()
+            }
+            return NearFieldGateDecision(
+                shouldTransmitCurrentFrame = false,
+                preRollFramesToFlush = emptyList(),
+                isSpeechActive = false,
+                suppressedByPlaybackEcho = false,
+                shouldSignalAudioStreamEnd = false,
+                rms = rms,
+                zcr = zcr,
+                noiseFloorRms = noiseFloorRms
+            )
+        }
+
+        // Currently in active speech
+        if (rms >= continueThreshold && speechLikeZcr) {
+            speechAccumMs += safeMs
+            silenceAccumMs = 0L
+            return NearFieldGateDecision(
+                shouldTransmitCurrentFrame = true,
+                preRollFramesToFlush = emptyList(),
+                isSpeechActive = true,
+                suppressedByPlaybackEcho = false,
+                shouldSignalAudioStreamEnd = false,
+                rms = rms,
+                zcr = zcr,
+                noiseFloorRms = noiseFloorRms
+            )
+        }
+
+        silenceAccumMs += safeMs
+        // Keep streaming brief hangover frames so final consonants are not clipped
+        val withinHangover = silenceAccumMs <= hangoverMs
+        if (silenceAccumMs >= silenceEndMs) {
+            val hadRealSpeech = speechAccumMs >= minSpeechMs
+            reset()
+            return NearFieldGateDecision(
+                shouldTransmitCurrentFrame = false,
+                preRollFramesToFlush = emptyList(),
+                isSpeechActive = false,
+                suppressedByPlaybackEcho = false,
+                shouldSignalAudioStreamEnd = hadRealSpeech,
+                rms = rms,
+                zcr = zcr,
+                noiseFloorRms = noiseFloorRms
+            )
+        }
+
+        return NearFieldGateDecision(
+            shouldTransmitCurrentFrame = withinHangover,
+            preRollFramesToFlush = emptyList(),
+            isSpeechActive = withinHangover,
+            suppressedByPlaybackEcho = false,
+            shouldSignalAudioStreamEnd = false,
+            rms = rms,
+            zcr = zcr,
+            noiseFloorRms = noiseFloorRms
+        )
+    }
+
+    companion object {
+        fun computeRmsAndZcr(pcm16Le: ByteArray, length: Int): Pair<Float, Float> {
+            val sampleCount = length / 2
+            if (sampleCount <= 0) return 0f to 0f
+            var sumSq = 0.0
+            var zeroCrossings = 0
+            var prev = 0
+            var i = 0
+            var idx = 0
+            while (i + 1 < length) {
+                val low = pcm16Le[i].toInt() and 0xFF
+                val high = pcm16Le[i + 1].toInt()
+                val sample = ((high shl 8) or low).toShort().toInt()
+                val norm = sample / 32768.0
+                sumSq += norm * norm
+                if (idx > 0 && ((sample >= 0 && prev < 0) || (sample < 0 && prev >= 0))) {
+                    zeroCrossings++
+                }
+                prev = sample
+                i += 2
+                idx++
+            }
+            val rms = sqrt(sumSq / sampleCount).toFloat()
+            val zcr = zeroCrossings.toFloat() / sampleCount.toFloat()
+            return rms to zcr
+        }
+    }
+}
+
+data class AudioEffectDiagnostics(
+    val aecAvailable: Boolean = false,
+    val aecEnabled: Boolean = false,
+    val nsAvailable: Boolean = false,
+    val nsEnabled: Boolean = false,
+    val agcAvailable: Boolean = false,
+    val agcDisabled: Boolean = false,
+    val highPassFilterActive: Boolean = true,
+    val nearFieldGateActive: Boolean = true,
+    val audioSource: String = "VOICE_COMMUNICATION",
+    val inputSampleRateHz: Int = LiveAudioEngine.INPUT_SAMPLE_RATE,
+    val outputSampleRateHz: Int = LiveAudioEngine.OUTPUT_SAMPLE_RATE
+) {
+    fun toJson(): String = JSONObject()
+        .put("aecAvailable", aecAvailable)
+        .put("aecEnabled", aecEnabled)
+        .put("nsAvailable", nsAvailable)
+        .put("nsEnabled", nsEnabled)
+        .put("agcAvailable", agcAvailable)
+        .put("agcDisabled", agcDisabled)
+        .put("highPassFilterActive", highPassFilterActive)
+        .put("nearFieldGateActive", nearFieldGateActive)
+        .put("audioSource", audioSource)
+        .put("inputSampleRateHz", inputSampleRateHz)
+        .put("outputSampleRateHz", outputSampleRateHz)
+        .toString()
+}
+
+/**
  * Genuine Native Android Full-Duplex PCM Audio Engine for Gemini Live:
- * - Capture: 16,000 Hz Mono 16-bit PCM (with hardware AEC + Noise Suppression)
+ * - Capture: 16,000 Hz Mono 16-bit PCM (with hardware AEC + NS enabled, hardware AGC disabled
+ *   when supported so distant voices aren't boosted during pauses, 85Hz high-pass filter, and
+ *   NearFieldVoiceGate with 300ms pre-roll + 260ms playback echo-tail suppression)
  * - Playback: 24,000 Hz Mono 16-bit PCM low-latency streaming via AudioTrack
  * - Manages Android AudioFocus (gain, transient loss / phone call interruption, clean abandon)
  * - Emits normalized audio amplitude (0f..1f) for real-time Arc Reactor visualization
@@ -114,6 +390,7 @@ class LiveAudioEngine(
     private var audioRecord: AudioRecord? = null
     private var echoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
+    private var automaticGainControl: AutomaticGainControl? = null
     private var captureJob: Job? = null
 
     private var audioTrack: AudioTrack? = null
@@ -124,6 +401,9 @@ class LiveAudioEngine(
 
     @Volatile
     private var resetEosRequested: Boolean = false
+
+    @Volatile
+    private var effectDiagnostics: AudioEffectDiagnostics = AudioEffectDiagnostics()
 
     private var focusRequest: AudioFocusRequest? = null
     private var hasAudioFocus: Boolean = false
@@ -151,13 +431,15 @@ class LiveAudioEngine(
     @Volatile
     var isVoiceMuted: Boolean = false
 
+    fun getAudioEffectDiagnostics(): AudioEffectDiagnostics = effectDiagnostics
+
     fun requestVoiceAudioFocus(): Boolean {
         val am = audioManager ?: return true
         if (hasAudioFocus) return true
         return try {
             val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val attrs = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
                 val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
@@ -238,47 +520,99 @@ class LiveAudioEngine(
                 return false
             }
 
-            // Enable hardware Acoustic Echo Cancellation & Noise Suppression where supported
+            // Configure hardware audio effects honestly and record actual availability
             val sessionId = recorder.audioSessionId
-            if (AcousticEchoCanceler.isAvailable()) {
-                echoCanceler = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
+            val aecAvail = AcousticEchoCanceler.isAvailable()
+            if (aecAvail) {
+                echoCanceler = try {
+                    AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
+                } catch (_: Exception) {
+                    null
+                }
             }
-            if (NoiseSuppressor.isAvailable()) {
-                noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
+            val nsAvail = NoiseSuppressor.isAvailable()
+            if (nsAvail) {
+                noiseSuppressor = try {
+                    NoiseSuppressor.create(sessionId)?.apply { enabled = true }
+                } catch (_: Exception) {
+                    null
+                }
             }
+            val agcAvail = AutomaticGainControl.isAvailable()
+            if (agcAvail) {
+                // Disable hardware AGC when supported so quiet pauses do NOT boost distant nearby voices
+                automaticGainControl = try {
+                    AutomaticGainControl.create(sessionId)?.apply { enabled = false }
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            effectDiagnostics = AudioEffectDiagnostics(
+                aecAvailable = aecAvail,
+                aecEnabled = echoCanceler?.enabled == true,
+                nsAvailable = nsAvail,
+                nsEnabled = noiseSuppressor?.enabled == true,
+                agcAvailable = agcAvail,
+                agcDisabled = automaticGainControl != null && automaticGainControl?.enabled == false,
+                highPassFilterActive = true,
+                nearFieldGateActive = true,
+                audioSource = "VOICE_COMMUNICATION",
+                inputSampleRateHz = INPUT_SAMPLE_RATE,
+                outputSampleRateHz = OUTPUT_SAMPLE_RATE
+            )
 
             audioRecord = recorder
             recorder.startRecording()
 
             captureJob = scope.launch {
                 val readBuffer = ByteArray(CHUNK_BYTES)
-                val eosDetector = NativeEndOfSpeechDetector()
+                val highPass = SpeechHighPassFilter()
+                val nearFieldGate = NearFieldVoiceGate()
 
                 while (isActive) {
                     val read = recorder.read(readBuffer, 0, readBuffer.size)
                     if (read > 0 && !isMicMuted) {
-                        val amp = computeRmsAmplitude(readBuffer, read)
-                        onAmplitudeChanged(amp)
-                        val chunk = if (read == readBuffer.size) readBuffer else readBuffer.copyOf(read)
-                        val b64 = Base64.encodeToString(chunk, Base64.NO_WRAP)
-                        onBase64PcmChunk(b64)
-
-                        // Fast adaptive end-of-speech detection (~420ms post-speech silence)
                         val frameMs = ((read / 2) * 1000L) / INPUT_SAMPLE_RATE
                         if (resetEosRequested) {
-                            eosDetector.reset()
+                            nearFieldGate.reset()
+                            highPass.reset()
                             resetEosRequested = false
                         }
-                        val decision = eosDetector.processFrame(
-                            amplitude = amp,
+
+                        // Remove DC offset and low-frequency rumble (<85 Hz) without damaging speech
+                        highPass.processPcm16LeInPlace(readBuffer, read)
+
+                        val gateDecision = nearFieldGate.processPcm16LeFrame(
+                            pcm16Le = readBuffer,
+                            length = read,
                             frameDurationMs = frameMs,
                             isAssistantSpeaking = isAssistantSpeakingNow
                         )
-                        if (decision.shouldSignalAudioStreamEnd) {
+
+                        // Drive Arc Reactor visual level only when not suppressed by playback echo
+                        onAmplitudeChanged(
+                            if (gateDecision.suppressedByPlaybackEcho) 0f
+                            else min(1f, gateDecision.rms * 3.8f)
+                        )
+
+                        // Flush 300ms pre-roll frames on speech onset so first syllables are preserved
+                        if (gateDecision.preRollFramesToFlush.isNotEmpty()) {
+                            for (preFrame in gateDecision.preRollFramesToFlush) {
+                                onBase64PcmChunk(Base64.encodeToString(preFrame, Base64.NO_WRAP))
+                            }
+                        }
+
+                        // Only transmit active near-field speech / brief consonant hangover frames
+                        if (gateDecision.shouldTransmitCurrentFrame) {
+                            val chunk = if (read == readBuffer.size) readBuffer else readBuffer.copyOf(read)
+                            onBase64PcmChunk(Base64.encodeToString(chunk, Base64.NO_WRAP))
+                        }
+
+                        if (gateDecision.shouldSignalAudioStreamEnd) {
                             onSpeechEnded()
                         }
                     } else if (isMicMuted) {
-                        eosDetector.reset()
+                        nearFieldGate.reset()
                         onAmplitudeChanged(0f)
                     }
                 }
@@ -303,6 +637,11 @@ class LiveAudioEngine(
         } catch (_: Exception) {
         }
         noiseSuppressor = null
+        try {
+            automaticGainControl?.release()
+        } catch (_: Exception) {
+        }
+        automaticGainControl = null
         try {
             audioRecord?.stop()
         } catch (_: Exception) {
@@ -335,10 +674,12 @@ class LiveAudioEngine(
             )
             if (minBuf <= 0) return null
 
+            // Pair USAGE_VOICE_COMMUNICATION with VOICE_COMMUNICATION AudioRecord so Android HAL AEC
+            // receives a clean speaker reference signal on supported devices.
             val trackBuilder = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )

@@ -248,6 +248,243 @@ export class FastEndOfSpeechDetector {
 }
 
 /**
+ * Computes zero-crossing rate (0..1) for a Float32 mono PCM buffer.
+ */
+export function computePcmZeroCrossingRate(samples: Float32Array): number {
+  if (samples.length < 2) return 0;
+  let crossings = 0;
+  let prev = samples[0];
+  for (let i = 1; i < samples.length; i++) {
+    const cur = samples[i];
+    if ((cur >= 0 && prev < 0) || (cur < 0 && prev >= 0)) {
+      crossings++;
+    }
+    prev = cur;
+  }
+  return crossings / samples.length;
+}
+
+/**
+ * First-order 85 Hz high-pass filter for 16 kHz Float32 PCM.
+ * Removes DC offset, electrical hum, and wind/fan rumble without distorting speech formants.
+ */
+export class SpeechHighPassFilter {
+  private prevInput = 0;
+  private prevOutput = 0;
+
+  constructor(private readonly alpha: number = 0.967) {}
+
+  public reset(): void {
+    this.prevInput = 0;
+    this.prevOutput = 0;
+  }
+
+  public process(samples: Float32Array): Float32Array {
+    const out = new Float32Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+      const x = samples[i];
+      const y = this.alpha * (this.prevOutput + x - this.prevInput);
+      this.prevInput = x;
+      this.prevOutput = y;
+      out[i] = Math.max(-1, Math.min(1, y));
+    }
+    return out;
+  }
+}
+
+export interface NearFieldSpeechGateDecision {
+  shouldTransmitCurrentFrame: boolean;
+  preRollFramesToFlush: Float32Array[];
+  isSpeechActive: boolean;
+  suppressedByPlaybackEcho: boolean;
+  shouldSignalAudioStreamEnd: boolean;
+  rms: number;
+  zcr: number;
+  noiseFloorRms: number;
+}
+
+/**
+ * Near-field speech gate with 300ms pre-roll buffer and 260ms playback echo-tail holdover.
+ * Prevents streaming silence, steady room noise, and Zoni's own speaker playback to Gemini Live
+ * while preserving the user's opening syllable on speech onset.
+ */
+export class NearFieldSpeechGate {
+  private noiseFloorRms = 0.005;
+  private inSpeech = false;
+  private speechAccumMs = 0;
+  private silenceAccumMs = 0;
+  private echoTailRemainingMs = 0;
+  private wasAssistantSpeaking = false;
+  private preRollQueue: Float32Array[] = [];
+
+  constructor(
+    private readonly options: {
+      minSpeechRms?: number;
+      snrStartMultiplier?: number;
+      snrContinueMultiplier?: number;
+      minSpeechMs?: number;
+      silenceEndMs?: number;
+      hangoverMs?: number;
+      echoTailHoldoverMs?: number;
+      maxPreRollFrames?: number;
+    } = {}
+  ) {}
+
+  public reset(): void {
+    this.inSpeech = false;
+    this.speechAccumMs = 0;
+    this.silenceAccumMs = 0;
+    this.preRollQueue = [];
+  }
+
+  public getNoiseFloorRms(): number {
+    return this.noiseFloorRms;
+  }
+
+  public processFrame(
+    pcm16k: Float32Array,
+    frameDurationMs: number,
+    isAssistantSpeaking: boolean
+  ): NearFieldSpeechGateDecision {
+    const safeMs = Math.max(1, frameDurationMs);
+    const rms = computePcmRms(pcm16k);
+    const zcr = computePcmZeroCrossingRate(pcm16k);
+    const echoTailHoldoverMs = this.options.echoTailHoldoverMs ?? 260;
+
+    if (isAssistantSpeaking) {
+      this.wasAssistantSpeaking = true;
+      this.echoTailRemainingMs = echoTailHoldoverMs;
+      this.reset();
+      return {
+        shouldTransmitCurrentFrame: false,
+        preRollFramesToFlush: [],
+        isSpeechActive: false,
+        suppressedByPlaybackEcho: true,
+        shouldSignalAudioStreamEnd: false,
+        rms,
+        zcr,
+        noiseFloorRms: this.noiseFloorRms,
+      };
+    }
+
+    if (this.wasAssistantSpeaking && this.echoTailRemainingMs > 0) {
+      this.echoTailRemainingMs = Math.max(0, this.echoTailRemainingMs - safeMs);
+      if (this.echoTailRemainingMs === 0) {
+        this.wasAssistantSpeaking = false;
+      }
+      this.reset();
+      return {
+        shouldTransmitCurrentFrame: false,
+        preRollFramesToFlush: [],
+        isSpeechActive: false,
+        suppressedByPlaybackEcho: true,
+        shouldSignalAudioStreamEnd: false,
+        rms,
+        zcr,
+        noiseFloorRms: this.noiseFloorRms,
+      };
+    }
+
+    const minSpeechRms = this.options.minSpeechRms ?? 0.017;
+    const snrStartMultiplier = this.options.snrStartMultiplier ?? 2.65;
+    const snrContinueMultiplier = this.options.snrContinueMultiplier ?? 1.75;
+    const minSpeechMs = this.options.minSpeechMs ?? 130;
+    const silenceEndMs = this.options.silenceEndMs ?? 400;
+    const hangoverMs = this.options.hangoverMs ?? 220;
+    const maxPreRollFrames = this.options.maxPreRollFrames ?? 6;
+
+    const speechLikeZcr = zcr >= 0.008 && zcr <= 0.44;
+    const startThreshold = Math.max(minSpeechRms, this.noiseFloorRms * snrStartMultiplier);
+    const continueThreshold = Math.max(
+      minSpeechRms * 0.62,
+      this.noiseFloorRms * snrContinueMultiplier
+    );
+
+    if (!this.inSpeech) {
+      if (rms >= startThreshold && speechLikeZcr) {
+        this.inSpeech = true;
+        this.speechAccumMs = safeMs;
+        this.silenceAccumMs = 0;
+        const flushed = this.preRollQueue.slice();
+        this.preRollQueue = [];
+        return {
+          shouldTransmitCurrentFrame: true,
+          preRollFramesToFlush: flushed,
+          isSpeechActive: true,
+          suppressedByPlaybackEcho: false,
+          shouldSignalAudioStreamEnd: false,
+          rms,
+          zcr,
+          noiseFloorRms: this.noiseFloorRms,
+        };
+      }
+
+      this.noiseFloorRms = Math.min(
+        0.032,
+        Math.max(0.002, this.noiseFloorRms * 0.94 + rms * 0.06)
+      );
+      this.preRollQueue.push(new Float32Array(pcm16k));
+      while (this.preRollQueue.length > maxPreRollFrames) {
+        this.preRollQueue.shift();
+      }
+      return {
+        shouldTransmitCurrentFrame: false,
+        preRollFramesToFlush: [],
+        isSpeechActive: false,
+        suppressedByPlaybackEcho: false,
+        shouldSignalAudioStreamEnd: false,
+        rms,
+        zcr,
+        noiseFloorRms: this.noiseFloorRms,
+      };
+    }
+
+    if (rms >= continueThreshold && speechLikeZcr) {
+      this.speechAccumMs += safeMs;
+      this.silenceAccumMs = 0;
+      return {
+        shouldTransmitCurrentFrame: true,
+        preRollFramesToFlush: [],
+        isSpeechActive: true,
+        suppressedByPlaybackEcho: false,
+        shouldSignalAudioStreamEnd: false,
+        rms,
+        zcr,
+        noiseFloorRms: this.noiseFloorRms,
+      };
+    }
+
+    this.silenceAccumMs += safeMs;
+    const withinHangover = this.silenceAccumMs <= hangoverMs;
+    if (this.silenceAccumMs >= silenceEndMs) {
+      const hadRealSpeech = this.speechAccumMs >= minSpeechMs;
+      this.reset();
+      return {
+        shouldTransmitCurrentFrame: false,
+        preRollFramesToFlush: [],
+        isSpeechActive: false,
+        suppressedByPlaybackEcho: false,
+        shouldSignalAudioStreamEnd: hadRealSpeech,
+        rms,
+        zcr,
+        noiseFloorRms: this.noiseFloorRms,
+      };
+    }
+
+    return {
+      shouldTransmitCurrentFrame: withinHangover,
+      preRollFramesToFlush: [],
+      isSpeechActive: withinHangover,
+      suppressedByPlaybackEcho: false,
+      shouldSignalAudioStreamEnd: false,
+      rms,
+      zcr,
+      noiseFloorRms: this.noiseFloorRms,
+    };
+  }
+}
+
+/**
  * Converts Float32 audio buffer from microphone into 16-bit PCM Base64 string
  */
 export function pcm16ToBase64(float32Array: Float32Array): string {

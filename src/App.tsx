@@ -15,13 +15,15 @@ import { OfflineIndicator } from './components/PWAInstallButton';
 import {
   FastEndOfSpeechDetector,
   LiveAudioPlayer,
-  computePcmRms,
+  NearFieldSpeechGate,
+  SpeechHighPassFilter,
   pcm16ToBase64,
   playProceduralSfx,
   getAudioContext,
   resampleFloat32Pcm,
   stopAllBrowserSpeech,
 } from './utils/audio';
+import { VoiceLatencyTracker } from './utils/voiceLatency';
 import {
   detectAssistantIntent,
   detectLanguageSwitchCommand,
@@ -617,6 +619,13 @@ export default function App() {
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const fastEosDetectorRef = useRef<FastEndOfSpeechDetector>(new FastEndOfSpeechDetector());
+  const nearFieldGateRef = useRef<NearFieldSpeechGate>(new NearFieldSpeechGate());
+  const speechHighPassRef = useRef<SpeechHighPassFilter>(new SpeechHighPassFilter());
+  const voiceLatencyTrackerRef = useRef<VoiceLatencyTracker>(new VoiceLatencyTracker());
+  const lastHandledWakeEventRef = useRef<{ detectedAtMs: number; handledAtMs: number }>({
+    detectedAtMs: 0,
+    handledAtMs: 0,
+  });
   const isAssistantSpeakingRef = useRef<boolean>(false);
   const lastFlashlightActionRef = useRef<{ payload: string; time: number } | null>(null);
   const liveToolsReadyRef = useRef<boolean>(false);
@@ -2281,6 +2290,8 @@ export default function App() {
                 );
               }
               if (outcomes.length > 0) {
+                voiceLatencyTrackerRef.current.markStageEnd('action_execution');
+                voiceLatencyTrackerRef.current.finishTurn(true);
                 const combined = outcomes.join(' ');
                 setLatestTranscript(combined);
                 setMessages((prev) => [
@@ -2295,7 +2306,7 @@ export default function App() {
                 ]);
               }
             })();
-          }, isFinal ? 120 : 300);
+          }, isFinal ? 25 : 160);
 
           if (isFlashlightOnCommand(String(text))) {
             if (
@@ -2328,9 +2339,13 @@ export default function App() {
 
         const handleAudioChunkEvent = (audioB64: string) => {
           clearTurnTimeout();
+          if (!receivedAudioInTurnRef.current) {
+            voiceLatencyTrackerRef.current.markStageEnd('voice_response');
+          }
           receivedAudioInTurnRef.current = true;
           isAssistantSpeakingRef.current = true;
           fastEosDetectorRef.current.reset();
+          nearFieldGateRef.current.reset();
           if (pendingChatFallbackRef.current) {
             pendingChatFallbackRef.current.answered = true;
           }
@@ -2384,6 +2399,7 @@ export default function App() {
           stopAllSpeechPlayback();
           isAssistantSpeakingRef.current = false;
           fastEosDetectorRef.current.reset();
+          nearFieldGateRef.current.reset();
           receivedAudioInTurnRef.current = false;
           currentTurnIdRef.current += 1;
           setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
@@ -2393,6 +2409,8 @@ export default function App() {
           clearTurnTimeout();
           isAssistantSpeakingRef.current = false;
           fastEosDetectorRef.current.reset();
+          nearFieldGateRef.current.reset();
+          voiceLatencyTrackerRef.current.finishTurn(false);
           currentTurnIdRef.current += 1;
           userSpeechTurnIdRef.current += 1;
           receivedAudioInTurnRef.current = false;
@@ -3301,7 +3319,7 @@ export default function App() {
         return;
       }
 
-      // 2. Request microphone hardware stream
+      // 2. Request microphone hardware stream (AEC + NS enabled, AGC disabled so distant voices aren't boosted during pauses)
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -3309,7 +3327,7 @@ export default function App() {
             sampleRate: 16000,
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true,
+            autoGainControl: false,
           },
         });
 
@@ -3351,11 +3369,14 @@ export default function App() {
         silentSink.gain.value = 0;
         scriptProcessorRef.current = processor;
         fastEosDetectorRef.current.reset();
+        nearFieldGateRef.current.reset();
+        speechHighPassRef.current.reset();
         isAssistantSpeakingRef.current = false;
 
         processor.onaudioprocess = (e) => {
           if (isMicMutedRef.current) {
             fastEosDetectorRef.current.reset();
+            nearFieldGateRef.current.reset();
             return;
           }
           if (
@@ -3372,33 +3393,55 @@ export default function App() {
             return;
           }
           const rawChannelData = e.inputBuffer.getChannelData(0);
-          // Always resample to exact 16,000 Hz PCM so Android WebView 48kHz hardware
-          // mics never stretch speech 3x slower or break Gemini Live VAD.
-          const pcm16k = resampleFloat32Pcm(rawChannelData, actualSampleRate, 16000);
-          const base64Audio = pcm16ToBase64(pcm16k);
+          // Resample to exact 16,000 Hz PCM + apply 85Hz high-pass filter to remove hum/rumble
+          const resampled16k = resampleFloat32Pcm(rawChannelData, actualSampleRate, 16000);
+          const pcm16k = speechHighPassRef.current.process(resampled16k);
+          const frameDurationMs = (pcm16k.length / 16000) * 1000;
+          const assistantTalking =
+            isAssistantSpeakingRef.current || Boolean(liveAudioPlayerRef.current?.isPlaying());
+
+          // Near-field gate suppresses silence, steady ambient noise, and Zoni's playback echo (+260ms tail)
+          // while flushing 300ms pre-roll frames on speech onset so opening syllables are never clipped.
+          const gateDecision = nearFieldGateRef.current.processFrame(
+            pcm16k,
+            frameDurationMs,
+            assistantTalking
+          );
+
           try {
             const weakNet =
               typeof navigator !== 'undefined' &&
               Boolean((navigator as any).connection?.effectiveType) &&
               ['slow-2g', '2g', '3g'].includes(String((navigator as any).connection.effectiveType));
-            if (!shouldDropLiveAudioForBackpressure(wsRef.current.bufferedAmount || 0, weakNet)) {
+
+            const sendPcmFrame = (frame: Float32Array) => {
+              if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+              if (shouldDropLiveAudioForBackpressure(wsRef.current.bufferedAmount || 0, weakNet)) {
+                return;
+              }
+              const b64 = pcm16ToBase64(frame);
               if (liveTransportModeRef.current === 'byok_direct') {
-                wsRef.current.send(JSON.stringify(buildDirectLiveAudioMessage(base64Audio)));
+                wsRef.current.send(JSON.stringify(buildDirectLiveAudioMessage(b64)));
               } else {
-                wsRef.current.send(JSON.stringify({ audio: base64Audio }));
+                wsRef.current.send(JSON.stringify({ audio: b64 }));
+              }
+            };
+
+            if (gateDecision.preRollFramesToFlush.length > 0) {
+              for (const preFrame of gateDecision.preRollFramesToFlush) {
+                sendPcmFrame(preFrame);
               }
             }
+            if (gateDecision.shouldTransmitCurrentFrame) {
+              sendPcmFrame(pcm16k);
+            }
 
-            const frameDurationMs = (pcm16k.length / 16000) * 1000;
-            const rms = computePcmRms(pcm16k);
-            const assistantTalking =
-              isAssistantSpeakingRef.current || Boolean(liveAudioPlayerRef.current?.isPlaying());
-            const vad = fastEosDetectorRef.current.processFrame(
-              rms,
-              frameDurationMs,
-              assistantTalking
-            );
-            if (vad.shouldSignalAudioStreamEnd && wsRef.current?.readyState === WebSocket.OPEN) {
+            if (
+              gateDecision.shouldSignalAudioStreamEnd &&
+              wsRef.current?.readyState === WebSocket.OPEN
+            ) {
+              voiceLatencyTrackerRef.current.beginTurn();
+              voiceLatencyTrackerRef.current.markStageStart('voice_response');
               // Immediately flush Gemini Live's audio buffer so Zoni replies right away
               if (liveTransportModeRef.current === 'byok_direct') {
                 wsRef.current.send(JSON.stringify(buildDirectLiveAudioStreamEndMessage()));
@@ -4181,8 +4224,29 @@ export default function App() {
     };
 
     const onWakeWordDetected = (ev: Event) => {
-      const detail = (ev as CustomEvent<{ wakeWord?: string; confidence?: number; remainingCommand?: string }>).detail || {};
-      const phrase = detail.wakeWord || wakeWordStatus?.wakePhrase || 'Zoni';
+      const detail =
+        (
+          ev as CustomEvent<{
+            wakeWord?: string;
+            wakePhrase?: string;
+            confidence?: number;
+            remainingCommand?: string;
+            detectedAtMs?: number;
+          }>
+        ).detail || {};
+
+      // Deduplicate repeated wake dispatches (e.g. Flow + LaunchIntent overlap)
+      const nowMs = Date.now();
+      const eventTs = Number(detail.detectedAtMs || 0);
+      if (
+        (eventTs > 0 && eventTs === lastHandledWakeEventRef.current.detectedAtMs) ||
+        nowMs - lastHandledWakeEventRef.current.handledAtMs < 1500
+      ) {
+        return;
+      }
+      lastHandledWakeEventRef.current = { detectedAtMs: eventTs, handledAtMs: nowMs };
+
+      const phrase = detail.wakePhrase || detail.wakeWord || wakeWordStatus?.wakePhrase || 'Zoni';
       const cleanedRemainder = stripWakePhraseFromCommand(detail.remainingCommand || '', phrase);
 
       if (cleanedRemainder) {

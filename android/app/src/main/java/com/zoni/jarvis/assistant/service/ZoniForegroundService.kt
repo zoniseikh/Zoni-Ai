@@ -64,7 +64,12 @@ class ZoniForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         preferences = ZoniPreferences(applicationContext)
-        wakeWordEngine = ZoniWakeWordEngine(applicationContext)
+        wakeWordEngine = ZoniWakeWordEngine(
+            context = applicationContext,
+            speakerProfileProvider = {
+                preferences.getSpeakerVoiceprintSync() to preferences.getSpeakerVerificationConfigSync()
+            }
+        )
         isServiceRunning = true
     }
 
@@ -224,6 +229,7 @@ class ZoniForegroundService : Service() {
             voiceState = VoiceLifecycleState.WAKE_WORD_DETECTED,
             lastDetectedAtMs = event.detectedAtMs,
             lastConfidence = event.confidence,
+            lastVerificationLatencyMs = event.verificationLatencyMs,
             lastError = ""
         )
         _wakeWordEvents.tryEmit(event)
@@ -255,6 +261,7 @@ class ZoniForegroundService : Service() {
                 putExtra(MainActivity.EXTRA_AUTO_VOICE, true)
                 putExtra(MainActivity.EXTRA_WAKE_WORD_TRIGGERED, true)
                 putExtra(MainActivity.EXTRA_WAKE_REMAINING_COMMAND, event.remainingCommand)
+                putExtra(MainActivity.EXTRA_WAKE_EVENT_TIMESTAMP, event.detectedAtMs)
             }
             startActivity(launchIntent)
         } catch (e: Exception) {
@@ -512,6 +519,7 @@ class ZoniForegroundService : Service() {
         voiceState: VoiceLifecycleState = _statusFlow.value.voiceState,
         lastDetectedAtMs: Long = _statusFlow.value.lastDetectedAtMs,
         lastConfidence: Float = _statusFlow.value.lastConfidence,
+        lastVerificationLatencyMs: Double = _statusFlow.value.lastVerificationLatencyMs,
         lastError: String = _statusFlow.value.lastError
     ) {
         _statusFlow.value = WakeWordStatusSnapshot(
@@ -523,8 +531,10 @@ class ZoniForegroundService : Service() {
             micPermissionGranted = hasMicPermission(this),
             notificationPermissionGranted = hasNotificationPermission(this),
             detectorEngine = wakeWordEngine?.engineName ?: "on_device_two_stage_acoustic_gate",
+            recognitionMode = wakeWordEngine?.currentRecognitionMode ?: ZoniWakeWordEngine.MODE_ON_DEVICE_OFFLINE,
             lastDetectedAtMs = lastDetectedAtMs,
             lastConfidence = lastConfidence,
+            lastVerificationLatencyMs = lastVerificationLatencyMs,
             lastError = lastError
         )
     }
