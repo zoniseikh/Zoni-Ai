@@ -28,6 +28,7 @@ import com.zoni.jarvis.assistant.device.ContactCallManager
 import com.zoni.jarvis.assistant.device.ContactCallResolution
 import com.zoni.jarvis.assistant.device.FlashlightController
 import com.zoni.jarvis.assistant.device.FlashlightResult
+import com.zoni.jarvis.assistant.device.SmartContactMatcher
 import com.zoni.jarvis.assistant.domain.NumberNormalizer
 import com.zoni.jarvis.assistant.domain.NumberNormalizerResult
 import com.zoni.jarvis.assistant.screen.ScreenCaptureManager
@@ -1137,8 +1138,18 @@ class DeviceActionExecutor(private val context: Context) {
                 messageText = cleanMsg
             )
             is ContactCallResolution.MultipleNumbersForContact -> {
+                val dedupedNumbers = SmartContactMatcher.deduplicatePhoneNumbers(resolved.numbers)
+                if (dedupedNumbers.size == 1) {
+                    return dispatchResolvedCommunication(
+                        request = request,
+                        actionType = actionType,
+                        recipientName = resolved.name,
+                        phoneNumber = dedupedNumbers[0],
+                        messageText = cleanMsg
+                    )
+                }
                 val arr = JSONArray()
-                resolved.numbers.forEach { num ->
+                dedupedNumbers.forEach { num ->
                     arr.put(JSONObject().put("name", resolved.name).put("phone", num))
                 }
                 TypedActionResult(
@@ -1157,10 +1168,29 @@ class DeviceActionExecutor(private val context: Context) {
             }
             is ContactCallResolution.MultipleMatches -> {
                 val arr = JSONArray()
+                val seenCandidateKeys = HashSet<String>()
+                var singleName = ""
+                var singlePhone = ""
                 resolved.candidates.take(6).forEach { c ->
-                    c.phoneNumbers.forEach { num ->
-                        arr.put(JSONObject().put("id", c.id).put("name", c.displayName).put("phone", num))
+                    val nameKey = SmartContactMatcher.normalizeDisplayText(c.displayName).lowercase()
+                    SmartContactMatcher.deduplicatePhoneNumbers(c.phoneNumbers).forEach { num ->
+                        val phoneKey = SmartContactMatcher.canonicalPhoneKey(num)
+                        val dedupKey = "$nameKey|$phoneKey"
+                        if (phoneKey.isNotEmpty() && seenCandidateKeys.add(dedupKey)) {
+                            singleName = c.displayName
+                            singlePhone = num
+                            arr.put(JSONObject().put("id", c.id).put("name", c.displayName).put("phone", num))
+                        }
                     }
+                }
+                if (arr.length() == 1 && singlePhone.isNotBlank()) {
+                    return dispatchResolvedCommunication(
+                        request = request,
+                        actionType = actionType,
+                        recipientName = singleName,
+                        phoneNumber = singlePhone,
+                        messageText = cleanMsg
+                    )
                 }
                 TypedActionResult(
                     actionId = request.actionId,
@@ -1774,19 +1804,28 @@ class DeviceActionExecutor(private val context: Context) {
 
     private fun resolveContactCandidates(query: String): JSONArray {
         val arr = JSONArray()
+        val seenKeys = HashSet<String>()
+        fun appendUnique(id: String, name: String, phone: String) {
+            val nameKey = SmartContactMatcher.normalizeDisplayText(name).lowercase()
+            val phoneKey = SmartContactMatcher.canonicalPhoneKey(phone)
+            if (phoneKey.isEmpty()) return
+            if (seenKeys.add("$nameKey|$phoneKey")) {
+                arr.put(JSONObject().put("id", id).put("name", name).put("phone", phone))
+            }
+        }
         when (val res = contactCallManager.resolveContact(query)) {
             is ContactCallResolution.ReadyToCall -> {
-                arr.put(JSONObject().put("id", "1").put("name", res.name).put("phone", res.number))
+                appendUnique("1", res.name, res.number)
             }
             is ContactCallResolution.MultipleNumbersForContact -> {
-                res.numbers.forEachIndexed { idx, num ->
-                    arr.put(JSONObject().put("id", "$idx").put("name", res.name).put("phone", num))
+                SmartContactMatcher.deduplicatePhoneNumbers(res.numbers).forEachIndexed { idx, num ->
+                    appendUnique("$idx", res.name, num)
                 }
             }
             is ContactCallResolution.MultipleMatches -> {
                 res.candidates.take(8).forEach { c ->
-                    c.phoneNumbers.forEach { num ->
-                        arr.put(JSONObject().put("id", c.id).put("name", c.displayName).put("phone", num))
+                    SmartContactMatcher.deduplicatePhoneNumbers(c.phoneNumbers).forEach { num ->
+                        appendUnique(c.id, c.displayName, num)
                     }
                 }
             }

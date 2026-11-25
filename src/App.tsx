@@ -81,6 +81,7 @@ import {
   persistLocalConversationTurn,
   tryOfflineLocalMemoryRecall,
 } from './utils/localMemory';
+import { deduplicateContactCandidates } from './utils/simCalling';
 import {
   getNativeAndroidBridge,
   detectAndroidRuntimeMode,
@@ -982,7 +983,7 @@ export default function App() {
           );
           if (nativeReport) {
             const rawCandidates = Array.isArray(nativeReport.data?.candidates)
-              ? nativeReport.data.candidates
+              ? deduplicateContactCandidates(nativeReport.data.candidates)
               : [];
             const needsDisambiguation =
               (nativeReport.status === 'multiple_contacts' ||

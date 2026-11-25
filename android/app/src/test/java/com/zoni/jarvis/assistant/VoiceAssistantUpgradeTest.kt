@@ -404,4 +404,44 @@ class VoiceAssistantUpgradeTest {
         val missing = SmartContactMatcher.resolveFromContacts("জাহানারা", contacts, useDirectCall = true)
         assertTrue(missing is ContactCallResolution.ContactNotFound)
     }
+
+    @Test
+    fun smartContactMatcherEliminatesDuplicateCrossAccountNumbersWhilePreservingDistinctNumbersAndContacts() {
+        // 1. Single contact saved once but returned twice from Android accounts (e.g. Google + SIM)
+        val duplicatedSingleNumber = listOf(
+            ContactMatch("42", "Rahim", listOf("9876543210")),
+            ContactMatch("109", "Rahim", listOf("9876543210"))
+        )
+        val resSingle = SmartContactMatcher.resolveFromContacts("রহিমকে", duplicatedSingleNumber, useDirectCall = true)
+        assertTrue("Expected ReadyToCall instead of duplicate MultipleMatches, got $resSingle", resSingle is ContactCallResolution.ReadyToCall)
+        assertEquals("Rahim", (resSingle as ContactCallResolution.ReadyToCall).name)
+        assertEquals("+919876543210", resSingle.number)
+
+        // 2. Same phone number in multiple formats (country code, trunk 0, 00 prefix, spaces, hyphens, BiDi marks)
+        val multiFormattedSameNumber = listOf(
+            ContactMatch("42", "Rahim", listOf("9876543210", "\u202A+91 98765-43210\u202C")),
+            ContactMatch("109", "rahim", listOf("09876543210", "0091 98765 43210"))
+        )
+        val resFormatted = SmartContactMatcher.resolveFromContacts("Rahim", multiFormattedSameNumber, useDirectCall = true)
+        assertTrue(resFormatted is ContactCallResolution.ReadyToCall)
+        assertEquals("+919876543210", (resFormatted as ContactCallResolution.ReadyToCall).number)
+
+        // 3. One contact with TWO genuinely different phone numbers (even when synced twice) -> BOTH preserved
+        val twoDistinctNumbersSameContact = listOf(
+            ContactMatch("42", "Rahim", listOf("9876543210", "9123456789")),
+            ContactMatch("109", "Rahim", listOf("+91 98765-43210"))
+        )
+        val resTwoNums = SmartContactMatcher.resolveFromContacts("রহিম", twoDistinctNumbersSameContact, useDirectCall = true)
+        assertTrue(resTwoNums is ContactCallResolution.MultipleNumbersForContact)
+        assertEquals(2, (resTwoNums as ContactCallResolution.MultipleNumbersForContact).numbers.size)
+
+        // 4. TWO genuinely different contacts with the SAME name "Rahim" and DIFFERENT numbers -> BOTH preserved
+        val twoDifferentRahims = listOf(
+            ContactMatch("10", "Rahim", listOf("9876543210")),
+            ContactMatch("11", "Rahim", listOf("9123456789"))
+        )
+        val resTwoContacts = SmartContactMatcher.resolveFromContacts("Rahim", twoDifferentRahims, useDirectCall = true)
+        assertTrue(resTwoContacts is ContactCallResolution.MultipleMatches)
+        assertEquals(2, (resTwoContacts as ContactCallResolution.MultipleMatches).candidates.size)
+    }
 }

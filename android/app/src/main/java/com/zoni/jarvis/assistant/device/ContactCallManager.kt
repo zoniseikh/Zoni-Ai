@@ -250,22 +250,63 @@ object SmartContactMatcher {
         return dp[a.length][b.length]
     }
 
+    private val INVISIBLE_PHONE_CHARS_REGEX = Regex("[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]")
+
     /**
-     * Deduplicates phone numbers representing the same line (e.g. "+8801711223344" and "01711-223344"),
-     * keeping the cleanest normalized format (preferring international '+' prefix when present).
+     * Produces a canonical comparison key for phone numbers regardless of formatting,
+     * spaces, hyphens, parentheses, BiDi characters, leading trunk '0', '00' prefix,
+     * or country code differences (e.g., "9876543210", "098765-43210", "+91 98765 43210",
+     * "00919876543210" all share canonical key "9876543210").
+     */
+    fun canonicalPhoneKey(rawNumber: String): String {
+        val cleaned = INVISIBLE_PHONE_CHARS_REGEX.replace(rawNumber, "").trim()
+        if (cleaned.isEmpty()) return ""
+        val ascii = NumberNormalizer.convertDigitsToAscii(cleaned)
+        val digitsOnly = ascii.filter { it.isDigit() }
+        if (digitsOnly.length < 3) return ""
+        if (digitsOnly.length >= 10) {
+            return digitsOnly.takeLast(10)
+        }
+        val withoutLeadingZeros = digitsOnly.trimStart('0')
+        return if (withoutLeadingZeros.length >= 3) withoutLeadingZeros else digitsOnly
+    }
+
+    /**
+     * Normalizes a raw saved phone number into a clean dialable string while handling
+     * invisible BiDi characters, '00' international dialing prefix, and Indian trunk '0'.
+     */
+    fun normalizeSavedPhoneNumber(raw: String): String {
+        var cleaned = INVISIBLE_PHONE_CHARS_REGEX.replace(raw, "").trim()
+        if (cleaned.isEmpty()) return ""
+        cleaned = NumberNormalizer.convertDigitsToAscii(cleaned)
+
+        val compact = cleaned.filter { it.isDigit() || it == '+' }
+        val normalizedInput = when {
+            compact.startsWith("00") && compact.length >= 12 -> "+${compact.drop(2)}"
+            !compact.startsWith("+") && compact.length == 11 && compact[0] == '0' && compact[1] in '6'..'9' ->
+                compact.drop(1)
+            else -> cleaned
+        }
+
+        val normResult = NumberNormalizer.normalizePhoneNumber(normalizedInput)
+        return if (normResult is NumberNormalizerResult.ValidCandidate) {
+            normResult.normalizedNumber
+        } else {
+            normalizedInput.filter { it.isDigit() || it == '+' }
+        }
+    }
+
+    /**
+     * Deduplicates phone numbers representing the same line (e.g. "+91 98765-43210", "09876543210",
+     * "9876543210" or "+8801711223344" and "01711-223344"), keeping the cleanest normalized format
+     * (preferring international '+' prefix when present).
      */
     fun deduplicatePhoneNumbers(rawNumbers: List<String>): List<String> {
         val byKey = LinkedHashMap<String, String>()
         for (raw in rawNumbers) {
-            val normResult = NumberNormalizer.normalizePhoneNumber(raw)
-            val clean = if (normResult is NumberNormalizerResult.ValidCandidate) {
-                normResult.normalizedNumber
-            } else {
-                raw.filter { it.isDigit() || it == '+' }
-            }
-            val digitsOnly = clean.filter { it.isDigit() }
-            if (digitsOnly.length < 3) continue
-            val dedupKey = if (digitsOnly.length >= 10) digitsOnly.takeLast(10) else digitsOnly
+            val clean = normalizeSavedPhoneNumber(raw)
+            val dedupKey = canonicalPhoneKey(clean.ifEmpty { raw })
+            if (dedupKey.isEmpty()) continue
             val existing = byKey[dedupKey]
             if (existing == null || (clean.startsWith("+") && !existing.startsWith("+"))) {
                 byKey[dedupKey] = clean
@@ -275,9 +316,72 @@ object SmartContactMatcher {
     }
 
     /**
+     * Deduplicates contacts across Android accounts/sources (e.g., Google + SIM + Device + WhatsApp
+     * creating separate CONTACT_ID rows for the exact same person & phone number):
+     * - Merges entries with identical contact ID.
+     * - Merges entries with identical normalized display name that share at least one canonical phone number.
+     * - Preserves genuinely distinct phone numbers for the same contact.
+     * - Preserves genuinely distinct contacts that share the same name but have completely different phone numbers.
+     */
+    fun deduplicateContacts(contacts: List<ContactMatch>): List<ContactMatch> {
+        // Pass 1: merge by explicit contact ID and deduplicate each contact's numbers
+        val byId = LinkedHashMap<String, ContactMatch>()
+        for (contact in contacts) {
+            val cleanName = normalizeDisplayText(contact.displayName)
+            val dedupedPhones = deduplicatePhoneNumbers(contact.phoneNumbers)
+            if (cleanName.isEmpty() || dedupedPhones.isEmpty()) continue
+
+            val idKey = contact.id.trim()
+            if (idKey.isNotEmpty() && byId.containsKey(idKey)) {
+                val prev = byId.getValue(idKey)
+                byId[idKey] = prev.copy(
+                    phoneNumbers = deduplicatePhoneNumbers(prev.phoneNumbers + dedupedPhones)
+                )
+            } else {
+                val mapKey = idKey.ifEmpty { "__anon_${byId.size}" }
+                byId[mapKey] = contact.copy(
+                    displayName = cleanName,
+                    phoneNumbers = dedupedPhones
+                )
+            }
+        }
+
+        // Pass 2: merge duplicate cross-source contacts (same normalized name + overlapping canonical phone key)
+        val merged = mutableListOf<ContactMatch>()
+        val mergedNameKeys = mutableListOf<String>()
+        val mergedPhoneKeys = mutableListOf<MutableSet<String>>()
+
+        for (candidate in byId.values) {
+            val nameKey = candidate.displayName.lowercase()
+            val candKeys = candidate.phoneNumbers
+                .map { canonicalPhoneKey(it) }
+                .filter { it.isNotEmpty() }
+                .toSet()
+            if (candKeys.isEmpty()) continue
+
+            val matchIdx = merged.indices.firstOrNull { idx ->
+                mergedNameKeys[idx] == nameKey && mergedPhoneKeys[idx].any { it in candKeys }
+            }
+
+            if (matchIdx != null) {
+                val existing = merged[matchIdx]
+                val combinedNumbers = deduplicatePhoneNumbers(existing.phoneNumbers + candidate.phoneNumbers)
+                merged[matchIdx] = existing.copy(phoneNumbers = combinedNumbers)
+                mergedPhoneKeys[matchIdx].addAll(candKeys)
+            } else {
+                merged.add(candidate)
+                mergedNameKeys.add(nameKey)
+                mergedPhoneKeys.add(candKeys.toMutableSet())
+            }
+        }
+
+        return merged
+    }
+
+    /**
      * Pure JVM-testable resolution over a list of contacts.
-     * Applies strict confidence threshold (>= 70), exact-winner priority over partial matches,
-     * safe disambiguation on ties, and phone-number deduplication.
+     * Applies cross-source & phone-number deduplication, strict confidence threshold (>= 70),
+     * exact-winner priority over partial matches, and safe disambiguation on genuine ties.
      */
     fun resolveFromContacts(
         rawQuery: String,
@@ -289,12 +393,12 @@ object SmartContactMatcher {
             return ContactCallResolution.ContactNotFound(cleanQuery)
         }
 
-        val scored = contacts.mapNotNull { contact ->
-            val dedupedPhones = deduplicatePhoneNumbers(contact.phoneNumbers)
-            if (dedupedPhones.isEmpty()) return@mapNotNull null
+        val uniqueContacts = deduplicateContacts(contacts)
+
+        val scored = uniqueContacts.mapNotNull { contact ->
             val score = scoreContactName(contact.displayName, cleanQuery)
             if (score < 70) return@mapNotNull null
-            Pair(contact.copy(phoneNumbers = dedupedPhones), score)
+            Pair(contact, score)
         }.sortedWith(compareByDescending<Pair<ContactMatch, Int>> { it.second }.thenBy { it.first.displayName.lowercase() })
 
         if (scored.isEmpty()) {
@@ -344,9 +448,10 @@ class ContactCallManager(private val context: Context) {
     }
 
     /**
-     * Resolves a Bengali or English contact name query against the Android Contacts Provider
+     * Resolves a Bengali, Hindi, or English contact name query against the Android Contacts Provider
      * using [SmartContactMatcher] (exact Unicode, case-insensitive English, cross-script
-     * Bengali <-> English transliteration, phonetic, kinship, and controlled fuzzy matching).
+     * Bengali <-> English transliteration, phonetic, kinship, controlled fuzzy matching,
+     * and cross-account/LOOKUP_KEY/canonical-phone deduplication).
      */
     fun resolveContact(contactQuery: String): ContactCallResolution {
         if (!hasContactPermission()) {
@@ -362,8 +467,10 @@ class ContactCallManager(private val context: Context) {
         val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
         val projection = arrayOf(
             ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
+            ContactsContract.CommonDataKinds.Phone.LOOKUP_KEY,
             ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-            ContactsContract.CommonDataKinds.Phone.NUMBER
+            ContactsContract.CommonDataKinds.Phone.NUMBER,
+            ContactsContract.CommonDataKinds.Phone.NORMALIZED_NUMBER
         )
 
         var cursor: Cursor? = null
@@ -377,25 +484,32 @@ class ContactCallManager(private val context: Context) {
             )
 
             if (cursor != null && cursor.moveToFirst()) {
-                val tempMap = LinkedHashMap<String, Pair<String, MutableList<String>>>()
+                val tempMap = LinkedHashMap<String, Triple<String, String, MutableList<String>>>()
                 val idIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.CONTACT_ID)
+                val lookupIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.LOOKUP_KEY)
                 val nameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
                 val numberIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                val normalizedIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NORMALIZED_NUMBER)
 
                 do {
                     val id = if (idIndex >= 0) cursor.getString(idIndex) else null
+                    val lookupKey = if (lookupIndex >= 0) cursor.getString(lookupIndex) else null
                     val name = if (nameIndex >= 0) cursor.getString(nameIndex) else null
                     val rawNumber = if (numberIndex >= 0) cursor.getString(numberIndex) else null
-                    if (id.isNullOrBlank() || name.isNullOrBlank() || rawNumber.isNullOrBlank()) continue
+                    val normalizedNumber = if (normalizedIndex >= 0) cursor.getString(normalizedIndex) else null
+                    val chosenNumber = rawNumber?.takeIf { it.isNotBlank() } ?: normalizedNumber
+                    if (id.isNullOrBlank() || name.isNullOrBlank() || chosenNumber.isNullOrBlank()) continue
 
-                    val existing = tempMap.getOrPut(id) { Pair(name, mutableListOf()) }
-                    existing.second.add(rawNumber)
+                    // Group by Android LOOKUP_KEY when available (aggregates linked RawContacts cleanly), else CONTACT_ID
+                    val groupKey = lookupKey?.takeIf { it.isNotBlank() } ?: id
+                    val existing = tempMap.getOrPut(groupKey) { Triple(id, name, mutableListOf()) }
+                    existing.third.add(chosenNumber)
                 } while (cursor.moveToNext())
 
-                for ((id, pair) in tempMap) {
-                    val dedupedNumbers = SmartContactMatcher.deduplicatePhoneNumbers(pair.second)
+                for ((_, triple) in tempMap) {
+                    val dedupedNumbers = SmartContactMatcher.deduplicatePhoneNumbers(triple.third)
                     if (dedupedNumbers.isNotEmpty()) {
-                        allContacts.add(ContactMatch(id, pair.first, dedupedNumbers))
+                        allContacts.add(ContactMatch(triple.first, triple.second, dedupedNumbers))
                     }
                 }
             }

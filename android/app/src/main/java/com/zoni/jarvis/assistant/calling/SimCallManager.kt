@@ -9,6 +9,7 @@ import com.zoni.jarvis.assistant.db.CallSessionEntity
 import com.zoni.jarvis.assistant.db.ZoniDatabase
 import com.zoni.jarvis.assistant.device.ContactCallManager
 import com.zoni.jarvis.assistant.device.ContactCallResolution
+import com.zoni.jarvis.assistant.device.SmartContactMatcher
 import com.zoni.jarvis.assistant.domain.NumberNormalizer
 import com.zoni.jarvis.assistant.domain.NumberNormalizerResult
 import kotlinx.coroutines.CoroutineScope
@@ -35,24 +36,28 @@ class SimCallManager(
 ) {
     fun searchContactsAsJson(query: String): String {
         val array = JSONArray()
+        val seenKeys = HashSet<String>()
+        fun appendUnique(id: String, name: String, phone: String) {
+            val nameKey = SmartContactMatcher.normalizeDisplayText(name).lowercase()
+            val phoneKey = SmartContactMatcher.canonicalPhoneKey(phone)
+            if (phoneKey.isEmpty()) return
+            if (seenKeys.add("$nameKey|$phoneKey")) {
+                array.put(JSONObject().put("id", id).put("name", name).put("phone", phone))
+            }
+        }
         when (val res = contactCallManager.resolveContact(query)) {
             is ContactCallResolution.ReadyToCall -> {
-                array.put(JSONObject().put("id", "1").put("name", res.name).put("phone", res.number))
+                appendUnique("1", res.name, res.number)
             }
             is ContactCallResolution.MultipleNumbersForContact -> {
-                res.numbers.forEachIndexed { idx, num ->
-                    array.put(JSONObject().put("id", "$idx").put("name", res.name).put("phone", num))
+                SmartContactMatcher.deduplicatePhoneNumbers(res.numbers).forEachIndexed { idx, num ->
+                    appendUnique("$idx", res.name, num)
                 }
             }
             is ContactCallResolution.MultipleMatches -> {
                 res.candidates.forEach { contact ->
-                    contact.phoneNumbers.forEach { num ->
-                        array.put(
-                            JSONObject()
-                                .put("id", contact.id)
-                                .put("name", contact.displayName)
-                                .put("phone", num)
-                        )
+                    SmartContactMatcher.deduplicatePhoneNumbers(contact.phoneNumbers).forEach { num ->
+                        appendUnique(contact.id, contact.displayName, num)
                     }
                 }
             }
