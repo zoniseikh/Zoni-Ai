@@ -444,4 +444,71 @@ class VoiceAssistantUpgradeTest {
         assertTrue(resTwoContacts is ContactCallResolution.MultipleMatches)
         assertEquals(2, (resTwoContacts as ContactCallResolution.MultipleMatches).candidates.size)
     }
+
+    @Test
+    fun smartContactMatcherPrefixSearchEnforcesStrictPrefixAndDeduplication() {
+        val contacts = listOf(
+            ContactMatch("1", "Babu", listOf("9876543210")),
+            ContactMatch("2", "Babu Jamai", listOf("9876543211")),
+            ContactMatch("3", "Babu Mama", listOf("9876543212")),
+            ContactMatch("4", "Babu Telecom", listOf("9876543213")),
+            ContactMatch("5", "Deb Babu", listOf("9876543214")),
+            ContactMatch("6", "Ful Babu Karandi", listOf("9876543215")),
+            ContactMatch("7", "বাবু", listOf("9876543216")),
+            ContactMatch("8", "বাবু জামাই", listOf("9876543217")),
+            ContactMatch("9", "দেব বাবু", listOf("9876543218")),
+            ContactMatch("10", "ফুল বাবু করন্দি", listOf("9876543219")),
+            ContactMatch("11", "राम", listOf("9876543220")),
+            ContactMatch("12", "राम कुमार", listOf("9876543221")),
+            ContactMatch("13", "श्री राम", listOf("9876543222"))
+        )
+
+        // 1. English "Babu" -> ONLY English names starting with "Babu" (exact first, then alphabetical)
+        val enRes = SmartContactMatcher.searchContactsByPrefix("Babu", contacts)
+        assertEquals(
+            listOf("Babu", "Babu Jamai", "Babu Mama", "Babu Telecom"),
+            enRes.map { it.displayName }
+        )
+
+        // 2. Case-insensitive English prefix search ("babu", "BABU", with extra spaces)
+        val lowerRes = SmartContactMatcher.searchContactsByPrefix("  bAbU  ", contacts)
+        assertEquals(
+            listOf("Babu", "Babu Jamai", "Babu Mama", "Babu Telecom"),
+            lowerRes.map { it.displayName }
+        )
+
+        // 3. Bengali "বাবু" -> ONLY Bengali names starting with "বাবু"; excludes "দেব বাবু", "ফুল বাবু করন্দি", "Babu"
+        val bnRes = SmartContactMatcher.searchContactsByPrefix("বাবু", contacts)
+        assertEquals(
+            listOf("বাবু", "বাবু জামাই"),
+            bnRes.map { it.displayName }
+        )
+
+        // 4. Hindi "राम" -> ONLY Hindi names starting with "राम"; excludes "श्री राम"
+        val hiRes = SmartContactMatcher.searchContactsByPrefix("राम", contacts)
+        assertEquals(
+            listOf("राम", "राम कुमार"),
+            hiRes.map { it.displayName }
+        )
+
+        // 5. Duplicate contact / duplicate phone number prevention + preserving distinct contacts with same name
+        val dupAndSameName = listOf(
+            ContactMatch("42", "Babu", listOf("9876543210")),
+            ContactMatch("109", "babu", listOf("+91 98765-43210", "09876543210")),
+            ContactMatch("110", "Babu SIM", listOf("0091-98765-43210")), // same phone number under variant label
+            ContactMatch("200", "Babu", listOf("9123456789")), // distinct person with same name "Babu"
+            ContactMatch("201", "Babu Work", listOf("9111222333", "9444555666")) // one contact with two distinct numbers
+        )
+        val dedupRes = SmartContactMatcher.searchContactsByPrefix("Babu", dupAndSameName)
+        val flattenedPhones = dedupRes.flatMap { it.phoneNumbers }
+        assertEquals(
+            listOf("+919876543210", "+919123456789", "+919111222333", "+919444555666"),
+            flattenedPhones
+        )
+        assertEquals(2, dedupRes.count { it.displayName == "Babu" })
+        assertEquals(1, dedupRes.count { it.displayName == "Babu Work" })
+
+        // 6. Empty / whitespace query returns empty list
+        assertTrue(SmartContactMatcher.searchContactsByPrefix("   ", contacts).isEmpty())
+    }
 }

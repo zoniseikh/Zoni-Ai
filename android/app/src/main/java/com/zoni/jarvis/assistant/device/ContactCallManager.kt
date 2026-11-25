@@ -65,9 +65,11 @@ object SmartContactMatcher {
         'ে' to "e", 'ৈ' to "oi", 'ো' to "o", 'ৌ' to "ou", '্' to ""
     )
 
+    private val INVISIBLE_PHONE_CHARS_REGEX = Regex("[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]")
+
     fun normalizeDisplayText(raw: String): String {
         return Normalizer.normalize(raw, Normalizer.Form.NFC)
-            .replace(Regex("[\u200B-\u200D\uFEFF]"), "")
+            .replace(INVISIBLE_PHONE_CHARS_REGEX, "")
             .replace(Regex("\\s+"), " ")
             .trim()
     }
@@ -250,8 +252,6 @@ object SmartContactMatcher {
         return dp[a.length][b.length]
     }
 
-    private val INVISIBLE_PHONE_CHARS_REGEX = Regex("[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]")
-
     /**
      * Produces a canonical comparison key for phone numbers regardless of formatting,
      * spaces, hyphens, parentheses, BiDi characters, leading trunk '0', '00' prefix,
@@ -379,6 +379,67 @@ object SmartContactMatcher {
     }
 
     /**
+     * Strict case-insensitive prefix check for Android SIM Calling Contact Search:
+     * - English query ("Babu") matches ONLY contacts whose display name starts with "Babu" (case-insensitive),
+     *   e.g. "Babu", "Babu Jamai", "Babu Mama", "Babu Telecom"; excludes "Deb Babu", "Ful Babu Karandi", "বাবু".
+     * - Bengali query ("বাবু") matches ONLY contacts whose display name starts with "বাবু",
+     *   e.g. "বাবু", "বাবু মামা"; excludes "দেব বাবু", "ফুল বাবু করন্দি", "Babu".
+     * - Hindi/Devanagari query ("राम") matches ONLY contacts starting with "राम"; excludes "श्री राम", "Ram".
+     */
+    fun matchesPrefixQuery(displayName: String, rawQuery: String): Boolean {
+        val cleanName = normalizeDisplayText(displayName).lowercase(java.util.Locale.ROOT)
+        val cleanQuery = normalizeDisplayText(rawQuery).lowercase(java.util.Locale.ROOT)
+        if (cleanName.isEmpty() || cleanQuery.isEmpty()) return false
+        return cleanName.startsWith(cleanQuery)
+    }
+
+    /**
+     * Pure JVM-testable prefix-only contact search for Android SIM Calling Search Box:
+     * 1. Deduplicates contacts & equivalent phone numbers across Android accounts/formatting.
+     * 2. Filters strictly by case-insensitive display-name prefix (no mid-name, end-of-name, substring, fuzzy, or cross-script matches).
+     * 3. Sorts exact match first, then alphabetically by display name.
+     * 4. Prevents the same phone number from appearing more than once while preserving:
+     *    - Multiple distinct contacts with the same name (different phone numbers).
+     *    - Multiple distinct phone numbers belonging to the same contact.
+     */
+    fun searchContactsByPrefix(
+        rawQuery: String,
+        contacts: List<ContactMatch>,
+        maxResults: Int = 50
+    ): List<ContactMatch> {
+        val cleanQuery = normalizeDisplayText(rawQuery).lowercase(java.util.Locale.ROOT)
+        if (cleanQuery.isEmpty()) return emptyList()
+
+        val uniqueContacts = deduplicateContacts(contacts)
+        val matched = uniqueContacts
+            .filter { contact -> matchesPrefixQuery(contact.displayName, cleanQuery) }
+            .sortedWith(
+                compareByDescending<ContactMatch> {
+                    normalizeDisplayText(it.displayName).lowercase(java.util.Locale.ROOT) == cleanQuery
+                }.thenBy {
+                    normalizeDisplayText(it.displayName).lowercase(java.util.Locale.ROOT)
+                }
+            )
+
+        val seenPhoneKeys = HashSet<String>()
+        val result = mutableListOf<ContactMatch>()
+        for (contact in matched) {
+            val uniquePhonesForContact = mutableListOf<String>()
+            for (phone in deduplicatePhoneNumbers(contact.phoneNumbers)) {
+                val phoneKey = canonicalPhoneKey(phone)
+                if (phoneKey.isNotEmpty() && seenPhoneKeys.add(phoneKey)) {
+                    uniquePhonesForContact.add(phone)
+                }
+            }
+            if (uniquePhonesForContact.isNotEmpty()) {
+                result.add(contact.copy(phoneNumbers = uniquePhonesForContact))
+                if (result.size >= maxResults) break
+            }
+        }
+        return result
+    }
+
+    /**
      * Pure JVM-testable resolution over a list of contacts.
      * Applies cross-source & phone-number deduplication, strict confidence threshold (>= 70),
      * exact-winner priority over partial matches, and safe disambiguation on genuine ties.
@@ -448,21 +509,10 @@ class ContactCallManager(private val context: Context) {
     }
 
     /**
-     * Resolves a Bengali, Hindi, or English contact name query against the Android Contacts Provider
-     * using [SmartContactMatcher] (exact Unicode, case-insensitive English, cross-script
-     * Bengali <-> English transliteration, phonetic, kinship, controlled fuzzy matching,
-     * and cross-account/LOOKUP_KEY/canonical-phone deduplication).
+     * Loads all phone-bearing Android contacts grouped by LOOKUP_KEY (fallback CONTACT_ID)
+     * with per-contact phone number deduplication.
      */
-    fun resolveContact(contactQuery: String): ContactCallResolution {
-        if (!hasContactPermission()) {
-            return ContactCallResolution.PermissionMissing
-        }
-
-        val cleanQuery = contactQuery.trim()
-        if (cleanQuery.isBlank()) {
-            return ContactCallResolution.ContactNotFound(cleanQuery)
-        }
-
+    private fun loadAllContacts(): Pair<List<ContactMatch>?, String?> {
         val allContacts = mutableListOf<ContactMatch>()
         val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
         val projection = arrayOf(
@@ -514,9 +564,50 @@ class ContactCallManager(private val context: Context) {
                 }
             }
         } catch (e: Exception) {
-            return ContactCallResolution.CallFailed("Contacts provider query error: ${e.message}")
+            return Pair(null, "Contacts provider query error: ${e.message}")
         } finally {
             cursor?.close()
+        }
+
+        return Pair(allContacts, null)
+    }
+
+    /**
+     * Strict prefix-only contact search for Android SIM Calling Contact Search Box.
+     * Case-insensitive, script-preserving prefix match with duplicate contact & phone-number prevention.
+     */
+    fun searchContactsByPrefix(contactQuery: String, maxResults: Int = 50): List<ContactMatch> {
+        if (!hasContactPermission()) return emptyList()
+        val cleanQuery = contactQuery.trim()
+        if (cleanQuery.isBlank()) return emptyList()
+        val (contacts, error) = loadAllContacts()
+        if (error != null || contacts == null) return emptyList()
+        return SmartContactMatcher.searchContactsByPrefix(
+            rawQuery = cleanQuery,
+            contacts = contacts,
+            maxResults = maxResults
+        )
+    }
+
+    /**
+     * Resolves a Bengali, Hindi, or English contact name query against the Android Contacts Provider
+     * using [SmartContactMatcher] (exact Unicode, case-insensitive English, cross-script
+     * Bengali <-> English transliteration, phonetic, kinship, controlled fuzzy matching,
+     * and cross-account/LOOKUP_KEY/canonical-phone deduplication).
+     */
+    fun resolveContact(contactQuery: String): ContactCallResolution {
+        if (!hasContactPermission()) {
+            return ContactCallResolution.PermissionMissing
+        }
+
+        val cleanQuery = contactQuery.trim()
+        if (cleanQuery.isBlank()) {
+            return ContactCallResolution.ContactNotFound(cleanQuery)
+        }
+
+        val (allContacts, error) = loadAllContacts()
+        if (error != null || allContacts == null) {
+            return ContactCallResolution.CallFailed(error ?: "Contacts provider query error")
         }
 
         return SmartContactMatcher.resolveFromContacts(

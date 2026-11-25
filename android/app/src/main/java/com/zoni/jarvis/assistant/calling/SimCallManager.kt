@@ -36,32 +36,20 @@ class SimCallManager(
 ) {
     fun searchContactsAsJson(query: String): String {
         val array = JSONArray()
-        val seenKeys = HashSet<String>()
-        fun appendUnique(id: String, name: String, phone: String) {
-            val nameKey = SmartContactMatcher.normalizeDisplayText(name).lowercase()
-            val phoneKey = SmartContactMatcher.canonicalPhoneKey(phone)
-            if (phoneKey.isEmpty()) return
-            if (seenKeys.add("$nameKey|$phoneKey")) {
-                array.put(JSONObject().put("id", id).put("name", name).put("phone", phone))
-            }
-        }
-        when (val res = contactCallManager.resolveContact(query)) {
-            is ContactCallResolution.ReadyToCall -> {
-                appendUnique("1", res.name, res.number)
-            }
-            is ContactCallResolution.MultipleNumbersForContact -> {
-                SmartContactMatcher.deduplicatePhoneNumbers(res.numbers).forEachIndexed { idx, num ->
-                    appendUnique("$idx", res.name, num)
+        val seenPhoneKeys = HashSet<String>()
+        val matches = contactCallManager.searchContactsByPrefix(query)
+        for (contact in matches) {
+            SmartContactMatcher.deduplicatePhoneNumbers(contact.phoneNumbers).forEach { num ->
+                val phoneKey = SmartContactMatcher.canonicalPhoneKey(num)
+                if (phoneKey.isNotEmpty() && seenPhoneKeys.add(phoneKey)) {
+                    array.put(
+                        JSONObject()
+                            .put("id", contact.id)
+                            .put("name", contact.displayName)
+                            .put("phone", num)
+                    )
                 }
             }
-            is ContactCallResolution.MultipleMatches -> {
-                res.candidates.forEach { contact ->
-                    SmartContactMatcher.deduplicatePhoneNumbers(contact.phoneNumbers).forEach { num ->
-                        appendUnique(contact.id, contact.displayName, num)
-                    }
-                }
-            }
-            else -> Unit
         }
         return array.toString()
     }
