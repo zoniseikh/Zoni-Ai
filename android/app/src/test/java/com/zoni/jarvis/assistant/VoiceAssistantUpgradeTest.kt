@@ -155,18 +155,18 @@ class VoiceAssistantUpgradeTest {
         }
 
         // Prime noise floor
-        repeat(5) { gate.processFrame(silence, frameSize) }
+        repeat(5) { gate.processPcm16Frame(silence, frameSize) }
 
         var sawEarlyOnset = false
         repeat(10) { // 400ms voiced wake word
-            val a = gate.processFrame(voiceFrame, frameSize)
+            val a = gate.processPcm16Frame(voiceFrame, frameSize)
             if (a.earlyOnsetDetected) sawEarlyOnset = true
         }
         assertTrue("Expected earlyOnsetDetected during voiced wake utterance", sawEarlyOnset)
 
         var sawCandidateReady = false
         repeat(10) { // 400ms trailing silence -> triggers candidateReady
-            val a = gate.processFrame(silence, frameSize)
+            val a = gate.processPcm16Frame(silence, frameSize)
             if (a.candidateReady) sawCandidateReady = true
         }
         assertTrue("Expected candidateReady after wake utterance + trailing silence", sawCandidateReady)

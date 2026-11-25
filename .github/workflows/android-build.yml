@@ -83,7 +83,7 @@ jobs:
           if [ "$TEST_EXIT" -ne 0 ]; then
             echo "=== Android Unit Test Failure Summary ==="
             for xml in android/app/build/test-results/testDebugUnitTest/*.xml; do
-              if [ -f "$xml" ] && grep -q "<failure" "$xml"; then
+              if [ -f "$xml" ] && grep -qE "<failure|<error" "$xml"; then
                 echo "--- $xml ---"
                 cat "$xml"
               fi
