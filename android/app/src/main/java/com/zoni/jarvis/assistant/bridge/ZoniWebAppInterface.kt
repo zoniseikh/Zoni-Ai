@@ -393,6 +393,14 @@ class ZoniWebAppInterface(
     fun enterAccessibleText(targetHint: String, text: String): Boolean =
         ZoniAccessibilityService.enterText(targetHint, text)
 
+    @JavascriptInterface
+    fun clickVisualElementJson(query: String): String =
+        ZoniAccessibilityService.clickVisualTargetWithRevalidation(
+            query = query,
+            context = context,
+            apiKey = keyManager.getApiKey().orEmpty()
+        ).toJson()
+
     // --- Notification Awareness, Official RemoteInput Reply & Rule-Based Auto Reply ---
 
     @JavascriptInterface

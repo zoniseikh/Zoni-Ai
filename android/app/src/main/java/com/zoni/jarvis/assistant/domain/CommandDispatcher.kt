@@ -213,11 +213,17 @@ class CommandDispatcher {
     }
 
     private fun parseAccessibilityNav(raw: String, lower: String): VoiceCommand? {
-        if (Regex("(?:scroll\\s+down|swipe\\s+down|নিচে\\s*স্ক্রল\\s*করো|নিচে\\s*যাও|नीचे\\s*स्क्रॉल\\s*करो)", RegexOption.IGNORE_CASE).containsMatchIn(lower)) {
+        if (Regex("(?:scroll\\s+down|swipe\\s+down|নিচে\\s*স্ক্রল\\s*করো|নিচে\\s*যাও|নিচে\\s*সোয়াইপ|নিচে\\s*সোয়াইপ|नीचे\\s*स्क्रॉल\\s*करो)", RegexOption.IGNORE_CASE).containsMatchIn(lower)) {
             return VoiceCommand.ScrollScreen("down")
         }
-        if (Regex("(?:scroll\\s+up|swipe\\s+up|উপরে\\s*স্ক্রল\\s*করো|ऊपर\\s*स्क्रॉल\\s*करो)", RegexOption.IGNORE_CASE).containsMatchIn(lower)) {
+        if (Regex("(?:scroll\\s+up|swipe\\s+up|উপরে\\s*স্ক্রল\\s*করো|উপরে\\s*সোয়াইপ|উপরে\\s*সোয়াইপ|ऊपर\\s*स्क्रॉल\\s*करो)", RegexOption.IGNORE_CASE).containsMatchIn(lower)) {
             return VoiceCommand.ScrollScreen("up")
+        }
+        if (Regex("(?:swipe\\s+left|scroll\\s+left|বামে\\s*(?:সোয়াইপ|সোয়াইপ|স্ক্রল)\\s*করো|বাম\\s*দিকে\\s*(?:সোয়াইপ|সোয়াইপ|স্ক্রল)|बाएं\\s*(?:स्वाइप|स्क्रॉल)\\s*करो)", RegexOption.IGNORE_CASE).containsMatchIn(lower)) {
+            return VoiceCommand.ScrollScreen("left")
+        }
+        if (Regex("(?:swipe\\s+right|scroll\\s+right|ডানে\\s*(?:সোয়াইপ|সোয়াইপ|স্ক্রল)\\s*করো|ডান\\s*দিকে\\s*(?:সোয়াইপ|সোয়াইপ|স্ক্রল)|दाएं\\s*(?:स्वाइप|स्क्रॉल)\\s*करो)", RegexOption.IGNORE_CASE).containsMatchIn(lower)) {
+            return VoiceCommand.ScrollScreen("right")
         }
         if (Regex("^(?:go\\s+back|back\\s+button|পেছনে\\s*যাও|ব্যাক\\s*করো|वापस\\s*जाओ)[.,?!।]*$", RegexOption.IGNORE_CASE).matches(lower)) {
             return VoiceCommand.NavigateGlobal("back")
@@ -229,9 +235,12 @@ class CommandDispatcher {
         if (tapEn != null && tapEn.groupValues[1].isNotBlank()) {
             return VoiceCommand.TapVisibleElement(tapEn.groupValues[1].trim())
         }
-        val tapBn = Regex("^(.+?)\\s*(?:বাটনে\\s*)?(?:ট্যাপ\\s*করো|ক্লিক\\s*করো|চাপো)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
+        val tapBn = Regex("^(.+?)\\s*(?:বাটনে|বাটনটিতে|আইকনে|অপশনে)?\\s*(?:ট্যাপ\\s*করো|ক্লিক\\s*করো|চাপ\\s*দাও|চাপো)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
         if (tapBn != null && tapBn.groupValues[1].isNotBlank()) {
-            return VoiceCommand.TapVisibleElement(tapBn.groupValues[1].trim())
+            val cleanedTarget = tapBn.groupValues[1].trim().replace(Regex("(?:-এ|-তে)$"), "").trim()
+            if (cleanedTarget.isNotBlank()) {
+                return VoiceCommand.TapVisibleElement(cleanedTarget)
+            }
         }
         return null
     }
@@ -694,11 +703,18 @@ class CommandDispatcher {
     }
 
     private fun parseContactCall(raw: String): VoiceCommand.CallContact? {
-        // Bengali: "আমার মাকে ফোন করো।", "রাহুলকে ফোন করো", "বাবাকে কল করো"
-        val bengaliMatch = Regex("^(?:আমার\\s+)?([\\p{L}\\p{M}\\w\\s]+?)(?:কে|রে)?\\s*(?:ফোন\\s*করো|কল\\s*করো|ফোন\\s*দাও|কল\\s*দাও)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
+        // Bengali: "আমার মাকে ফোন করো।", "রহিমকে কল করো", "বাবাকে কল দাও", "কল করো রহিমকে"
+        val bengaliMatch = Regex("^(?:আমার\\s+)?([\\p{L}\\p{M}\\w\\s]+?)(?:-?কে|রে)?\\s*(?:ফোন\\s*করো|কল\\s*করো|ফোন\\s*দাও|কল\\s*দাও|ফোন\\s*লাগাও|কল\\s*লাগাও)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
         if (bengaliMatch != null) {
             val contact = bengaliMatch.groupValues[1].trim()
             if (contact.isNotBlank() && !contact.contains("নম্বর")) {
+                return VoiceCommand.CallContact(contact)
+            }
+        }
+        val bengaliVerbFirst = Regex("^(?:ফোন\\s*করো|কল\\s*করো|ফোন\\s*দাও|কল\\s*দাও)\\s+(?:আমার\\s+)?([\\p{L}\\p{M}\\w\\s]+?)(?:-?কে|রে)?[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
+        if (bengaliVerbFirst != null) {
+            val contact = bengaliVerbFirst.groupValues[1].trim()
+            if (contact.isNotBlank() && !contact.contains("নম্বর") && contact.any { it.isLetter() }) {
                 return VoiceCommand.CallContact(contact)
             }
         }

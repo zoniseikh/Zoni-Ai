@@ -208,11 +208,11 @@ export class FastEndOfSpeechDetector {
     }
 
     const minSpeechRms = this.options.minSpeechRms ?? 0.015;
-    const minSpeechMs = this.options.minSpeechMs ?? 120;
-    const silenceEndMs = this.options.silenceEndMs ?? 380;
+    const minSpeechMs = this.options.minSpeechMs ?? 130;
+    const silenceEndMs = this.options.silenceEndMs ?? 420;
 
     const startThreshold = Math.max(minSpeechRms, this.noiseFloor * 2.8);
-    const continueThreshold = Math.max(minSpeechRms * 0.65, this.noiseFloor * 1.9);
+    const continueThreshold = Math.max(minSpeechRms * 0.65, this.noiseFloor * 1.85);
 
     if (!this.inSpeech) {
       if (rms >= startThreshold) {

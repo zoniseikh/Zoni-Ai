@@ -209,13 +209,15 @@ class ZoniLiveSessionClient(
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 if (ws != webSocket) return
+                val wasReadyBeforeClose = isSessionReady
                 isConnecting = false
                 isSessionReady = false
+                hasPendingSpeechAudio = false
                 healthyResetJob?.cancel()
                 webSocket = null
 
                 val safeReason = SecureKeyManager.sanitizeSecret(reason, lastApiKey)
-                val looksLikeVadConfigIssue = !isSessionReady && (code == 1007 || code == 1008) &&
+                val looksLikeVadConfigIssue = !wasReadyBeforeClose && (code == 1007 || code == 1008) &&
                     useFastVadConfig &&
                     (safeReason.contains("realtimeInputConfig", ignoreCase = true) ||
                         safeReason.contains("automaticActivityDetection", ignoreCase = true) ||
@@ -393,13 +395,18 @@ class ZoniLiveSessionClient(
         }
     }
 
+    @Volatile
+    private var hasPendingSpeechAudio: Boolean = false
+
     fun sendAudioChunk(base64Pcm16k: String) {
         if (!isSessionReady || base64Pcm16k.isBlank()) return
+        hasPendingSpeechAudio = true
         webSocket?.send(buildDirectAudioPayload(base64Pcm16k))
     }
 
     fun sendAudioStreamEnd() {
-        if (!isSessionReady) return
+        if (!isSessionReady || !hasPendingSpeechAudio) return
+        hasPendingSpeechAudio = false
         webSocket?.send(buildDirectAudioStreamEndPayload())
     }
 
@@ -546,8 +553,8 @@ class ZoniLiveSessionClient(
                             .put("disabled", false)
                             .put("startOfSpeechSensitivity", "START_SENSITIVITY_HIGH")
                             .put("endOfSpeechSensitivity", "END_SENSITIVITY_HIGH")
-                            .put("prefixPaddingMs", 100)
-                            .put("silenceDurationMs", 300)
+                            .put("prefixPaddingMs", 120)
+                            .put("silenceDurationMs", 320)
                     )
                 )
             }

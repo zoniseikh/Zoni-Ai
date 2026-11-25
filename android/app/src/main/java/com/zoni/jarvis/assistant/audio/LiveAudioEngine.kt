@@ -23,6 +23,77 @@ import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
+ * Pure, JVM-testable adaptive end-of-speech detector for Android Gemini Live voice turns.
+ * - Adapts to ambient room noise floor without desensitizing on loud spikes.
+ * - Preserves short mid-sentence pauses (~200-350ms) without cutting the user off.
+ * - Emits [EndOfSpeechDecision.shouldSignalAudioStreamEnd] exactly once per spoken utterance
+ *   after [silenceEndMs] of post-speech silence so Gemini Live replies immediately.
+ * - Suppresses triggers while the assistant is speaking to avoid audio-overlap / echo loops.
+ */
+data class EndOfSpeechDecision(
+    val isSpeech: Boolean,
+    val shouldSignalAudioStreamEnd: Boolean
+)
+
+class NativeEndOfSpeechDetector(
+    private val minSpeechAmp: Float = 0.055f,
+    private val minSpeechMs: Long = 130L,
+    private val silenceEndMs: Long = 420L
+) {
+    private var noiseFloor: Float = 0.015f
+    private var inSpeech: Boolean = false
+    private var speechAccumMs: Long = 0L
+    private var silenceAccumMs: Long = 0L
+
+    fun reset() {
+        inSpeech = false
+        speechAccumMs = 0L
+        silenceAccumMs = 0L
+    }
+
+    fun processFrame(
+        amplitude: Float,
+        frameDurationMs: Long,
+        isAssistantSpeaking: Boolean
+    ): EndOfSpeechDecision {
+        if (isAssistantSpeaking) {
+            reset()
+            return EndOfSpeechDecision(isSpeech = false, shouldSignalAudioStreamEnd = false)
+        }
+        val safeAmp = amplitude.coerceIn(0f, 1f)
+        val safeFrameMs = frameDurationMs.coerceAtLeast(1L)
+        val startThreshold = maxOf(minSpeechAmp, noiseFloor * 2.8f)
+        val continueThreshold = maxOf(minSpeechAmp * 0.64f, noiseFloor * 1.85f)
+
+        if (!inSpeech) {
+            if (safeAmp >= startThreshold) {
+                inSpeech = true
+                speechAccumMs = safeFrameMs
+                silenceAccumMs = 0L
+                return EndOfSpeechDecision(isSpeech = true, shouldSignalAudioStreamEnd = false)
+            }
+            noiseFloor = (noiseFloor * 0.94f + safeAmp * 0.06f).coerceIn(0.008f, 0.09f)
+            return EndOfSpeechDecision(isSpeech = false, shouldSignalAudioStreamEnd = false)
+        }
+
+        if (safeAmp >= continueThreshold) {
+            speechAccumMs += safeFrameMs
+            silenceAccumMs = 0L
+            return EndOfSpeechDecision(isSpeech = true, shouldSignalAudioStreamEnd = false)
+        }
+
+        silenceAccumMs += safeFrameMs
+        if (silenceAccumMs >= silenceEndMs) {
+            val hadRealSpeech = speechAccumMs >= minSpeechMs
+            reset()
+            return EndOfSpeechDecision(isSpeech = false, shouldSignalAudioStreamEnd = hadRealSpeech)
+        }
+
+        return EndOfSpeechDecision(isSpeech = false, shouldSignalAudioStreamEnd = false)
+    }
+}
+
+/**
  * Genuine Native Android Full-Duplex PCM Audio Engine for Gemini Live:
  * - Capture: 16,000 Hz Mono 16-bit PCM (with hardware AEC + Noise Suppression)
  * - Playback: 24,000 Hz Mono 16-bit PCM low-latency streaming via AudioTrack
@@ -181,10 +252,7 @@ class LiveAudioEngine(
 
             captureJob = scope.launch {
                 val readBuffer = ByteArray(CHUNK_BYTES)
-                var noiseFloor = 0.015f
-                var inSpeech = false
-                var speechAccumMs = 0L
-                var silenceAccumMs = 0L
+                val eosDetector = NativeEndOfSpeechDetector()
 
                 while (isActive) {
                     val read = recorder.read(readBuffer, 0, readBuffer.size)
@@ -195,44 +263,22 @@ class LiveAudioEngine(
                         val b64 = Base64.encodeToString(chunk, Base64.NO_WRAP)
                         onBase64PcmChunk(b64)
 
-                        // Fast adaptive end-of-speech detection (~380ms post-speech silence)
+                        // Fast adaptive end-of-speech detection (~420ms post-speech silence)
                         val frameMs = ((read / 2) * 1000L) / INPUT_SAMPLE_RATE
-                        if (resetEosRequested || isAssistantSpeakingNow) {
-                            inSpeech = false
-                            speechAccumMs = 0L
-                            silenceAccumMs = 0L
+                        if (resetEosRequested) {
+                            eosDetector.reset()
                             resetEosRequested = false
-                        } else {
-                            val startThreshold = maxOf(0.055f, noiseFloor * 2.8f)
-                            val continueThreshold = maxOf(0.035f, noiseFloor * 1.9f)
-                            if (!inSpeech) {
-                                if (amp >= startThreshold) {
-                                    inSpeech = true
-                                    speechAccumMs = frameMs
-                                    silenceAccumMs = 0L
-                                } else {
-                                    noiseFloor = (noiseFloor * 0.94f + amp * 0.06f).coerceIn(0.008f, 0.09f)
-                                }
-                            } else if (amp >= continueThreshold) {
-                                speechAccumMs += frameMs
-                                silenceAccumMs = 0L
-                            } else {
-                                silenceAccumMs += frameMs
-                                if (silenceAccumMs >= 380L) {
-                                    val hadSpeech = speechAccumMs >= 120L
-                                    inSpeech = false
-                                    speechAccumMs = 0L
-                                    silenceAccumMs = 0L
-                                    if (hadSpeech) {
-                                        onSpeechEnded()
-                                    }
-                                }
-                            }
+                        }
+                        val decision = eosDetector.processFrame(
+                            amplitude = amp,
+                            frameDurationMs = frameMs,
+                            isAssistantSpeaking = isAssistantSpeakingNow
+                        )
+                        if (decision.shouldSignalAudioStreamEnd) {
+                            onSpeechEnded()
                         }
                     } else if (isMicMuted) {
-                        inSpeech = false
-                        speechAccumMs = 0L
-                        silenceAccumMs = 0L
+                        eosDetector.reset()
                         onAmplitudeChanged(0f)
                     }
                 }
@@ -266,6 +312,8 @@ class LiveAudioEngine(
         } catch (_: Exception) {
         }
         audioRecord = null
+        isAssistantSpeakingNow = false
+        resetEosRequested = true
         abandonVoiceAudioFocus()
         onAmplitudeChanged(0f)
     }
@@ -336,6 +384,8 @@ class LiveAudioEngine(
     }
 
     fun stopAllPlayback() {
+        isAssistantSpeakingNow = false
+        resetEosRequested = true
         synchronized(playbackLock) {
             try {
                 audioTrack?.pause()
@@ -378,7 +428,7 @@ class LiveAudioEngine(
     companion object {
         const val INPUT_SAMPLE_RATE = 16000
         const val OUTPUT_SAMPLE_RATE = 24000
-        // ~64ms low-latency chunks at 16kHz 16-bit mono (2048 bytes)
-        const val CHUNK_BYTES = 2048
+        // 50ms low-latency capture chunks at 16kHz 16-bit mono (1600 bytes)
+        const val CHUNK_BYTES = 1600
     }
 }

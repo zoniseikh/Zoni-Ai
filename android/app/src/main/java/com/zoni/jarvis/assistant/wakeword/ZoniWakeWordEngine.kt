@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -133,8 +134,11 @@ object WakeWordMatcher {
         "জোনী" to 0.98f,
         "জনি" to 0.96f,
         "জনী" to 0.95f,
+        "জুনি" to 0.93f,
+        "যোনি" to 0.92f,
         "জোনি এআই" to 1.00f,
         "জনি এআই" to 0.98f,
+        "জোনি এ আই" to 0.98f,
         "ज़ोनी" to 1.00f,
         "जोनी" to 0.96f,
         "ज़ोनी एआई" to 1.00f,
@@ -156,7 +160,11 @@ object WakeWordMatcher {
         "done", "gone", "none", "bone", "cone", "tone", "lone"
     )
 
-    private val OPTIONAL_PREFIXES = listOf("hey ", "hi ", "ok ", "okay ", "hello ", "ওহে ", "হেই ", "হ্যালো ", "हे ", "ओए ")
+    private val OPTIONAL_PREFIXES = listOf(
+        "hey ", "hi ", "ok ", "okay ", "hello ",
+        "ওহে ", "হেই ", "হে ", "হ্যালো ", "ও ", "এই ", "অ্যাই ", "শোনো ",
+        "हे ", "ओए "
+    )
 
     fun normalizeText(raw: String): String {
         val nfc = Normalizer.normalize(raw, Normalizer.Form.NFC)
@@ -321,13 +329,71 @@ object WakeWordMatcher {
 }
 
 /**
+ * Pure JVM-testable rolling 16-bit PCM pre-roll ring buffer.
+ * Keeps the most recent ~1.8 seconds of local microphone audio so when Stage-1 detects
+ * a wake-word utterance ("জোনি" / "Zoni"), Stage-2 can transcribe the exact spoken audio
+ * (via Android 13+ EXTRA_AUDIO_SOURCE pipe) instead of missing the already-spoken wake word.
+ */
+class RollingPcmRingBuffer(
+    private val capacitySamples: Int = 28800 // 1.8s at 16kHz
+) {
+    private val buffer = ShortArray(capacitySamples.coerceAtLeast(1600))
+    private var writeIndex = 0
+    private var filledSamples = 0
+
+    @Synchronized
+    fun clear() {
+        writeIndex = 0
+        filledSamples = 0
+    }
+
+    @Synchronized
+    fun write(samples: ShortArray, count: Int = samples.size) {
+        val safeCount = count.coerceIn(0, samples.size)
+        for (i in 0 until safeCount) {
+            buffer[writeIndex] = samples[i]
+            writeIndex = (writeIndex + 1) % buffer.size
+            if (filledSamples < buffer.size) filledSamples++
+        }
+    }
+
+    @Synchronized
+    fun snapshotSamples(maxSamples: Int = filledSamples): ShortArray {
+        val take = maxSamples.coerceIn(0, filledSamples)
+        if (take == 0) return ShortArray(0)
+        val out = ShortArray(take)
+        val start = (writeIndex - take + buffer.size) % buffer.size
+        for (i in 0 until take) {
+            out[i] = buffer[(start + i) % buffer.size]
+        }
+        return out
+    }
+
+    @Synchronized
+    fun snapshotPcm16LeBytes(trailingSilenceSamples: Int = 4000): ByteArray {
+        val samples = snapshotSamples()
+        val totalSamples = samples.size + trailingSilenceSamples.coerceAtLeast(0)
+        val bytes = ByteArray(totalSamples * 2)
+        for (i in samples.indices) {
+            val s = samples[i].toInt()
+            bytes[i * 2] = (s and 0xFF).toByte()
+            bytes[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+        }
+        return bytes
+    }
+
+    @Synchronized
+    fun sizeSamples(): Int = filledSamples
+}
+
+/**
  * Pure JVM-testable Stage-1 On-Device Acoustic Voice Activity & Wake-Length Gate.
  *
  * Inspects 16kHz 16-bit mono PCM frames locally without sending a single byte over the network:
  * - Tracks an adaptive ambient noise floor (handles fan/room noise).
  * - Checks voice-band Zero-Crossing Rate (ZCR) to filter impulsive clicks/knocks.
- * - Triggers a local verification candidate ONLY when a short speech burst matching the
- *   duration profile of "Zoni" / "জোনি" (220ms–1350ms) finishes with brief trailing silence.
+ * - Exposes `earlyOnsetDetected` (~100ms voiced onset) for API 26–32 handoff and
+ *   `candidateReady` (220ms–1350ms + trailing silence) for API 33+ pre-roll pipe verification.
  */
 class AcousticWakeGate(
     private val config: WakeWordConfig = WakeWordConfig(),
@@ -339,13 +405,15 @@ class AcousticWakeGate(
     private var silenceDurationMs: Long = 0L
     private var peakRms: Float = 0f
     private var voicedFrames: Int = 0
+    private var earlyOnsetFired: Boolean = false
 
     data class FrameAnalysis(
         val rms: Float,
         val zcr: Float,
         val isVoiceFrame: Boolean,
         val candidateReady: Boolean,
-        val utteranceDurationMs: Long
+        val utteranceDurationMs: Long,
+        val earlyOnsetDetected: Boolean = false
     )
 
     fun reset() {
@@ -354,11 +422,12 @@ class AcousticWakeGate(
         silenceDurationMs = 0L
         peakRms = 0f
         voicedFrames = 0
+        earlyOnsetFired = false
     }
 
     fun processPcm16Frame(samples: ShortArray, count: Int = samples.size): FrameAnalysis {
         if (count <= 0) {
-            return FrameAnalysis(0f, 0f, false, false, 0L)
+            return FrameAnalysis(0f, 0f, false, false, 0L, false)
         }
         val frameMs = max(1L, (count * 1000L) / sampleRateHz)
 
@@ -390,6 +459,7 @@ class AcousticWakeGate(
 
         var candidateReady = false
         var completedDuration = 0L
+        var earlyOnset = false
 
         if (isVoice) {
             if (!inSpeech) {
@@ -398,11 +468,17 @@ class AcousticWakeGate(
                 silenceDurationMs = 0L
                 peakRms = rms
                 voicedFrames = 0
+                earlyOnsetFired = false
             }
             speechDurationMs += frameMs
             silenceDurationMs = 0L
             peakRms = max(peakRms, rms)
             voicedFrames++
+
+            if (!earlyOnsetFired && speechDurationMs >= 100L && voicedFrames >= 2 && peakRms >= dynamicThreshold * 1.15f) {
+                earlyOnsetFired = true
+                earlyOnset = true
+            }
         } else if (inSpeech) {
             silenceDurationMs += frameMs
             if (silenceDurationMs >= config.trailingSilenceMs) {
@@ -425,7 +501,8 @@ class AcousticWakeGate(
             zcr = zcr,
             isVoiceFrame = isVoice,
             candidateReady = candidateReady,
-            utteranceDurationMs = completedDuration
+            utteranceDurationMs = completedDuration,
+            earlyOnsetDetected = earlyOnset
         )
     }
 }
@@ -483,6 +560,8 @@ class ZoniWakeWordEngine(
     private var captureJob: Job? = null
     private var audioRecord: AudioRecord? = null
     private var speechRecognizer: SpeechRecognizer? = null
+    private var activeAudioPipeRead: ParcelFileDescriptor? = null
+    private val preRollBuffer = RollingPcmRingBuffer(capacitySamples = PRE_ROLL_SAMPLES)
     private var onDetectedCallback: ((WakeWordDetectionEvent) -> Unit)? = null
     private var onErrorCallback: ((String) -> Unit)? = null
 
@@ -579,7 +658,9 @@ class ZoniWakeWordEngine(
         return try {
             recorder.startRecording()
             _isListening.value = true
+            preRollBuffer.clear()
             val gate = AcousticWakeGate(config = config, sampleRateHz = SAMPLE_RATE)
+            val supportsAudioSourcePipe = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
 
             captureJob = scope.launch {
                 val frame = ShortArray(FRAME_SAMPLES)
@@ -593,13 +674,28 @@ class ZoniWakeWordEngine(
                         delay(40L)
                         continue
                     }
+                    preRollBuffer.write(frame, read)
                     val analysis = gate.processPcm16Frame(frame, read)
-                    if (analysis.candidateReady) {
+
+                    // Android 13+: wait for full wake-sized burst in pre-roll buffer, then pipe exact PCM
+                    // Android 8–12: hand off on early voice onset (~100ms) so live SpeechRecognizer catches the phrase
+                    val shouldVerify = if (supportsAudioSourcePipe) {
+                        analysis.candidateReady
+                    } else {
+                        analysis.earlyOnsetDetected
+                    }
+
+                    if (shouldVerify) {
                         val now = System.currentTimeMillis()
                         if (now - lastTriggerAtMs >= config.cooldownMs) {
                             isVerifyingPhrase = true
+                            val capturedPcmBytes = if (supportsAudioSourcePipe) {
+                                preRollBuffer.snapshotPcm16LeBytes(trailingSilenceSamples = 4000)
+                            } else {
+                                null
+                            }
                             stopAcousticRecorderOnly()
-                            triggerBoundedOnDeviceVerification()
+                            triggerBoundedOnDeviceVerification(capturedPcmBytes)
                             break
                         }
                     }
@@ -625,7 +721,7 @@ class ZoniWakeWordEngine(
         }
     }
 
-    private fun triggerBoundedOnDeviceVerification() {
+    private fun triggerBoundedOnDeviceVerification(preRollPcmBytes: ByteArray? = null) {
         mainHandler.post {
             if (!isRunning || isPausedForConversation) {
                 isVerifyingPhrase = false
@@ -704,18 +800,55 @@ class ZoniWakeWordEngine(
                 override fun onEvent(eventType: Int, params: Bundle?) = Unit
             })
 
+            var writePipeEnd: ParcelFileDescriptor? = null
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 600L)
+                // Bilingual Bengali + English recognition hint so both "জোনি"/"জনি" and "Zoni" match
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "bn-BD")
+                putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, false)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 650L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 550L)
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    preRollPcmBytes != null &&
+                    preRollPcmBytes.isNotEmpty()
+                ) {
+                    try {
+                        val pipe = ParcelFileDescriptor.createPipe()
+                        activeAudioPipeRead = pipe[0]
+                        writePipeEnd = pipe[1]
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, pipe[0])
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, SAMPLE_RATE)
+                    } catch (pipeErr: Exception) {
+                        Log.w(TAG, "EXTRA_AUDIO_SOURCE pipe unavailable, falling back to live mic verify: ${pipeErr.message}")
+                        closeActiveAudioPipe()
+                    }
+                }
             }
 
             try {
                 recognizer.startListening(intent)
+                val pipeWriter = writePipeEnd
+                if (pipeWriter != null && preRollPcmBytes != null) {
+                    scope.launch {
+                        try {
+                            ParcelFileDescriptor.AutoCloseOutputStream(pipeWriter).use { out ->
+                                out.write(preRollPcmBytes)
+                                out.flush()
+                            }
+                        } catch (_: Exception) {
+                            try { pipeWriter.close() } catch (_: Exception) {}
+                        }
+                    }
+                }
             } catch (e: Exception) {
+                try { writePipeEnd?.close() } catch (_: Exception) {}
                 mainHandler.removeCallbacks(timeoutRunnable)
                 Log.w(TAG, "Verifier startListening failed: ${e.message}")
                 cancelVerifierOnMain()
@@ -796,7 +929,16 @@ class ZoniWakeWordEngine(
         }
     }
 
+    private fun closeActiveAudioPipe() {
+        val readEnd = activeAudioPipeRead
+        activeAudioPipeRead = null
+        if (readEnd != null) {
+            try { readEnd.close() } catch (_: Exception) {}
+        }
+    }
+
     private fun cancelVerifierOnMain() {
+        closeActiveAudioPipe()
         mainHandler.post {
             val sr = speechRecognizer
             speechRecognizer = null
@@ -812,6 +954,8 @@ class ZoniWakeWordEngine(
         private const val SAMPLE_RATE = 16000
         // 40ms frames at 16kHz = 640 samples
         private const val FRAME_SAMPLES = 640
+        // 1.8s rolling pre-roll buffer at 16kHz
+        private const val PRE_ROLL_SAMPLES = 28800
         private const val VERIFY_WINDOW_MS = 2300L
     }
 }

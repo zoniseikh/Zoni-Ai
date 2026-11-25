@@ -82,8 +82,11 @@ class GeminiByokConfigTest {
         assertEquals("models/gemini-2.5-flash-native-audio-preview-12-2025", setup.getString("model"))
         assertEquals("resume-123", setup.getJSONObject("sessionResumption").getString("handle"))
         val aad = setup.getJSONObject("realtimeInputConfig").getJSONObject("automaticActivityDetection")
+        assertFalse(aad.getBoolean("disabled"))
+        assertEquals("START_SENSITIVITY_HIGH", aad.getString("startOfSpeechSensitivity"))
         assertEquals("END_SENSITIVITY_HIGH", aad.getString("endOfSpeechSensitivity"))
-        assertEquals(300, aad.getInt("silenceDurationMs"))
+        assertEquals(120, aad.getInt("prefixPaddingMs"))
+        assertEquals(320, aad.getInt("silenceDurationMs"))
         assertEquals(
             "Kore",
             setup.getJSONObject("generationConfig")

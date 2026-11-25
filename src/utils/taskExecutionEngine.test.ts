@@ -529,4 +529,21 @@ test('Advanced App UI Control: parses YouTube Play/Pause/Stop and Facebook/Benga
   const fbCommentEn = buildStructuredTaskPlan('Tap Comment on Facebook');
   assert.equal(fbCommentEn.steps[0]?.tool, 'accessibility_action');
   assert.equal(fbCommentEn.steps[0]?.args.command, 'tap:Comment');
+
+  // Horizontal swipe commands (Bengali, English, Hindi)
+  assert.equal(buildStructuredTaskPlan('বামে সোয়াইপ করো').steps[0]?.args.command, 'scroll_left');
+  assert.equal(buildStructuredTaskPlan('ডানে সোয়াইপ করো').steps[0]?.args.command, 'scroll_right');
+  assert.equal(buildStructuredTaskPlan('Swipe left').steps[0]?.args.command, 'scroll_left');
+  assert.equal(buildStructuredTaskPlan('Swipe right').steps[0]?.args.command, 'scroll_right');
+  assert.equal(buildStructuredTaskPlan('बाएं स्वाइप करो').steps[0]?.args.command, 'scroll_left');
+  assert.equal(buildStructuredTaskPlan('दाएं स्वाइप करो').steps[0]?.args.command, 'scroll_right');
+
+  // Natural Bengali button/icon tap phrases
+  const bnPressBtn = buildStructuredTaskPlan('Next বাটনে চাপ দাও');
+  assert.equal(bnPressBtn.steps[0]?.tool, 'accessibility_action');
+  assert.equal(bnPressBtn.steps[0]?.args.command, 'tap:Next');
+
+  const bnIconTap = buildStructuredTaskPlan('Settings আইকনে ক্লিক করো');
+  assert.equal(bnIconTap.steps[0]?.tool, 'accessibility_action');
+  assert.equal(bnIconTap.steps[0]?.args.command, 'tap:Settings');
 });

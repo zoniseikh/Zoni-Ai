@@ -8,6 +8,9 @@ import com.zoni.jarvis.assistant.network.LiveServerEvent
 import com.zoni.jarvis.assistant.network.ZoniLiveSessionClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -163,5 +166,133 @@ class GeminiRepository(
 
     fun sendInterrupt() {
         liveClient.sendInterrupt()
+    }
+
+    companion object {
+        private const val VISION_MODEL = "gemini-2.5-flash"
+
+        /**
+         * On-demand visual UI target localization using the user's own BYOK Gemini API key.
+         * Sends a single user-requested screenshot frame + screen dimensions and requests strict JSON
+         * coordinates + confidence + ambiguity detection. Never leaks the API key in errors.
+         */
+        fun locateVisualTargetOnScreenBlocking(
+            apiKey: String,
+            base64Jpeg: String,
+            userQuery: String,
+            screenWidth: Int,
+            screenHeight: Int,
+            visibleLabelsHint: List<String> = emptyList()
+        ): GeminiResult {
+            val validation = SecureKeyManager.validateApiKeyFormat(apiKey)
+            if (!validation.valid) {
+                return GeminiResult.GenericError(validation.error ?: "Gemini API Key is missing or invalid.")
+            }
+            if (base64Jpeg.isBlank()) {
+                return GeminiResult.GenericError("Screen frame is empty.")
+            }
+            val key = validation.normalizedKey
+            val safeW = screenWidth.coerceAtLeast(100)
+            val safeH = screenHeight.coerceAtLeast(100)
+            val hintsText = visibleLabelsHint.take(25).joinToString(" | ")
+
+            val prompt = buildString {
+                append("You are an Android UI precision click locator. ")
+                append("The screenshot is ${safeW}x${safeH} pixels. ")
+                append("Locate the EXACT UI element the user asked to tap: \"")
+                append(userQuery.replace("\"", "'"))
+                append("\".\n")
+                if (hintsText.isNotBlank()) {
+                    append("Visible accessibility text hints on screen: ")
+                    append(hintsText)
+                    append("\n")
+                }
+                append("Rules:\n")
+                append("1. Return ONLY a single JSON object with keys: found (boolean), confidence (0.0-1.0), ambiguous (boolean), label (string), x (int pixel 0..$safeW), y (int pixel 0..$safeH), xNorm (int 0..1000), yNorm (int 0..1000), reason (string), alternatives (array of {label, confidence, x, y}).\n")
+                append("2. If the requested element is NOT visible, set found=false and confidence=0.\n")
+                append("3. If multiple similar elements match and it is unclear which one the user wants, set ambiguous=true and list them in alternatives.\n")
+                append("4. NEVER target password, PIN, OTP, CVV, or banking payment confirmation buttons — if requested, set found=false and reason=\"sensitive_blocked\".\n")
+                append("5. Point x,y to the exact visual center of the clickable button/icon/card.")
+            }
+
+            val requestBody = JSONObject().apply {
+                put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject().apply {
+                            put("role", "user")
+                            put(
+                                "parts",
+                                JSONArray()
+                                    .put(JSONObject().put("text", prompt))
+                                    .put(
+                                        JSONObject().put(
+                                            "inline_data",
+                                            JSONObject()
+                                                .put("mime_type", "image/jpeg")
+                                                .put("data", base64Jpeg)
+                                        )
+                                    )
+                            )
+                        }
+                    )
+                )
+                put(
+                    "generationConfig",
+                    JSONObject()
+                        .put("temperature", 0.1)
+                        .put("maxOutputTokens", 384)
+                        .put("responseMimeType", "application/json")
+                )
+            }
+
+            var conn: HttpURLConnection? = null
+            return try {
+                val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$VISION_MODEL:generateContent")
+                conn = (url.openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 9000
+                    readTimeout = 14000
+                    requestMethod = "POST"
+                    doOutput = true
+                    setRequestProperty("x-goog-api-key", key)
+                    setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                    setRequestProperty("Accept", "application/json")
+                }
+                OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
+                    writer.write(requestBody.toString())
+                    writer.flush()
+                }
+                val code = conn.responseCode
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                val rawBody = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+
+                if (code !in 200..299) {
+                    val safeErr = SecureKeyManager.sanitizeSecret(rawBody.take(240), key)
+                    return GeminiResult.GenericError("Gemini Vision request failed (HTTP $code): $safeErr")
+                }
+
+                val root = JSONObject(rawBody)
+                val candidates = root.optJSONArray("candidates")
+                val parts = candidates?.optJSONObject(0)?.optJSONObject("content")?.optJSONArray("parts")
+                val text = buildString {
+                    if (parts != null) {
+                        for (i in 0 until parts.length()) {
+                            val t = parts.optJSONObject(i)?.optString("text", "").orEmpty()
+                            if (t.isNotBlank()) append(t)
+                        }
+                    }
+                }.trim()
+                if (text.isEmpty()) {
+                    GeminiResult.GenericError("Gemini Vision returned an empty response.")
+                } else {
+                    GeminiResult.Success(text)
+                }
+            } catch (e: Exception) {
+                val safeMsg = SecureKeyManager.sanitizeSecret(e.localizedMessage ?: "Network error", key)
+                GeminiResult.NetworkError("Gemini Vision network error: $safeMsg")
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
+            }
+        }
     }
 }

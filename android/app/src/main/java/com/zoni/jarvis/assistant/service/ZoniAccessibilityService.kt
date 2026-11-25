@@ -2,12 +2,16 @@ package com.zoni.jarvis.assistant.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Context
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import com.zoni.jarvis.assistant.data.GeminiRepository
+import com.zoni.jarvis.assistant.data.GeminiResult
+import com.zoni.jarvis.assistant.screen.ScreenCaptureManager
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.CountDownLatch
@@ -238,7 +242,7 @@ class ZoniAccessibilityService : AccessibilityService() {
         )
     }
 
-    fun tapElementByTextDetailed(targetText: String): AccessibilityActionOutcome {
+    fun tapElementByTextDetailed(targetText: String, ordinalIndex: Int? = null): AccessibilityActionOutcome {
         val query = targetText.trim()
         if (query.isEmpty()) {
             return AccessibilityActionOutcome(
@@ -272,14 +276,111 @@ class ZoniAccessibilityService : AccessibilityService() {
         val activePkg = root.packageName?.toString().orEmpty()
         checkScreenSafety(root, "tap_visible_element")?.let { return it }
 
-        // 1. Semantic node lookup (exact text -> contentDescription -> partial match)
-        val matchedNode = findBestSemanticNode(root, query) ?: return AccessibilityActionOutcome(
+        val beforeLabels = collectVisibleLabels(root, 40)
+
+        // 1. Universal cross-app semantic Accessibility resolution (with one delayed-UI retry)
+        var (snapshots, nodeMap) = captureNodeSnapshotTree(root)
+        var universalRes = UniversalUiAutomationEngine.resolveTarget(snapshots, query, ordinalIndex)
+        if (universalRes is UniversalUiResolution.NotFound && universalRes.failureCode == "element_not_found") {
+            try {
+                Thread.sleep(350L)
+            } catch (_: InterruptedException) {
+                // ignore
+            }
+            val refreshedRoot = rootInActiveWindow ?: root
+            checkScreenSafety(refreshedRoot, "tap_visible_element")?.let { return it }
+            val refreshed = captureNodeSnapshotTree(refreshedRoot)
+            snapshots = refreshed.first
+            nodeMap = refreshed.second
+            universalRes = UniversalUiAutomationEngine.resolveTarget(snapshots, query, ordinalIndex)
+        }
+
+        when (val res = universalRes) {
+            is UniversalUiResolution.Ambiguous -> {
+                val arr = JSONArray()
+                res.candidates.forEachIndexed { i, c ->
+                    arr.put(JSONObject().put("index", i + 1).put("label", c.label))
+                }
+                return AccessibilityActionOutcome(
+                    success = false,
+                    verified = true,
+                    actionType = "tap_visible_element",
+                    activePackage = activePkg,
+                    message = "Multiple visible controls match \"${res.query}\". Please specify which one (e.g., first or second).",
+                    failureReason = "multiple_elements",
+                    target = query,
+                    executionStatus = "multiple_elements",
+                    data = JSONObject().put("candidates", arr)
+                )
+            }
+            is UniversalUiResolution.Matched -> {
+                val cand = res.candidate
+                val liveMatch = nodeMap[cand.matchNode.nodeId]
+                val liveClickable = cand.clickableNode?.let { nodeMap[it.nodeId] }
+                if (liveMatch?.isPassword == true || liveClickable?.isPassword == true) {
+                    return AccessibilityActionOutcome(
+                        success = false,
+                        verified = false,
+                        actionType = "tap_visible_element",
+                        activePackage = activePkg,
+                        message = "Blocked tapping a password field for security.",
+                        failureReason = "password_field_blocked"
+                    )
+                }
+                val clickStartMs = System.currentTimeMillis()
+                val (clicked, method) = performSmartClickOnResolvedTarget(liveMatch, liveClickable, cand.bounds)
+                if (clicked) {
+                    val eventObserved = waitForUiTransitionEvent(clickStartMs, maxWaitMs = 700L)
+                    val afterRoot = rootInActiveWindow
+                    val afterSnapshots = if (afterRoot != null) captureNodeSnapshotTree(afterRoot, 160).first else emptyList()
+                    val verification = UniversalUiAutomationEngine.verifyClickOutcome(
+                        beforeLabels = beforeLabels,
+                        afterNodes = afterSnapshots,
+                        clickedLabel = cand.label,
+                        accessibilityEventObserved = eventObserved
+                    )
+                    return AccessibilityActionOutcome(
+                        success = true,
+                        verified = verification.stateChanged,
+                        actionType = "tap_visible_element",
+                        activePackage = afterRoot?.packageName?.toString().orEmpty().ifBlank { activePkg },
+                        message = verification.evidence,
+                        target = cand.label,
+                        executionStatus = verification.status,
+                        data = JSONObject()
+                            .put("method", method)
+                            .put("target", cand.label)
+                            .put("rankIndex", res.rankIndex)
+                            .put("stateChanged", verification.stateChanged)
+                    )
+                }
+            }
+            is UniversalUiResolution.NotFound -> {
+                if (res.failureCode == "sensitive_target_blocked" || res.failureCode == "element_index_out_of_range") {
+                    return AccessibilityActionOutcome(
+                        success = false,
+                        verified = true,
+                        actionType = "tap_visible_element",
+                        activePackage = activePkg,
+                        message = res.reason,
+                        failureReason = res.failureCode,
+                        target = query,
+                        executionStatus = res.failureCode
+                    )
+                }
+            }
+        }
+
+        // 2. Fallback: direct AccessibilityNodeInfo lookup for custom views that omit bounds
+        val latestRoot = rootInActiveWindow ?: root
+        val matchedNode = findBestSemanticNode(latestRoot, query) ?: return AccessibilityActionOutcome(
             success = false,
             verified = false,
             actionType = "tap_visible_element",
             activePackage = activePkg,
             message = "Could not find visible UI element \"$query\" on the current screen.",
-            failureReason = "element_not_found"
+            failureReason = "element_not_found",
+            target = query
         )
 
         if (matchedNode.isPassword) {
@@ -293,7 +394,6 @@ class ZoniAccessibilityService : AccessibilityService() {
             )
         }
 
-        // 2. Walk up to clickable semantic node and invoke ACTION_CLICK
         var clickable: AccessibilityNodeInfo? = matchedNode
         while (clickable != null && !clickable.isClickable) {
             clickable = clickable.parent
@@ -305,11 +405,11 @@ class ZoniAccessibilityService : AccessibilityService() {
                 actionType = "tap_visible_element",
                 activePackage = activePkg,
                 message = "Tapped \"$query\" via semantic Accessibility node.",
+                target = query,
                 data = JSONObject().put("method", "semantic_node_click").put("target", query)
             )
         }
 
-        // 3. Fallback: gesture tap strictly on the discovered semantic node's real screen bounds
         val rect = Rect()
         matchedNode.getBoundsInScreen(rect)
         if (!rect.isEmpty && rect.centerX() > 0 && rect.centerY() > 0) {
@@ -321,6 +421,7 @@ class ZoniAccessibilityService : AccessibilityService() {
                     actionType = "tap_visible_element",
                     activePackage = activePkg,
                     message = "Tapped \"$query\" using bounded node gesture.",
+                    target = query,
                     data = JSONObject().put("method", "bounded_node_gesture").put("target", query)
                 )
             }
@@ -332,7 +433,8 @@ class ZoniAccessibilityService : AccessibilityService() {
             actionType = "tap_visible_element",
             activePackage = activePkg,
             message = "Found \"$query\" on screen, but it could not be clicked.",
-            failureReason = "click_action_rejected"
+            failureReason = "click_action_rejected",
+            target = query
         )
     }
 
@@ -375,8 +477,12 @@ class ZoniAccessibilityService : AccessibilityService() {
 
     fun scrollScreenDetailed(direction: String): AccessibilityActionOutcome {
         val normalized = direction.trim().lowercase()
-        val isUp = normalized == "up" || normalized == "scroll_up" || normalized == "backward"
-        val dirLabel = if (isUp) "up" else "down"
+        val dirLabel = when {
+            normalized.contains("left") || normalized.contains("বাম") -> "left"
+            normalized.contains("right") || normalized.contains("ডান") -> "right"
+            normalized == "up" || normalized == "scroll_up" || normalized == "swipe_up" || normalized == "backward" -> "up"
+            else -> "down"
+        }
 
         val root = rootInActiveWindow ?: return AccessibilityActionOutcome(
             success = false,
@@ -389,36 +495,38 @@ class ZoniAccessibilityService : AccessibilityService() {
         val activePkg = root.packageName?.toString().orEmpty()
         checkScreenSafety(root, "scroll_screen")?.let { return it }
 
-        val scrollAction = if (isUp) {
-            AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
-        } else {
-            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
-        }
-
-        fun findScrollableAndScroll(node: AccessibilityNodeInfo?): Boolean {
-            if (node == null || node.isPassword) return false
-            if (node.isScrollable && node.performAction(scrollAction)) {
-                return true
+        if (dirLabel == "up" || dirLabel == "down") {
+            val scrollAction = if (dirLabel == "up") {
+                AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+            } else {
+                AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
             }
-            for (i in 0 until node.childCount) {
-                if (findScrollableAndScroll(node.getChild(i))) return true
+
+            fun findScrollableAndScroll(node: AccessibilityNodeInfo?): Boolean {
+                if (node == null || node.isPassword) return false
+                if (node.isScrollable && node.performAction(scrollAction)) {
+                    return true
+                }
+                for (i in 0 until node.childCount) {
+                    if (findScrollableAndScroll(node.getChild(i))) return true
+                }
+                return false
             }
-            return false
+
+            if (findScrollableAndScroll(root)) {
+                return AccessibilityActionOutcome(
+                    success = true,
+                    verified = true,
+                    actionType = "scroll_screen",
+                    activePackage = activePkg,
+                    message = "Scrolled $dirLabel on the active list.",
+                    data = JSONObject().put("direction", dirLabel).put("method", "semantic_scroll")
+                )
+            }
         }
 
-        if (findScrollableAndScroll(root)) {
-            return AccessibilityActionOutcome(
-                success = true,
-                verified = true,
-                actionType = "scroll_screen",
-                activePackage = activePkg,
-                message = "Scrolled $dirLabel on the active list.",
-                data = JSONObject().put("direction", dirLabel).put("method", "semantic_scroll")
-            )
-        }
-
-        // Gesture swipe fallback (requires android:canPerformGestures="true")
-        val swiped = dispatchSwipeGesture(isUp = isUp)
+        // Gesture swipe fallback (supports up / down / left / right; requires android:canPerformGestures="true")
+        val swiped = dispatchSwipeGesture(dirLabel)
         return if (swiped) {
             AccessibilityActionOutcome(
                 success = true,
@@ -746,22 +854,38 @@ class ZoniAccessibilityService : AccessibilityService() {
         return dispatchGestureBlocking(gesture)
     }
 
-    private fun dispatchSwipeGesture(isUp: Boolean): Boolean {
+    private fun dispatchSwipeGesture(direction: String): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false
         val metrics = resources.displayMetrics
         val centerX = metrics.widthPixels * 0.5f
+        val centerY = metrics.heightPixels * 0.5f
+        val leftX = metrics.widthPixels * 0.18f
+        val rightX = metrics.widthPixels * 0.82f
         val topY = metrics.heightPixels * 0.25f
         val bottomY = metrics.heightPixels * 0.75f
 
         val path = Path().apply {
-            if (isUp) {
-                // Swipe finger down to scroll content upward
-                moveTo(centerX, topY)
-                lineTo(centerX, bottomY)
-            } else {
-                // Swipe finger up to scroll content downward
-                moveTo(centerX, bottomY)
-                lineTo(centerX, topY)
+            when (direction) {
+                "up" -> {
+                    // Swipe finger down to scroll content upward
+                    moveTo(centerX, topY)
+                    lineTo(centerX, bottomY)
+                }
+                "left" -> {
+                    // Swipe finger right-to-left
+                    moveTo(rightX, centerY)
+                    lineTo(leftX, centerY)
+                }
+                "right" -> {
+                    // Swipe finger left-to-right
+                    moveTo(leftX, centerY)
+                    lineTo(rightX, centerY)
+                }
+                else -> {
+                    // Swipe finger up to scroll content downward
+                    moveTo(centerX, bottomY)
+                    lineTo(centerX, topY)
+                }
             }
         }
         val gesture = GestureDescription.Builder()
@@ -1218,7 +1342,309 @@ class ZoniAccessibilityService : AccessibilityService() {
                 executionStatus = "duplicate_blocked"
             )
         }
-        return tapElementByTextDetailed(targetText).copy(actionType = "click_visible_element", target = targetText)
+        return tapElementByTextDetailed(targetText, index).copy(actionType = "click_visible_element", target = targetText)
+    }
+
+    // ========================================================================
+    // PART 1B — INTELLIGENT VISUAL RECOGNITION & PRECISION CLICK (GEMINI VISION + LIVE ACCESSIBILITY REVALIDATION)
+    // ========================================================================
+
+    fun clickVisualTargetWithRevalidation(
+        query: String,
+        context: Context,
+        apiKey: String
+    ): AccessibilityActionOutcome {
+        val cleanQuery = query.trim()
+        val activePkgInitial = getActivePackageName()
+        if (cleanQuery.isEmpty()) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "click_visual_element",
+                activePackage = activePkgInitial,
+                message = "Please describe which button, icon, or visual element to click.",
+                failureReason = "missing_target_text"
+            )
+        }
+        if (AccessibilityGuard.isSensitiveInputHint(cleanQuery)) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visual_element",
+                activePackage = activePkgInitial,
+                message = "Cannot visually inspect or click password, PIN, OTP, or payment fields.",
+                failureReason = "sensitive_target_blocked",
+                target = cleanQuery
+            )
+        }
+
+        // 1. Check screen safety BEFORE capturing any screen pixels
+        val rootBefore = rootInActiveWindow ?: return AccessibilityActionOutcome(
+            success = false,
+            verified = false,
+            actionType = "click_visual_element",
+            activePackage = activePkgInitial,
+            message = "No active Android window is accessible for visual clicking.",
+            failureReason = "no_active_window",
+            target = cleanQuery
+        )
+        val activePkg = rootBefore.packageName?.toString().orEmpty().ifBlank { activePkgInitial }
+        checkScreenSafety(rootBefore, "click_visual_element")?.let { return it }
+
+        if (!UiActionDeduplicator.tryAcquire(activePkg, "click_visual_element", cleanQuery)) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visual_element",
+                activePackage = activePkg,
+                message = "Prevented accidental duplicate visual click on \"$cleanQuery\".",
+                failureReason = "duplicate_tap_prevented",
+                target = cleanQuery,
+                executionStatus = "duplicate_blocked"
+            )
+        }
+
+        // 2. Require active user-authorized MediaProjection screen capture + user's BYOK Gemini API key
+        if (!ScreenCaptureManager.isActive()) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visual_element",
+                activePackage = activePkg,
+                message = "Screen awareness (MediaProjection) is not enabled. Enable Screen Awareness to click unlabeled visual elements.",
+                failureReason = "screen_capture_not_active",
+                target = cleanQuery,
+                executionStatus = "permission_missing"
+            )
+        }
+        if (apiKey.isBlank()) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visual_element",
+                activePackage = activePkg,
+                message = "Gemini API Key is required for visual screen recognition. Add your key in Settings.",
+                failureReason = "gemini_api_key_missing",
+                target = cleanQuery
+            )
+        }
+
+        // 3. Capture ONE on-demand screen frame
+        val frame = ScreenCaptureManager.captureSingleFrameBase64(context)
+        if (!frame.success || frame.base64Jpeg.isBlank()) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visual_element",
+                activePackage = activePkg,
+                message = frame.error.ifBlank { "Could not capture the current screen frame for visual recognition." },
+                failureReason = "screen_capture_failed",
+                target = cleanQuery
+            )
+        }
+
+        val (screenW, screenH) = try {
+            val wm = context.getSystemService(Context.WINDOW_SERVICE) as? android.view.WindowManager
+            if (wm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val b = wm.currentWindowMetrics.bounds
+                b.width().coerceAtLeast(360) to b.height().coerceAtLeast(640)
+            } else if (wm != null) {
+                val dm = android.util.DisplayMetrics()
+                @Suppress("DEPRECATION")
+                wm.defaultDisplay?.getRealMetrics(dm)
+                dm.widthPixels.coerceAtLeast(360) to dm.heightPixels.coerceAtLeast(640)
+            } else {
+                val metrics = resources.displayMetrics
+                metrics.widthPixels.coerceAtLeast(360) to metrics.heightPixels.coerceAtLeast(640)
+            }
+        } catch (_: Exception) {
+            val metrics = resources.displayMetrics
+            metrics.widthPixels.coerceAtLeast(360) to metrics.heightPixels.coerceAtLeast(640)
+        }
+        val beforeLabels = collectVisibleLabels(rootBefore, 40)
+
+        // 4. Ask Gemini Vision (`gemini-2.5-flash`) to localize the exact visual target
+        val visionResult = GeminiRepository.locateVisualTargetOnScreenBlocking(
+            apiKey = apiKey,
+            base64Jpeg = frame.base64Jpeg,
+            userQuery = cleanQuery,
+            screenWidth = screenW,
+            screenHeight = screenH,
+            visibleLabelsHint = beforeLabels
+        )
+        val rawVisionJson = when (visionResult) {
+            is GeminiResult.Success -> visionResult.text
+            is GeminiResult.NetworkError -> return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "click_visual_element",
+                activePackage = activePkg,
+                message = visionResult.message,
+                failureReason = "vision_network_error",
+                target = cleanQuery
+            )
+            is GeminiResult.GenericError -> return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "click_visual_element",
+                activePackage = activePkg,
+                message = visionResult.message,
+                failureReason = "vision_api_error",
+                target = cleanQuery
+            )
+        }
+
+        val proposal = VisualClickIntelligenceEngine.parseGeminiVisionTargetJson(rawVisionJson, screenW, screenH)
+
+        // 5. Re-capture LIVE Accessibility tree & re-verify safety right before clicking
+        val liveRoot = rootInActiveWindow ?: return AccessibilityActionOutcome(
+            success = false,
+            verified = false,
+            actionType = "click_visual_element",
+            activePackage = activePkg,
+            message = "Active screen changed before visual click could be revalidated.",
+            failureReason = "no_active_window",
+            target = cleanQuery
+        )
+        checkScreenSafety(liveRoot, "click_visual_element")?.let { return it }
+        val (liveSnapshots, liveNodeMap) = captureNodeSnapshotTree(liveRoot)
+
+        val plan = VisualClickIntelligenceEngine.revalidateTargetAgainstAccessibilityTree(
+            query = cleanQuery,
+            proposal = proposal,
+            liveNodes = liveSnapshots,
+            screenWidth = screenW,
+            screenHeight = screenH
+        )
+
+        return when (plan) {
+            is VisualClickPlan.BlockedSensitive -> AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visual_element",
+                activePackage = activePkg,
+                message = plan.reason,
+                failureReason = "sensitive_target_blocked",
+                target = cleanQuery,
+                executionStatus = "blocked_sensitive"
+            )
+            is VisualClickPlan.NotFound -> AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visual_element",
+                activePackage = activePkg,
+                message = plan.reason,
+                failureReason = "visual_target_not_found",
+                target = cleanQuery
+            )
+            is VisualClickPlan.RefuseLowConfidence -> AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visual_element",
+                activePackage = activePkg,
+                message = plan.reason,
+                failureReason = "low_visual_confidence",
+                target = cleanQuery,
+                data = JSONObject().put("confidence", plan.confidence.toDouble())
+            )
+            is VisualClickPlan.ClarifyAmbiguous -> {
+                val arr = JSONArray()
+                plan.options.forEachIndexed { idx, opt ->
+                    arr.put(JSONObject().put("index", idx + 1).put("label", opt))
+                }
+                AccessibilityActionOutcome(
+                    success = false,
+                    verified = true,
+                    actionType = "click_visual_element",
+                    activePackage = activePkg,
+                    message = plan.reason,
+                    failureReason = "multiple_elements",
+                    target = cleanQuery,
+                    executionStatus = "multiple_elements",
+                    data = JSONObject().put("candidates", arr)
+                )
+            }
+            is VisualClickPlan.ClickAccessibilityNode -> {
+                val liveMatch = liveNodeMap[plan.matchNode.nodeId]
+                val liveClickable = plan.clickableAncestor?.let { liveNodeMap[it.nodeId] }
+                val clickStartMs = System.currentTimeMillis()
+                val (clicked, method) = performSmartClickOnResolvedTarget(liveMatch, liveClickable, plan.resolvedBounds)
+                if (!clicked) {
+                    return AccessibilityActionOutcome(
+                        success = false,
+                        verified = false,
+                        actionType = "click_visual_element",
+                        activePackage = activePkg,
+                        message = "Visually located \"${plan.label}\", but Android rejected the click action.",
+                        failureReason = "click_action_rejected",
+                        target = plan.label
+                    )
+                }
+                val eventObserved = waitForUiTransitionEvent(clickStartMs, maxWaitMs = 750L)
+                val afterRoot = rootInActiveWindow
+                val afterSnapshots = if (afterRoot != null) captureNodeSnapshotTree(afterRoot, 160).first else emptyList()
+                val verification = UniversalUiAutomationEngine.verifyClickOutcome(
+                    beforeLabels = beforeLabels,
+                    afterNodes = afterSnapshots,
+                    clickedLabel = plan.label,
+                    accessibilityEventObserved = eventObserved
+                )
+                AccessibilityActionOutcome(
+                    success = true,
+                    verified = verification.stateChanged,
+                    actionType = "click_visual_element",
+                    activePackage = afterRoot?.packageName?.toString().orEmpty().ifBlank { activePkg },
+                    message = verification.evidence,
+                    target = plan.label,
+                    executionStatus = verification.status,
+                    data = JSONObject()
+                        .put("method", "visual_revalidated_$method")
+                        .put("confidence", plan.confidence.toDouble())
+                        .put("target", plan.label)
+                        .put("stateChanged", verification.stateChanged)
+                )
+            }
+            is VisualClickPlan.ClickVerifiedCoordinates -> {
+                val clickStartMs = System.currentTimeMillis()
+                val tapped = dispatchTapGesture(plan.x.toFloat(), plan.y.toFloat())
+                if (!tapped) {
+                    return AccessibilityActionOutcome(
+                        success = false,
+                        verified = false,
+                        actionType = "click_visual_element",
+                        activePackage = activePkg,
+                        message = "Located \"${plan.label}\" visually, but gesture tap could not be dispatched.",
+                        failureReason = "gesture_dispatch_failed",
+                        target = plan.label
+                    )
+                }
+                val eventObserved = waitForUiTransitionEvent(clickStartMs, maxWaitMs = 750L)
+                val afterRoot = rootInActiveWindow
+                val afterSnapshots = if (afterRoot != null) captureNodeSnapshotTree(afterRoot, 160).first else emptyList()
+                val verification = UniversalUiAutomationEngine.verifyClickOutcome(
+                    beforeLabels = beforeLabels,
+                    afterNodes = afterSnapshots,
+                    clickedLabel = plan.label,
+                    accessibilityEventObserved = eventObserved
+                )
+                AccessibilityActionOutcome(
+                    success = true,
+                    verified = verification.stateChanged,
+                    actionType = "click_visual_element",
+                    activePackage = afterRoot?.packageName?.toString().orEmpty().ifBlank { activePkg },
+                    message = verification.evidence,
+                    target = plan.label,
+                    executionStatus = verification.status,
+                    data = JSONObject()
+                        .put("method", "visual_verified_gesture")
+                        .put("confidence", plan.confidence.toDouble())
+                        .put("x", plan.x)
+                        .put("y", plan.y)
+                        .put("target", plan.label)
+                        .put("stateChanged", verification.stateChanged)
+                )
+            }
+        }
     }
 
     // ========================================================================
@@ -2286,6 +2712,23 @@ class ZoniAccessibilityService : AccessibilityService() {
             return svc.clickVisibleElementAdvanced(targetText, index)
         }
 
+        fun clickVisualTargetWithRevalidation(
+            query: String,
+            context: Context,
+            apiKey: String
+        ): AccessibilityActionOutcome {
+            val svc = instance ?: return AccessibilityActionOutcome(
+                success = false,
+                verified = false,
+                actionType = "click_visual_element",
+                message = "Zoni Accessibility Service is not enabled. Enable it in Android Accessibility Settings.",
+                failureReason = "accessibility_service_disabled",
+                target = query,
+                executionStatus = "permission_missing"
+            )
+            return svc.clickVisualTargetWithRevalidation(query, context, apiKey)
+        }
+
         fun clickWhatsAppContact(
             contactQuery: String = "",
             ordinalIndex: Int? = null,
@@ -2390,8 +2833,10 @@ class ZoniAccessibilityService : AccessibilityService() {
                 lower == "back" || lower == "go_back" -> svc.performGlobalNavigationDetailed("back")
                 lower == "recents" -> svc.performGlobalNavigationDetailed("recents")
                 lower == "notifications" -> svc.performGlobalNavigationDetailed("notifications")
-                lower == "scroll_down" || lower == "scroll down" -> svc.scrollScreenDetailed("down")
-                lower == "scroll_up" || lower == "scroll up" -> svc.scrollScreenDetailed("up")
+                lower == "scroll_down" || lower == "scroll down" || lower == "swipe_down" -> svc.scrollScreenDetailed("down")
+                lower == "scroll_up" || lower == "scroll up" || lower == "swipe_up" -> svc.scrollScreenDetailed("up")
+                lower == "scroll_left" || lower == "scroll left" || lower == "swipe_left" || lower == "swipe left" -> svc.scrollScreenDetailed("left")
+                lower == "scroll_right" || lower == "scroll right" || lower == "swipe_right" || lower == "swipe right" -> svc.scrollScreenDetailed("right")
                 lower == "read_screen" -> svc.readVisibleScreenDetailed(80)
                 lower.startsWith("tap:") -> svc.tapElementByTextDetailed(clean.substringAfter(":").trim())
                 lower.startsWith("click:") -> svc.tapElementByTextDetailed(clean.substringAfter(":").trim())
@@ -2415,8 +2860,10 @@ class ZoniAccessibilityService : AccessibilityService() {
                 lower == "back" || lower == "go_back" -> svc.performGlobalNavigationDetailed("back").success
                 lower == "recents" -> svc.performGlobalNavigationDetailed("recents").success
                 lower == "notifications" -> svc.performGlobalNavigationDetailed("notifications").success
-                lower == "scroll_down" || lower == "scroll down" -> svc.scrollScreenDetailed("down").success
-                lower == "scroll_up" || lower == "scroll up" -> svc.scrollScreenDetailed("up").success
+                lower == "scroll_down" || lower == "scroll down" || lower == "swipe_down" -> svc.scrollScreenDetailed("down").success
+                lower == "scroll_up" || lower == "scroll up" || lower == "swipe_up" -> svc.scrollScreenDetailed("up").success
+                lower == "scroll_left" || lower == "scroll left" || lower == "swipe_left" || lower == "swipe left" -> svc.scrollScreenDetailed("left").success
+                lower == "scroll_right" || lower == "scroll right" || lower == "swipe_right" || lower == "swipe right" -> svc.scrollScreenDetailed("right").success
                 lower.startsWith("tap:") -> svc.tapElementByTextDetailed(clean.substringAfter(":").trim()).success
                 lower.startsWith("click:") -> svc.tapElementByTextDetailed(clean.substringAfter(":").trim()).success
                 lower.startsWith("type:") -> {

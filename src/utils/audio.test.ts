@@ -62,3 +62,38 @@ test('FastEndOfSpeechDetector ignores steady room noise and fires audioStreamEnd
     assert.equal(res.shouldSignalAudioStreamEnd, false);
   }
 });
+
+test('FastEndOfSpeechDetector default config tolerates brief mid-sentence pauses and responds right after speech ends', () => {
+  const detector = new FastEndOfSpeechDetector();
+
+  // First phrase (200ms at RMS 0.10)
+  for (let i = 0; i < 4; i++) {
+    const res = detector.processFrame(0.10, 50, false);
+    assert.equal(res.shouldSignalAudioStreamEnd, false);
+  }
+
+  // Brief mid-sentence pause (250ms < 420ms default silenceEndMs) -> must NOT cut off
+  for (let i = 0; i < 5; i++) {
+    const res = detector.processFrame(0.005, 50, false);
+    assert.equal(res.shouldSignalAudioStreamEnd, false);
+  }
+
+  // User continues speaking (150ms)
+  for (let i = 0; i < 3; i++) {
+    const res = detector.processFrame(0.11, 50, false);
+    assert.equal(res.shouldSignalAudioStreamEnd, false);
+  }
+
+  // User finishes -> should fire once around 420ms (9 * 50ms = 450ms)
+  let firedAtFrame = -1;
+  let totalFired = 0;
+  for (let i = 1; i <= 12; i++) {
+    const res = detector.processFrame(0.004, 50, false);
+    if (res.shouldSignalAudioStreamEnd) {
+      if (firedAtFrame === -1) firedAtFrame = i;
+      totalFired += 1;
+    }
+  }
+  assert.equal(totalFired, 1);
+  assert.ok(firedAtFrame >= 8 && firedAtFrame <= 10, `Expected EOS around 420ms (frame 9), got frame ${firedAtFrame}`);
+});

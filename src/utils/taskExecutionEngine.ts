@@ -782,8 +782,8 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     }
   }
 
-  // 3. Accessibility Navigation & Touch ("scroll down", "scroll up", "go back", "go home", "tap <button>")
-  if (/(?:scroll\s+down|নিচে\s*স্ক্রল\s*করো|নিচের\s*দিকে\s*স্ক্রল|नीचे\s*स्क्रॉल\s*करो)/i.test(segment)) {
+  // 3. Accessibility Navigation & Touch ("scroll down", "scroll up", "swipe left", "swipe right", "go back", "go home", "tap <button>")
+  if (/(?:scroll\s+down|swipe\s+down|নিচে\s*স্ক্রল\s*করো|নিচের\s*দিকে\s*স্ক্রল|নিচে\s*সোয়াইপ|নিচে\s*সোয়াইপ|नीचे\s*स्क्रॉल\s*करो)/i.test(segment)) {
     return {
       stepId,
       tool: 'accessibility_action',
@@ -793,7 +793,7 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
       honestOutcomeNote: 'Scrolls down on the active Android screen via AccessibilityService.',
     };
   }
-  if (/(?:scroll\s+up|উপরে\s*স্ক্রল\s*করো|উপরের\s*দিকে\s*স্ক্রল|ऊपर\s*स्क्रॉल\s*करो)/i.test(segment)) {
+  if (/(?:scroll\s+up|swipe\s+up|উপরে\s*স্ক্রল\s*করো|উপরের\s*দিকে\s*স্ক্রল|উপরে\s*সোয়াইপ|উপরে\s*সোয়াইপ|ऊपर\s*स्क्रॉल\s*करो)/i.test(segment)) {
     return {
       stepId,
       tool: 'accessibility_action',
@@ -801,6 +801,26 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
       requiredPermissions: ['ACCESSIBILITY_SERVICE'],
       requiresUserConfirmation: false,
       honestOutcomeNote: 'Scrolls up on the active Android screen via AccessibilityService.',
+    };
+  }
+  if (/(?:swipe\s+left|scroll\s+left|বামে\s*(?:সোয়াইপ|সোয়াইপ|স্ক্রল)\s*করো|বাম\s*দিকে\s*(?:সোয়াইপ|সোয়াইপ|স্ক্রল)|बाएं\s*(?:स्वाइप|स्क्रॉल)\s*करो)/i.test(segment)) {
+    return {
+      stepId,
+      tool: 'accessibility_action',
+      args: { command: 'scroll_left' },
+      requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Swipes left on the active Android screen via AccessibilityService.',
+    };
+  }
+  if (/(?:swipe\s+right|scroll\s+right|ডানে\s*(?:সোয়াইপ|সোয়াইপ|স্ক্রল)\s*করো|ডান\s*দিকে\s*(?:সোয়াইপ|সোয়াইপ|স্ক্রল)|दाएं\s*(?:स्वाइप|स्क्रॉल)\s*करो)/i.test(segment)) {
+    return {
+      stepId,
+      tool: 'accessibility_action',
+      args: { command: 'scroll_right' },
+      requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: 'Swipes right on the active Android screen via AccessibilityService.',
     };
   }
   if (/^(?:go\s+back|back\s+button|পেছনে\s*যাও|পিছনে\s*যাও|ব্যাক\s*করো|वापस\s*जाओ|बैक\s*करो)$/i.test(segment)) {
@@ -836,12 +856,12 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     };
   }
 
-  // Bengali & Hindi visible button/control click ("Facebook-এ Like বাটনে ক্লিক করো", "এই বাটনে ক্লিক করো", "<label> বাটনে ক্লিক করো")
+  // Bengali & Hindi visible button/control click ("Facebook-এ Like বাটনে ক্লিক করো", "লাল বাটনে চাপ দাও", "<label>-এ ক্লিক করো")
   const bnTapMatch = segment.match(
-    /^(?:(?:facebook|ফেসবুক|youtube|ইউটিউব)(?:-?এ|\s*এ)\s+)?(.+?)\s*(?:বাটনে|বাটনটিতে|বটনে)?\s*(?:ক্লিক\s*করো|ট্যাপ\s*করো|চাপো)$/i
+    /^(?:(?:facebook|ফেসবুক|youtube|ইউটিউব)(?:-?এ|\s*এ)\s+)?(.+?)\s*(?:বাটনে|বাটনটিতে|বটনে|আইকনে|অপশনে)?\s*(?:ক্লিক\s*করো|ট্যাপ\s*করো|চাপ\s*দাও|চাপো|क्लिक\s*करो|टैप\s*करो|दबाओ)$/i
   );
   if (bnTapMatch && bnTapMatch[1]) {
-    const rawTarget = bnTapMatch[1].trim();
+    const rawTarget = bnTapMatch[1].trim().replace(/(?:-এ|-তে)$/, '').trim();
     const normalizedTarget = /^এই$/i.test(rawTarget) ? 'button' : rawTarget;
     return {
       stepId,

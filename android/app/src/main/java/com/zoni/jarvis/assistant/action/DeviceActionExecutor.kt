@@ -21,6 +21,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.zoni.jarvis.assistant.R
 import com.zoni.jarvis.assistant.ZoniApplication
+import com.zoni.jarvis.assistant.data.SecureKeyManager
 import com.zoni.jarvis.assistant.device.AppLaunchResult
 import com.zoni.jarvis.assistant.device.AppLauncher
 import com.zoni.jarvis.assistant.device.ContactCallManager
@@ -29,7 +30,9 @@ import com.zoni.jarvis.assistant.device.FlashlightController
 import com.zoni.jarvis.assistant.device.FlashlightResult
 import com.zoni.jarvis.assistant.domain.NumberNormalizer
 import com.zoni.jarvis.assistant.domain.NumberNormalizerResult
+import com.zoni.jarvis.assistant.screen.ScreenCaptureManager
 import com.zoni.jarvis.assistant.service.AppChatAdapterRegistry
+import com.zoni.jarvis.assistant.service.VisualClickIntelligenceEngine
 import com.zoni.jarvis.assistant.service.WhatsAppSendDeduplicator
 import com.zoni.jarvis.assistant.service.ZoniAccessibilityService
 import com.zoni.jarvis.assistant.service.ZoniNotificationListenerService
@@ -62,6 +65,7 @@ class DeviceActionExecutor(private val context: Context) {
     private val contactCallManager = ContactCallManager(context)
     private val appLauncher = AppLauncher(context)
     private val flashlightController = FlashlightController(context)
+    private val keyManager: SecureKeyManager by lazy { SecureKeyManager(context.applicationContext) }
     private val simCallManager: com.zoni.jarvis.assistant.calling.SimCallManager by lazy {
         com.zoni.jarvis.assistant.calling.SimCallManager(
             context = context,
@@ -257,13 +261,18 @@ class DeviceActionExecutor(private val context: Context) {
 
             AllowedActionType.SCROLL_SCREEN -> {
                 val dir = (args["direction"] ?: "down").lowercase()
-                val cmd = if (dir.contains("up")) "scroll_up" else "scroll_down"
+                val cmd = when {
+                    dir.contains("left") || dir.contains("বাম") -> "scroll_left"
+                    dir.contains("right") || dir.contains("ডান") -> "scroll_right"
+                    dir.contains("up") -> "scroll_up"
+                    else -> "scroll_down"
+                }
                 wrapAccessibilityResult(request, ZoniAccessibilityService.performExplicitActionDetailedJson(cmd))
             }
 
             AllowedActionType.TAP_VISIBLE_ELEMENT -> {
                 val label = args["element_text"] ?: args["target"] ?: ""
-                wrapAccessibilityResult(request, ZoniAccessibilityService.performExplicitActionDetailedJson("tap:$label"))
+                executeSmartOrVisualClick(request, label, index = null)
             }
 
             AllowedActionType.ENTER_TEXT_IN_VISIBLE_FIELD -> {
@@ -633,8 +642,7 @@ class DeviceActionExecutor(private val context: Context) {
             AllowedActionType.CLICK_VISIBLE_ELEMENT -> {
                 val target = args["target"] ?: args["element_text"] ?: ""
                 val index = args["index"]?.toIntOrNull()
-                val outcome = ZoniAccessibilityService.clickVisibleElementAdvanced(target, index)
-                wrapAccessibilityResult(request, outcome.toJson())
+                executeSmartOrVisualClick(request, target, index)
             }
 
             AllowedActionType.CLICK_WHATSAPP_CONTACT -> executeWhatsAppContactClick(
@@ -727,6 +735,55 @@ class DeviceActionExecutor(private val context: Context) {
                 failureReason = "call_control_parse_error"
             )
         }
+    }
+
+    /**
+     * Two-tier intelligent UI clicking:
+     * Tier 1: Fast, privacy-preserving Accessibility tree resolution (YouTube/Facebook/Universal).
+     * Tier 2: On-demand Gemini Vision + live Accessibility revalidation for visual-attribute requests
+     *         (color/icon/position) or when an unlabeled custom control is not found in the Accessibility tree.
+     */
+    private fun executeSmartOrVisualClick(
+        request: TypedActionRequest,
+        target: String,
+        index: Int?
+    ): TypedActionResult {
+        val cleanTarget = target.trim()
+        val canUseVision = ScreenCaptureManager.isActive() && keyManager.hasApiKey()
+
+        // Visual-attribute queries ("red button", "লাল বাটন", "top right icon") try Vision+Revalidation first when active
+        if (index == null && canUseVision && VisualClickIntelligenceEngine.isVisualAttributeQuery(cleanTarget)) {
+            val visualOutcome = ZoniAccessibilityService.clickVisualTargetWithRevalidation(
+                query = cleanTarget,
+                context = context,
+                apiKey = keyManager.getApiKey().orEmpty()
+            )
+            if (visualOutcome.success ||
+                visualOutcome.failureReason == "multiple_elements" ||
+                visualOutcome.failureReason == "sensitive_target_blocked" ||
+                visualOutcome.failureReason == "protected_banking_or_auth_screen" ||
+                visualOutcome.failureReason == "sensitive_screen_content"
+            ) {
+                return wrapAccessibilityResult(request, visualOutcome.toJson())
+            }
+        }
+
+        // Tier 1: Semantic Accessibility click
+        val semanticOutcome = ZoniAccessibilityService.clickVisibleElementAdvanced(cleanTarget, index)
+        if (semanticOutcome.success ||
+            semanticOutcome.failureReason != "element_not_found" ||
+            !canUseVision
+        ) {
+            return wrapAccessibilityResult(request, semanticOutcome.toJson())
+        }
+
+        // Tier 2: Intelligent visual fallback when Accessibility label wasn't found and Screen Awareness is active
+        val visualFallback = ZoniAccessibilityService.clickVisualTargetWithRevalidation(
+            query = cleanTarget,
+            context = context,
+            apiKey = keyManager.getApiKey().orEmpty()
+        )
+        return wrapAccessibilityResult(request, visualFallback.toJson())
     }
 
     private fun ensureWhatsAppInForeground(): Boolean {

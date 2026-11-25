@@ -11,6 +11,11 @@ import androidx.core.content.ContextCompat
 import com.zoni.jarvis.assistant.domain.NumberNormalizer
 import com.zoni.jarvis.assistant.domain.NumberNormalizerResult
 
+import com.zoni.jarvis.assistant.service.MultilingualNameMatcher
+import java.text.Normalizer
+import kotlin.math.max
+import kotlin.math.min
+
 data class ContactMatch(
     val id: String,
     val displayName: String,
@@ -24,6 +29,302 @@ sealed class ContactCallResolution {
     data class ContactNotFound(val query: String) : ContactCallResolution()
     object PermissionMissing : ContactCallResolution()
     data class CallFailed(val reason: String) : ContactCallResolution()
+}
+
+/**
+ * Pure JVM-testable Bilingual (Bengali & English) Smart Contact Search & Disambiguation Engine.
+ *
+ * Supports:
+ * 1. Exact Bengali Unicode match ("রহিম" -> "রহিম") with NFC + zero-width cleanup + suffix stripping ("রহিমকে" -> "রহিম")
+ * 2. Case-insensitive English match ("Rahim" / "rahim" -> "Rahim")
+ * 3. Bidirectional Bengali <-> English transliteration ("রহিম" <-> "Rahim"/"Rohim", "অমিত" <-> "Amit", "সুমন" <-> "Sumon"/"Suman")
+ * 4. Kinship aliases ("মা" <-> "Mom"/"Ammu", "বাবা" <-> "Dad"/"Abbu")
+ * 5. Controlled fuzzy similarity (Levenshtein >= 72% for typo tolerance) without unsafe false matches
+ * 6. Phone number normalization & equivalent-number deduplication ("+8801711..." vs "01711...")
+ * 7. Safe disambiguation when multiple contacts genuinely tie
+ */
+object SmartContactMatcher {
+
+    private val BENGALI_VOWEL_SIGNS = setOf('া', 'ি', 'ী', 'ু', 'ূ', 'ৃ', 'ে', 'ৈ', 'ো', 'ৌ', '্')
+
+    private val BENGALI_CONSONANT_MAP: Map<Char, String> = mapOf(
+        'ক' to "k", 'খ' to "kh", 'গ' to "g", 'ঘ' to "gh", 'ঙ' to "ng",
+        'চ' to "ch", 'ছ' to "ch", 'জ' to "j", 'ঝ' to "jh", 'ঞ' to "n",
+        'ট' to "t", 'ঠ' to "th", 'ড' to "d", 'ঢ' to "dh", 'ণ' to "n",
+        'ত' to "t", 'থ' to "th", 'দ' to "d", 'ধ' to "dh", 'ন' to "n",
+        'প' to "p", 'ফ' to "f", 'ব' to "b", 'ভ' to "bh", 'ম' to "m",
+        'য' to "j", 'র' to "r", 'ল' to "l", 'শ' to "sh", 'ষ' to "sh", 'স' to "s", 'হ' to "h",
+        '\u09DC' to "r", '\u09DD' to "rh", '\u09DF' to "y",
+        'ৎ' to "t", 'ং' to "ng", 'ঃ' to "h", 'ঁ' to "n"
+    )
+
+    private val BENGALI_VOWEL_MAP: Map<Char, String> = mapOf(
+        'অ' to "a", 'আ' to "a", 'ই' to "i", 'ঈ' to "i", 'উ' to "u", 'ঊ' to "u",
+        'ঋ' to "ri", 'এ' to "e", 'ঐ' to "oi", 'ও' to "o", 'ঔ' to "ou",
+        'া' to "a", 'ি' to "i", 'ী' to "i", 'ু' to "u", 'ূ' to "u", 'ৃ' to "ri",
+        'ে' to "e", 'ৈ' to "oi", 'ো' to "o", 'ৌ' to "ou", '্' to ""
+    )
+
+    fun normalizeDisplayText(raw: String): String {
+        return Normalizer.normalize(raw, Normalizer.Form.NFC)
+            .replace(Regex("[\u200B-\u200D\uFEFF]"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    fun cleanContactQuery(raw: String): String {
+        val norm = normalizeDisplayText(raw)
+        return MultilingualNameMatcher.cleanPersonQuery(norm)
+    }
+
+    /**
+     * Inherent-vowel-aware Bengali -> Latin transliteration so:
+     * "রহিম" -> "rahim", "অমিত" -> "amit", "সুমন" -> "suman", "করিম" -> "karim", "রাহুল" -> "rahul".
+     */
+    fun transliterateToLatin(input: String): String {
+        val norm = normalizeDisplayText(input).lowercase()
+        val sb = StringBuilder(norm.length * 2)
+        var i = 0
+        while (i < norm.length) {
+            val ch = norm[i]
+            val next = if (i + 1 < norm.length) norm[i + 1] else '\u0000'
+
+            // Handle decomposed Bengali nukta letters (ড/ঢ/য + U+09BC)
+            if (next == '\u09BC') {
+                val nukta = when (ch) {
+                    'ড' -> "r"
+                    'ঢ' -> "rh"
+                    'য' -> "y"
+                    else -> null
+                }
+                if (nukta != null) {
+                    sb.append(nukta)
+                    val afterNukta = if (i + 2 < norm.length) norm[i + 2] else '\u0000'
+                    if (afterNukta != '\u0000' && afterNukta !in BENGALI_VOWEL_SIGNS && BENGALI_CONSONANT_MAP.containsKey(afterNukta)) {
+                        sb.append('a')
+                    }
+                    i += 2
+                    continue
+                }
+            }
+
+            val consonant = BENGALI_CONSONANT_MAP[ch]
+            if (consonant != null) {
+                sb.append(consonant)
+                // Insert inherent 'a' when followed by another Bengali consonant (and NOT a vowel sign or virama '্' or word end)
+                if (next != '\u0000' && next !in BENGALI_VOWEL_SIGNS && BENGALI_CONSONANT_MAP.containsKey(next)) {
+                    sb.append('a')
+                }
+                i++
+                continue
+            }
+
+            val vowel = BENGALI_VOWEL_MAP[ch]
+            if (vowel != null) {
+                sb.append(vowel)
+                i++
+                continue
+            }
+
+            if (ch.isLetterOrDigit() || ch == ' ') {
+                sb.append(ch)
+            } else if (ch == '-' || ch == '_' || ch == '.') {
+                sb.append(' ')
+            }
+            i++
+        }
+        return sb.toString().replace(Regex("\\s+"), " ").trim()
+    }
+
+    /**
+     * Canonical phonetic key bridging Bengali/English spelling variations:
+     * "Rahim"/"Rohim"/"Raheem"/"রহিম" -> "rahim"
+     * "Sumon"/"Suman"/"সুমন" -> "suman"
+     * "Amit"/"Omit"/"অমিত" -> "amit"
+     * "Shakib"/"Sakib"/"সাকিব" -> "sakib"
+     * "Tanveer"/"Tanvir"/"তানভীর" -> "tanbir"
+     */
+    fun toCanonicalPhonetic(raw: String): String {
+        val latin = transliterateToLatin(raw).lowercase()
+        val replaced = latin
+            .replace("ph", "f")
+            .replace("bh", "b")
+            .replace("sh", "s")
+            .replace("kh", "k")
+            .replace("gh", "g")
+            .replace("dh", "d")
+            .replace("th", "t")
+            .replace("ch", "c")
+            .replace("ee", "i")
+            .replace("oo", "u")
+            .replace('v', 'b')
+            .replace('w', 'b')
+            .replace('z', 'j')
+            .replace('q', 'k')
+            .replace('y', 'i')
+            .replace('o', 'a')
+            .replace(Regex("([a-z])\\1+"), "$1")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return replaced
+    }
+
+    fun scoreContactName(displayName: String, rawQuery: String): Int {
+        val cleanName = normalizeDisplayText(displayName)
+        val cleanQuery = cleanContactQuery(rawQuery)
+        if (cleanName.isEmpty() || cleanQuery.isEmpty()) return 0
+
+        val nLower = cleanName.lowercase()
+        val qLower = cleanQuery.lowercase()
+
+        // 1. Exact full match (Bengali Unicode or English case-insensitive)
+        if (nLower == qLower) return 100
+
+        // 2. Exact transliterated / canonical phonetic match ("রহিম" <-> "Rahim"/"Rohim", "অমিত" <-> "Amit", "সুমন" <-> "Sumon")
+        val nTrans = transliterateToLatin(cleanName)
+        val qTrans = transliterateToLatin(cleanQuery)
+        if (nTrans.isNotEmpty() && nTrans == qTrans) return 96
+
+        val nCanon = toCanonicalPhonetic(cleanName)
+        val qCanon = toCanonicalPhonetic(cleanQuery)
+        if (nCanon.isNotEmpty() && nCanon == qCanon) return 95
+
+        // 3. Kinship alias match ("মা" <-> "Mom"/"Ammu", "বাবা" <-> "Dad"/"Abbu")
+        if (MultilingualNameMatcher.matchesKinshipAlias(cleanName, cleanQuery)) return 92
+
+        // 4. Whole-word exact match in multi-word display names ("রহিম" -> "Rahim Khan" / "Rahim Bhai")
+        val nWords = nLower.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val nCanonWords = nCanon.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val qCanonWords = qCanon.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (qLower in nWords) return 88
+        if (qCanon.isNotEmpty() && qCanon in nCanonWords) return 87
+        if (qCanonWords.size > 1 && qCanonWords.all { qw -> nCanonWords.any { nw -> nw == qw } }) return 91
+
+        // 5. Prefix match (full name or first word)
+        if (nLower.startsWith(qLower) || (qCanon.length >= 2 && nCanon.startsWith(qCanon))) return 82
+        if (qCanon.length >= 3 && nCanonWords.any { it.startsWith(qCanon) }) return 80
+
+        // 6. Consonant skeleton match (for Bengali/English vowel differences where length >= 3)
+        val nSkel = MultilingualNameMatcher.consonantSkeleton(nCanon)
+        val qSkel = MultilingualNameMatcher.consonantSkeleton(qCanon)
+        if (qSkel.length >= 3 && (nSkel == qSkel || nCanonWords.any { MultilingualNameMatcher.consonantSkeleton(it) == qSkel })) {
+            return 84
+        }
+
+        // 7. Substring match
+        if (qLower.length >= 3 && nLower.contains(qLower)) return 76
+        if (qCanon.length >= 3 && nCanon.contains(qCanon)) return 75
+
+        // 8. Controlled fuzzy similarity (Levenshtein >= 74% on full name or individual token)
+        if (qCanon.length >= 3) {
+            val fullSim = similarityScore(qCanon, nCanon)
+            val bestTokenSim = nCanonWords.maxOfOrNull { similarityScore(qCanon, it) } ?: 0
+            val bestSim = max(fullSim, bestTokenSim)
+            if (bestSim >= 74) {
+                return (bestSim * 0.92f).toInt().coerceIn(70, 86)
+            }
+        }
+
+        return 0
+    }
+
+    private fun similarityScore(a: String, b: String): Int {
+        if (a.isEmpty() || b.isEmpty()) return 0
+        val maxLen = max(a.length, b.length)
+        val dist = levenshtein(a, b)
+        // Guard against short 3-4 char names matching wildly different words
+        if (maxLen <= 4 && dist > 1) return 0
+        return (((maxLen - dist).toFloat() / maxLen.toFloat()) * 100f).toInt().coerceIn(0, 100)
+    }
+
+    private fun levenshtein(a: String, b: String): Int {
+        val dp = Array(a.length + 1) { IntArray(b.length + 1) }
+        for (i in 0..a.length) dp[i][0] = i
+        for (j in 0..b.length) dp[0][j] = j
+        for (i in 1..a.length) {
+            for (j in 1..b.length) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                dp[i][j] = min(min(dp[i - 1][j] + 1, dp[i][j - 1] + 1), dp[i - 1][j - 1] + cost)
+            }
+        }
+        return dp[a.length][b.length]
+    }
+
+    /**
+     * Deduplicates phone numbers representing the same line (e.g. "+8801711223344" and "01711-223344"),
+     * keeping the cleanest normalized format (preferring international '+' prefix when present).
+     */
+    fun deduplicatePhoneNumbers(rawNumbers: List<String>): List<String> {
+        val byKey = LinkedHashMap<String, String>()
+        for (raw in rawNumbers) {
+            val normResult = NumberNormalizer.normalizePhoneNumber(raw)
+            val clean = if (normResult is NumberNormalizerResult.ValidCandidate) {
+                normResult.normalizedNumber
+            } else {
+                raw.filter { it.isDigit() || it == '+' }
+            }
+            val digitsOnly = clean.filter { it.isDigit() }
+            if (digitsOnly.length < 3) continue
+            val dedupKey = if (digitsOnly.length >= 10) digitsOnly.takeLast(10) else digitsOnly
+            val existing = byKey[dedupKey]
+            if (existing == null || (clean.startsWith("+") && !existing.startsWith("+"))) {
+                byKey[dedupKey] = clean
+            }
+        }
+        return byKey.values.toList()
+    }
+
+    /**
+     * Pure JVM-testable resolution over a list of contacts.
+     * Applies strict confidence threshold (>= 70), exact-winner priority over partial matches,
+     * safe disambiguation on ties, and phone-number deduplication.
+     */
+    fun resolveFromContacts(
+        rawQuery: String,
+        contacts: List<ContactMatch>,
+        useDirectCall: Boolean
+    ): ContactCallResolution {
+        val cleanQuery = rawQuery.trim()
+        if (cleanQuery.isBlank()) {
+            return ContactCallResolution.ContactNotFound(cleanQuery)
+        }
+
+        val scored = contacts.mapNotNull { contact ->
+            val dedupedPhones = deduplicatePhoneNumbers(contact.phoneNumbers)
+            if (dedupedPhones.isEmpty()) return@mapNotNull null
+            val score = scoreContactName(contact.displayName, cleanQuery)
+            if (score < 70) return@mapNotNull null
+            Pair(contact.copy(phoneNumbers = dedupedPhones), score)
+        }.sortedWith(compareByDescending<Pair<ContactMatch, Int>> { it.second }.thenBy { it.first.displayName.lowercase() })
+
+        if (scored.isEmpty()) {
+            return ContactCallResolution.ContactNotFound(cleanQuery)
+        }
+
+        val topScore = scored[0].second
+        // Select clear winner if top match is exact/phonetic-exact (>= 92) and leads runner-up by >= 8 points,
+        // or if only one contact qualifies in the top tier.
+        val topTier = if (scored.size > 1 && topScore >= 92 && (topScore - scored[1].second) >= 8) {
+            listOf(scored[0].first)
+        } else {
+            scored.filter { it.second >= topScore - 6 }.map { it.first }
+        }
+
+        if (topTier.size == 1) {
+            val contact = topTier[0]
+            return if (contact.phoneNumbers.size == 1) {
+                ContactCallResolution.ReadyToCall(
+                    name = contact.displayName,
+                    number = contact.phoneNumbers[0],
+                    useDirectCall = useDirectCall
+                )
+            } else {
+                ContactCallResolution.MultipleNumbersForContact(contact.displayName, contact.phoneNumbers)
+            }
+        }
+
+        return ContactCallResolution.MultipleMatches(cleanQuery, topTier.take(6))
+    }
 }
 
 class ContactCallManager(private val context: Context) {
@@ -43,7 +344,9 @@ class ContactCallManager(private val context: Context) {
     }
 
     /**
-     * Resolves a contact name query against the Android Contacts Provider.
+     * Resolves a Bengali or English contact name query against the Android Contacts Provider
+     * using [SmartContactMatcher] (exact Unicode, case-insensitive English, cross-script
+     * Bengali <-> English transliteration, phonetic, kinship, and controlled fuzzy matching).
      */
     fun resolveContact(contactQuery: String): ContactCallResolution {
         if (!hasContactPermission()) {
@@ -55,51 +358,45 @@ class ContactCallManager(private val context: Context) {
             return ContactCallResolution.ContactNotFound(cleanQuery)
         }
 
-        val matches = mutableListOf<ContactMatch>()
+        val allContacts = mutableListOf<ContactMatch>()
         val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
         val projection = arrayOf(
             ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
             ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
             ContactsContract.CommonDataKinds.Phone.NUMBER
         )
-        val selection = "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?"
-        val selectionArgs = arrayOf("%$cleanQuery%")
 
         var cursor: Cursor? = null
         try {
             cursor = context.contentResolver.query(
                 uri,
                 projection,
-                selection,
-                selectionArgs,
+                null,
+                null,
                 "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
             )
 
             if (cursor != null && cursor.moveToFirst()) {
-                val tempMap = mutableMapOf<String, Pair<String, MutableList<String>>>()
+                val tempMap = LinkedHashMap<String, Pair<String, MutableList<String>>>()
                 val idIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.CONTACT_ID)
                 val nameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
                 val numberIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
 
                 do {
-                    val id = cursor.getString(idIndex)
-                    val name = cursor.getString(nameIndex)
-                    val rawNumber = cursor.getString(numberIndex)
-                    val normResult = NumberNormalizer.normalizePhoneNumber(rawNumber)
-                    val cleanNumber = if (normResult is NumberNormalizerResult.ValidCandidate) {
-                        normResult.normalizedNumber
-                    } else {
-                        rawNumber.filter { it.isDigit() || it == '+' }
-                    }
+                    val id = if (idIndex >= 0) cursor.getString(idIndex) else null
+                    val name = if (nameIndex >= 0) cursor.getString(nameIndex) else null
+                    val rawNumber = if (numberIndex >= 0) cursor.getString(numberIndex) else null
+                    if (id.isNullOrBlank() || name.isNullOrBlank() || rawNumber.isNullOrBlank()) continue
 
                     val existing = tempMap.getOrPut(id) { Pair(name, mutableListOf()) }
-                    if (!existing.second.contains(cleanNumber)) {
-                        existing.second.add(cleanNumber)
-                    }
+                    existing.second.add(rawNumber)
                 } while (cursor.moveToNext())
 
                 for ((id, pair) in tempMap) {
-                    matches.add(ContactMatch(id, pair.first, pair.second))
+                    val dedupedNumbers = SmartContactMatcher.deduplicatePhoneNumbers(pair.second)
+                    if (dedupedNumbers.isNotEmpty()) {
+                        allContacts.add(ContactMatch(id, pair.first, dedupedNumbers))
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -108,26 +405,11 @@ class ContactCallManager(private val context: Context) {
             cursor?.close()
         }
 
-        if (matches.isEmpty()) {
-            return ContactCallResolution.ContactNotFound(cleanQuery)
-        }
-
-        // Single contact match
-        if (matches.size == 1) {
-            val contact = matches[0]
-            return if (contact.phoneNumbers.size == 1) {
-                ContactCallResolution.ReadyToCall(
-                    name = contact.displayName,
-                    number = contact.phoneNumbers[0],
-                    useDirectCall = hasCallPhonePermission()
-                )
-            } else {
-                ContactCallResolution.MultipleNumbersForContact(contact.displayName, contact.phoneNumbers)
-            }
-        }
-
-        // Multiple matching contacts (e.g. multiple "Rahul")
-        return ContactCallResolution.MultipleMatches(cleanQuery, matches)
+        return SmartContactMatcher.resolveFromContacts(
+            rawQuery = cleanQuery,
+            contacts = allContacts,
+            useDirectCall = hasCallPhonePermission()
+        )
     }
 
     /**

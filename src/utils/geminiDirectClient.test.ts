@@ -247,8 +247,11 @@ test('Direct Gemini Live WebSocket helpers build official setup/audio/text/tool 
   assert.equal(setup.setup.model, 'models/gemini-2.5-flash-native-audio-preview-12-2025');
   assert.equal(setup.setup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, 'Kore');
   assert.equal(setup.setup.sessionResumption.handle, 'handle-xyz');
+  assert.equal(setup.setup.realtimeInputConfig.automaticActivityDetection.disabled, false);
+  assert.equal(setup.setup.realtimeInputConfig.automaticActivityDetection.startOfSpeechSensitivity, 'START_SENSITIVITY_HIGH');
   assert.equal(setup.setup.realtimeInputConfig.automaticActivityDetection.endOfSpeechSensitivity, 'END_SENSITIVITY_HIGH');
-  assert.equal(setup.setup.realtimeInputConfig.automaticActivityDetection.silenceDurationMs, 300);
+  assert.equal(setup.setup.realtimeInputConfig.automaticActivityDetection.prefixPaddingMs, 120);
+  assert.equal(setup.setup.realtimeInputConfig.automaticActivityDetection.silenceDurationMs, 320);
   assert.equal(setup.setup.tools[0].functionDeclarations.length, 36);
 
   const setupNoVad = buildDirectLiveSetupMessage({

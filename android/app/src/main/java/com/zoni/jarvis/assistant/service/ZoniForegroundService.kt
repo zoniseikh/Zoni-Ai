@@ -2,6 +2,7 @@ package com.zoni.jarvis.assistant.service
 
 import android.Manifest
 import android.app.ForegroundServiceStartNotAllowedException
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -11,7 +12,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -51,6 +54,9 @@ class ZoniForegroundService : Service() {
     private var wakeWordEngine: ZoniWakeWordEngine? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private lateinit var preferences: ZoniPreferences
+    private val serviceHandler = Handler(Looper.getMainLooper())
+    private var wakeLockRenewRunnable: Runnable? = null
+    private var activationRecoveryRunnable: Runnable? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -72,6 +78,7 @@ class ZoniForegroundService : Service() {
             }
 
             ACTION_PAUSE_WAKE_WORD -> {
+                cancelActivationRecoveryWatchdog()
                 val reasonState = VoiceLifecycleState.fromString(intent?.getStringExtra(EXTRA_VOICE_STATE))
                 wakeWordEngine?.pauseForConversation()
                 releaseWakeLock()
@@ -104,6 +111,13 @@ class ZoniForegroundService : Service() {
 
             ACTION_UPDATE_VOICE_STATE -> {
                 val newState = VoiceLifecycleState.fromString(intent?.getStringExtra(EXTRA_VOICE_STATE))
+                if (newState == VoiceLifecycleState.CONNECTED ||
+                    newState == VoiceLifecycleState.LISTENING ||
+                    newState == VoiceLifecycleState.PROCESSING ||
+                    newState == VoiceLifecycleState.SPEAKING
+                ) {
+                    cancelActivationRecoveryWatchdog()
+                }
                 val cur = _statusFlow.value
                 _statusFlow.value = cur.copy(voiceState = newState)
                 return START_STICKY
@@ -137,7 +151,9 @@ class ZoniForegroundService : Service() {
                 val statusText = intent?.getStringExtra(EXTRA_STATUS_TEXT)
                     ?: "Zoni AI Live Voice Link সক্রিয় আছে — কথা বলার জন্য প্রস্তুত"
                 // Pause wake-word detector so Gemini Live owns the microphone cleanly
+                cancelActivationRecoveryWatchdog()
                 wakeWordEngine?.pauseForConversation()
+                releaseWakeLock()
                 if (!promoteToMicrophoneForeground(statusText)) {
                     return START_NOT_STICKY
                 }
@@ -153,6 +169,7 @@ class ZoniForegroundService : Service() {
     }
 
     private fun startWakeWordDetectorInternal(phrase: String) {
+        cancelActivationRecoveryWatchdog()
         acquirePartialWakeLock()
         val cfg = WakeWordConfig(wakePhrase = phrase)
         val started = wakeWordEngine?.start(
@@ -205,13 +222,18 @@ class ZoniForegroundService : Service() {
         )
         updateNotificationIfForeground("Zoni শনাক্ত হয়েছে! অ্যাসিস্ট্যান্ট চালু হচ্ছে...")
 
+        // If Gemini Live does not engage within 18 seconds (e.g., locked screen or OS blocked background launch),
+        // automatically re-arm wake-word listening instead of leaving the assistant stuck in ACTIVATING.
+        scheduleActivationRecoveryWatchdog()
+
         // Bring MainActivity forward safely. On Android 10+ (API 29+), startActivity from background
         // may be silently blocked without throwing, so we also post a high-priority wake notification
         // whenever MainActivity is not already in foreground (MainActivity.onResume cancels it immediately
         // if startActivity succeeds).
         val appAlreadyVisible = MainActivity.isActivityInForeground
-        if (!appAlreadyVisible && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            postWakeActivationFallbackNotification(event.remainingCommand)
+        val screenOffOrLocked = isScreenOffOrLocked()
+        if ((!appAlreadyVisible && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) || screenOffOrLocked) {
+            postWakeActivationFallbackNotification(event.remainingCommand, useFullScreenIntent = screenOffOrLocked)
         }
         try {
             val launchIntent = Intent(this, MainActivity::class.java).apply {
@@ -225,11 +247,47 @@ class ZoniForegroundService : Service() {
             startActivity(launchIntent)
         } catch (e: Exception) {
             Log.w(TAG, "Background activity launch restricted by Android OS; posting wake notification: ${e.message}")
-            postWakeActivationFallbackNotification(event.remainingCommand)
+            postWakeActivationFallbackNotification(event.remainingCommand, useFullScreenIntent = screenOffOrLocked)
         }
     }
 
-    private fun postWakeActivationFallbackNotification(remainingCommand: String) {
+    private fun isScreenOffOrLocked(): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val interactive = pm?.isInteractive ?: true
+        val locked = km?.isKeyguardLocked ?: false
+        return !interactive || locked
+    }
+
+    private fun scheduleActivationRecoveryWatchdog() {
+        cancelActivationRecoveryWatchdog()
+        val runnable = Runnable {
+            val curState = _statusFlow.value.voiceState
+            val stillStuckActivating = curState == VoiceLifecycleState.ACTIVATING ||
+                curState == VoiceLifecycleState.WAKE_WORD_DETECTED
+            if (stillStuckActivating &&
+                isServiceRunning &&
+                ::preferences.isInitialized &&
+                (preferences.isWakeWordEnabledSync() || preferences.isBackgroundListeningEnabledSync()) &&
+                hasMicPermission(this)
+            ) {
+                Log.i(TAG, "Activation watchdog: Live session did not engage within ${ACTIVATION_RECOVERY_TIMEOUT_MS}ms; resuming wake-word listening.")
+                startWakeWordDetectorInternal(preferences.getWakePhraseSync())
+            }
+        }
+        activationRecoveryRunnable = runnable
+        serviceHandler.postDelayed(runnable, ACTIVATION_RECOVERY_TIMEOUT_MS)
+    }
+
+    private fun cancelActivationRecoveryWatchdog() {
+        activationRecoveryRunnable?.let { serviceHandler.removeCallbacks(it) }
+        activationRecoveryRunnable = null
+    }
+
+    private fun postWakeActivationFallbackNotification(
+        remainingCommand: String,
+        useFullScreenIntent: Boolean = false
+    ) {
         if (!hasNotificationPermission(this)) return
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         val openIntent = Intent(this, MainActivity::class.java).apply {
@@ -244,17 +302,23 @@ class ZoniForegroundService : Service() {
             openIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val notif = NotificationCompat.Builder(this, ZoniApplication.CHANNEL_ASSISTANT_ALERTS)
+        val builder = NotificationCompat.Builder(this, ZoniApplication.CHANNEL_ASSISTANT_ALERTS)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle("Zoni AI Activated")
             .setContentText("Tap to continue your voice session with Zoni AI.")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setAutoCancel(true)
             .setContentIntent(pi)
-            .build()
+        if (useFullScreenIntent) {
+            try {
+                builder.setFullScreenIntent(pi, true)
+            } catch (_: Exception) {
+            }
+        }
         try {
-            nm.notify(WAKE_ALERT_NOTIFICATION_ID, notif)
+            nm.notify(WAKE_ALERT_NOTIFICATION_ID, builder.build())
         } catch (e: Exception) {
             Log.w(TAG, "Could not post wake activation fallback notification: ${e.message}")
         }
@@ -339,19 +403,43 @@ class ZoniForegroundService : Service() {
 
     private fun acquirePartialWakeLock() {
         try {
-            if (wakeLock?.isHeld == true) return
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "zoni:WakeWordListeningLock").apply {
-                setReferenceCounted(false)
-                // Acquire with 30-minute safety window, renewed when detector re-arms
-                acquire(30L * 60L * 1000L)
+            val existing = wakeLock
+            if (existing == null) {
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "zoni:WakeWordListeningLock").apply {
+                    setReferenceCounted(false)
+                    acquire(WAKE_LOCK_WINDOW_MS)
+                }
+            } else {
+                // Re-acquire refreshes the 30-minute safety timeout cleanly
+                existing.acquire(WAKE_LOCK_WINDOW_MS)
             }
+            scheduleWakeLockRenewal()
         } catch (e: Exception) {
             Log.w(TAG, "WakeLock acquisition skipped: ${e.message}")
         }
     }
 
+    private fun scheduleWakeLockRenewal() {
+        wakeLockRenewRunnable?.let { serviceHandler.removeCallbacks(it) }
+        val runnable = object : Runnable {
+            override fun run() {
+                if (isServiceRunning && _statusFlow.value.listening) {
+                    try {
+                        wakeLock?.acquire(WAKE_LOCK_WINDOW_MS)
+                    } catch (_: Exception) {
+                    }
+                    serviceHandler.postDelayed(this, WAKE_LOCK_RENEW_INTERVAL_MS)
+                }
+            }
+        }
+        wakeLockRenewRunnable = runnable
+        serviceHandler.postDelayed(runnable, WAKE_LOCK_RENEW_INTERVAL_MS)
+    }
+
     private fun releaseWakeLock() {
+        wakeLockRenewRunnable?.let { serviceHandler.removeCallbacks(it) }
+        wakeLockRenewRunnable = null
         try {
             if (wakeLock?.isHeld == true) {
                 wakeLock?.release()
@@ -362,6 +450,7 @@ class ZoniForegroundService : Service() {
     }
 
     private fun reportErrorAndStop(errorMessage: String) {
+        cancelActivationRecoveryWatchdog()
         wakeWordEngine?.stop()
         releaseWakeLock()
         isInForeground = false
@@ -380,6 +469,7 @@ class ZoniForegroundService : Service() {
     }
 
     private fun stopAllAndShutdown(disablePersistedPreference: Boolean) {
+        cancelActivationRecoveryWatchdog()
         wakeWordEngine?.stop()
         releaseWakeLock()
         if (disablePersistedPreference && ::preferences.isInitialized) {
@@ -428,6 +518,7 @@ class ZoniForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        cancelActivationRecoveryWatchdog()
         wakeWordEngine?.stop()
         releaseWakeLock()
         isInForeground = false
@@ -443,6 +534,9 @@ class ZoniForegroundService : Service() {
 
     companion object {
         private const val TAG = "ZoniForegroundService"
+        private const val WAKE_LOCK_WINDOW_MS = 30L * 60L * 1000L
+        private const val WAKE_LOCK_RENEW_INTERVAL_MS = 20L * 60L * 1000L
+        private const val ACTIVATION_RECOVERY_TIMEOUT_MS = 18_000L
         const val NOTIFICATION_ID = 7001
         const val WAKE_ALERT_NOTIFICATION_ID = 7002
         const val ACTION_START = "com.zoni.jarvis.assistant.ACTION_START_SERVICE"

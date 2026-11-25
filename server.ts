@@ -1288,22 +1288,34 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
     const ai = getGeminiClient();
     const systemInstruction = buildSystemInstruction(mode, nickname, undefined, lang);
 
-    const connectWithHandle = async (handleToUse?: string) => {
+    const connectWithHandle = async (handleToUse?: string, includeFastVad = true) => {
+      const liveConfig: Record<string, any> = {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: voice },
+          },
+        },
+        systemInstruction,
+        tools: [{ functionDeclarations: ZONI_ASSISTANT_TOOLS }],
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+        sessionResumption: handleToUse ? { handle: handleToUse } : {},
+      };
+      if (includeFastVad) {
+        liveConfig.realtimeInputConfig = {
+          automaticActivityDetection: {
+            disabled: false,
+            startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
+            endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
+            prefixPaddingMs: 120,
+            silenceDurationMs: 320,
+          },
+        };
+      }
       return await ai.live.connect({
         model: 'gemini-3.8-live',
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: voice },
-            },
-          },
-          systemInstruction,
-          tools: [{ functionDeclarations: ZONI_ASSISTANT_TOOLS }],
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          sessionResumption: handleToUse ? { handle: handleToUse } : {},
-        },
+        config: liveConfig,
         callbacks: {
           onmessage: (message: any) => {
             if (!isAlive || clientWs.readyState !== WebSocket.OPEN) return;
@@ -1496,20 +1508,32 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
     };
 
     let sessionResumed = false;
+    const connectFreshWithVadFallback = async () => {
+      try {
+        return await connectWithHandle(undefined, true);
+      } catch (vadErr) {
+        const msg = sanitizeErrorMessage(vadErr);
+        if (/realtimeInputConfig|automaticActivityDetection|invalid argument|unknown name/i.test(msg)) {
+          console.warn('[ZONI-LIVE] Upstream rejected realtimeInputConfig; retrying without fast VAD:', msg);
+          return await connectWithHandle(undefined, false);
+        }
+        throw vadErr;
+      }
+    };
     if (requestedHandle) {
       try {
-        liveSession = await connectWithHandle(requestedHandle);
+        liveSession = await connectWithHandle(requestedHandle, true);
         sessionResumed = true;
       } catch (resumeErr) {
         console.warn(
           'Session resumption handle expired or rejected, starting fresh Live session:',
           sanitizeErrorMessage(resumeErr)
         );
-        liveSession = await connectWithHandle(undefined);
+        liveSession = await connectFreshWithVadFallback();
         sessionResumed = false;
       }
     } else {
-      liveSession = await connectWithHandle(undefined);
+      liveSession = await connectFreshWithVadFallback();
     }
 
     if (!isAlive) {

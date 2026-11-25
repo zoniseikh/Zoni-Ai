@@ -1415,3 +1415,520 @@ object UiActionDeduplicator {
     }
 }
 
+// ============================================================================
+// PART 5 — UNIVERSAL CROSS-APP UI AUTOMATION ENGINE (PURE JVM-TESTABLE)
+// ============================================================================
+
+data class UniversalUiCandidate(
+    val matchNode: AccessibleNodeSnapshot,
+    val clickableNode: AccessibleNodeSnapshot?,
+    val label: String,
+    val bounds: AccessibleRect,
+    val score: Int
+)
+
+sealed class UniversalUiResolution {
+    data class Matched(val candidate: UniversalUiCandidate, val rankIndex: Int) : UniversalUiResolution()
+    data class Ambiguous(val query: String, val candidates: List<UniversalUiCandidate>) : UniversalUiResolution()
+    data class NotFound(val reason: String, val failureCode: String) : UniversalUiResolution()
+}
+
+data class UniversalClickVerification(
+    val stateChanged: Boolean,
+    val status: String,
+    val evidence: String
+)
+
+object UniversalUiAutomationEngine {
+
+    private val UNIVERSAL_SYNONYMS: Map<String, Set<String>> = mapOf(
+        "search" to setOf("search", "find", "সার্চ", "খুঁজুন", "খোঁজ", "खोजें", "सर्च"),
+        "settings" to setOf("settings", "setting", "সেটিংস", "সেটিং", "सेटिंग्स"),
+        "send" to setOf("send", "submit", "post", "পাঠান", "পাঠাও", "সাবমিট", "পোস্ট", "भेजें", "सबमिट"),
+        "play" to setOf("play", "resume", "start", "প্লে", "চালাও", "শুরু", "प्ले", "चलाएं"),
+        "pause" to setOf("pause", "পজ", "বিরতি", "থামাও", "पॉज़"),
+        "stop" to setOf("stop", "স্টপ", "বন্ধ", "बंद"),
+        "back" to setOf("back", "navigate up", "return", "ব্যাক", "পেছনে", "পিছনে", "ফিরে", "वापस"),
+        "home" to setOf("home", "হোম", "होम"),
+        "next" to setOf("next", "continue", "proceed", "forward", "পরবর্তী", "নেক্সট", "এগিয়ে", "अगला", "आगे"),
+        "previous" to setOf("previous", "prev", "আগের", "পূর্ববর্তী", "पिछला"),
+        "close" to setOf("close", "dismiss", "exit", "ক্লোজ", "বন্ধ", "बंद करें"),
+        "cancel" to setOf("cancel", "বাতিল", "ক্যানসেল", "রদ্দ", "रद्द"),
+        "ok" to setOf("ok", "okay", "done", "confirm", "accept", "agree", "allow", "ঠিক আছে", "ওকে", "ডান", "অনুমতি", "स्वीकार"),
+        "save" to setOf("save", "সেভ", "সংরক্ষণ", "सेव"),
+        "share" to setOf("share", "শেয়ার", "শেয়ার", "शेयर"),
+        "like" to setOf("like", "লাইক", "পছন্দ", "लाइक"),
+        "comment" to setOf("comment", "comments", "reply", "কমেন্ট", "মন্তব্য", "রিপ্লাই", "कमेंट"),
+        "subscribe" to setOf("subscribe", "সাবস্ক্রাইব", "सब्सक्राइब"),
+        "follow" to setOf("follow", "ফলো", "অনুসরণ", "फॉलो"),
+        "delete" to setOf("delete", "remove", "trash", "ডিলিট", "মুছুন", "হटाएं", "डिलीट"),
+        "edit" to setOf("edit", "এডিট", "সম্পাদনা", "एडिट"),
+        "add" to setOf("add", "new", "create", "plus", "যোগ", "নতুন", "অ্যাড", "जोड़ें"),
+        "download" to setOf("download", "ডাউনলোড", "डाउनलोड"),
+        "menu" to setOf("menu", "more", "more options", "options", "মেনু", "আরও", "मेनू"),
+        "profile" to setOf("profile", "account", "me", "প্রোফাইল", "অ্যাকাউন্ট", "प्रोफ़ाइल"),
+        "notifications" to setOf("notifications", "notification", "alerts", "নোটিফিকেশন", "বিজ্ঞপ্তি", "नोटिफिकेशन"),
+        "camera" to setOf("camera", "ক্যামেরা", "कैमरा"),
+        "call" to setOf("call", "voice call", "audio call", "কল", "ফোন", "कॉल"),
+        "video_call" to setOf("video call", "ভিডিও কল", "वीडियो कॉल"),
+        "mute" to setOf("mute", "মিউট", "म्यूट"),
+        "unmute" to setOf("unmute", "আনমিউট", "अनम्यूट"),
+        "skip" to setOf("skip", "skip ad", "স্কিপ", "এড়িয়ে যান", "स्किप"),
+        "refresh" to setOf("refresh", "reload", "রিফ্রেশ", "रिफ्रेश")
+    )
+
+    fun cleanTargetQuery(rawQuery: String): String {
+        var clean = Normalizer.normalize(rawQuery, Normalizer.Form.NFC).trim()
+        clean = clean
+            .replace(Regex("^(?:please\\s+|click\\s+|tap\\s+|press\\s+|open\\s+)(?:on\\s+)?", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("^(?:the\\s+|this\\s+|that\\s+|এই\\s+|ওই\\s+)", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s*(?:button|tab|icon|option|item|link|বাটনে|বাটনটিতে|বাটন|বটনে|বটন|আইকনে|আইকন|অপশনে|অপশন|बटन|आइकन)$", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("(?:-এ|-তে)$"), "")
+            .trim()
+        return clean
+    }
+
+    fun resolveTarget(
+        nodes: List<AccessibleNodeSnapshot>,
+        rawQuery: String,
+        ordinalIndex: Int? = null
+    ): UniversalUiResolution {
+        val cleanQuery = cleanTargetQuery(rawQuery)
+        if (cleanQuery.isEmpty()) {
+            return UniversalUiResolution.NotFound(
+                reason = "Please specify which visible element to tap.",
+                failureCode = "missing_target_text"
+            )
+        }
+        if (AccessibilityGuard.isSensitiveInputHint(cleanQuery)) {
+            return UniversalUiResolution.NotFound(
+                reason = "Cannot interact with password, PIN, or OTP UI elements.",
+                failureCode = "sensitive_target_blocked"
+            )
+        }
+
+        val lowerQuery = cleanQuery.lowercase()
+        val matchedSynGroup = UNIVERSAL_SYNONYMS.entries.firstOrNull { (key, terms) ->
+            lowerQuery == key || terms.any { lowerQuery == it }
+        }
+        val acceptedTerms = matchedSynGroup?.value ?: setOf(lowerQuery)
+
+        val nodesById = nodes.associateBy { it.nodeId }
+        val rawMatches = mutableListOf<UniversalUiCandidate>()
+
+        for (node in nodes) {
+            if (node.isPassword || !node.isVisibleToUser || !node.isEnabled) continue
+            val txt = node.text?.trim().orEmpty()
+            val desc = node.contentDescription?.trim().orEmpty()
+            val hint = node.hintText?.trim().orEmpty()
+            val vidTail = node.viewIdResourceName?.substringAfterLast("/")?.replace('_', ' ')?.trim().orEmpty()
+            val primaryLabel = txt.ifEmpty { desc.ifEmpty { hint.ifEmpty { vidTail } } }
+            if (primaryLabel.isEmpty()) continue
+            if (AccessibilityGuard.isSensitiveInputHint(primaryLabel)) continue
+
+            val lowerTxt = txt.lowercase()
+            val lowerDesc = desc.lowercase()
+            val lowerHint = hint.lowercase()
+            val lowerVid = vidTail.lowercase()
+            val lowerPrimary = primaryLabel.lowercase()
+
+            var score = 0
+            for (term in acceptedTerms) {
+                when {
+                    lowerTxt == term || lowerDesc == term -> score = maxOf(score, 100)
+                    lowerHint == term || lowerVid == term -> score = maxOf(score, 92)
+                    lowerTxt.startsWith("$term ") || lowerDesc.startsWith("$term ") || lowerDesc.startsWith("$term,") ->
+                        score = maxOf(score, 88)
+                    lowerTxt.contains(term) || lowerDesc.contains(term) -> score = maxOf(score, 76)
+                    lowerHint.contains(term) || lowerVid.contains(term) -> score = maxOf(score, 68)
+                }
+            }
+
+            if (score == 0) {
+                val crossScriptScore = MultilingualNameMatcher.scoreNameMatch(primaryLabel, cleanQuery)
+                if (crossScriptScore >= 75) {
+                    score = crossScriptScore - 4
+                } else if (lowerPrimary.contains(lowerQuery) && lowerQuery.length >= 2) {
+                    score = 70
+                }
+            }
+
+            if (score < 68) continue
+
+            val clickable = AccessibilityTreeResolver.findNearestClickableNode(node, nodesById, maxDepth = 5)
+            val effectiveBounds = if (node.bounds.isValidVisible) node.bounds else clickable?.bounds ?: node.bounds
+            if (clickable == null && !effectiveBounds.isValidVisible) continue
+            if (clickable != null) score += 12
+
+            val classLower = node.className?.lowercase().orEmpty()
+            if (classLower.contains("button") || classLower.contains("tab") || classLower.contains("switch") || classLower.contains("checkbox")) {
+                score += 4
+            }
+
+            rawMatches.add(
+                UniversalUiCandidate(
+                    matchNode = node,
+                    clickableNode = clickable,
+                    label = primaryLabel,
+                    bounds = effectiveBounds,
+                    score = score
+                )
+            )
+        }
+
+        if (rawMatches.isEmpty()) {
+            return UniversalUiResolution.NotFound(
+                reason = "Could not find visible UI element \"$cleanQuery\" on the current screen.",
+                failureCode = "element_not_found"
+            )
+        }
+
+        // Deduplicate by clickable container ID or tight spatial bucket
+        val deduped = LinkedHashMap<String, UniversalUiCandidate>()
+        for (cand in rawMatches.sortedWith(compareByDescending<UniversalUiCandidate> { it.score }
+            .thenBy { it.bounds.top }.thenBy { it.bounds.left })) {
+            val key = cand.clickableNode?.nodeId?.let { "u_click_$it" }
+                ?: "u_pos_${cand.bounds.top / 48}_${cand.bounds.left / 48}_${cand.label.lowercase().take(20)}"
+            if (!deduped.containsKey(key)) {
+                deduped[key] = cand
+            }
+        }
+        val ordered = deduped.values.sortedWith(compareBy<UniversalUiCandidate> { it.bounds.top }.thenBy { it.bounds.left })
+
+        if (ordinalIndex != null) {
+            if (ordinalIndex < 1 || ordinalIndex > ordered.size) {
+                return UniversalUiResolution.NotFound(
+                    reason = "Requested \"$cleanQuery\" #$ordinalIndex is not visible on screen (only ${ordered.size} match(es)).",
+                    failureCode = "element_index_out_of_range"
+                )
+            }
+            return UniversalUiResolution.Matched(ordered[ordinalIndex - 1], ordinalIndex)
+        }
+
+        val topScore = ordered.maxOf { it.score }
+        val topTier = ordered.filter { it.score >= topScore - 6 }
+        if (topTier.size == 1) {
+            val winner = topTier[0]
+            return UniversalUiResolution.Matched(winner, ordered.indexOf(winner) + 1)
+        }
+        return UniversalUiResolution.Ambiguous(cleanQuery, topTier.take(5))
+    }
+
+    fun verifyClickOutcome(
+        beforeLabels: List<String>,
+        afterNodes: List<AccessibleNodeSnapshot>,
+        clickedLabel: String,
+        accessibilityEventObserved: Boolean
+    ): UniversalClickVerification {
+        val afterLabels = afterNodes.mapNotNull { it.combinedLabel.takeIf { s -> s.isNotEmpty() } }
+        val changed = afterLabels.take(20) != beforeLabels.take(20)
+        return when {
+            accessibilityEventObserved && changed -> UniversalClickVerification(
+                stateChanged = true,
+                status = "executed_verified",
+                evidence = "Tapped \"$clickedLabel\" and verified screen updated."
+            )
+            accessibilityEventObserved -> UniversalClickVerification(
+                stateChanged = true,
+                status = "executed_event_verified",
+                evidence = "Tapped \"$clickedLabel\" and observed Accessibility UI response."
+            )
+            changed -> UniversalClickVerification(
+                stateChanged = true,
+                status = "executed_content_changed",
+                evidence = "Tapped \"$clickedLabel\" and observed visible UI content change."
+            )
+            else -> UniversalClickVerification(
+                stateChanged = false,
+                status = "executed_unverified",
+                evidence = "Dispatched click on \"$clickedLabel\", but no screen state change was detected."
+            )
+        }
+    }
+}
+
+// ============================================================================
+// PART 6 — INTELLIGENT VISUAL RECOGNITION & PRECISION CLICK ENGINE (PURE JVM)
+// ============================================================================
+
+data class VisualTargetAlternative(
+    val label: String,
+    val confidence: Float,
+    val x: Int,
+    val y: Int
+)
+
+data class VisualTargetProposal(
+    val found: Boolean,
+    val confidence: Float,
+    val ambiguous: Boolean,
+    val label: String,
+    val x: Int,
+    val y: Int,
+    val reason: String = "",
+    val alternatives: List<VisualTargetAlternative> = emptyList()
+)
+
+sealed class VisualClickPlan {
+    data class ClickAccessibilityNode(
+        val matchNode: AccessibleNodeSnapshot,
+        val clickableAncestor: AccessibleNodeSnapshot?,
+        val resolvedBounds: AccessibleRect,
+        val label: String,
+        val confidence: Float
+    ) : VisualClickPlan()
+
+    data class ClickVerifiedCoordinates(
+        val x: Int,
+        val y: Int,
+        val label: String,
+        val confidence: Float
+    ) : VisualClickPlan()
+
+    data class ClarifyAmbiguous(
+        val query: String,
+        val options: List<String>,
+        val reason: String
+    ) : VisualClickPlan()
+
+    data class RefuseLowConfidence(
+        val query: String,
+        val confidence: Float,
+        val reason: String
+    ) : VisualClickPlan()
+
+    data class BlockedSensitive(
+        val reason: String
+    ) : VisualClickPlan()
+
+    data class NotFound(
+        val reason: String
+    ) : VisualClickPlan()
+}
+
+object VisualClickIntelligenceEngine {
+
+    const val MIN_CONFIDENCE: Float = 0.68f
+    const val AMBIGUITY_CONFIDENCE_DELTA: Float = 0.12f
+
+    private val VISUAL_QUERY_REGEX = Regex(
+        "(?:\\b(?:red|blue|green|yellow|orange|white|black|purple|pink|grey|gray|dark|light|round|circular|square|" +
+            "icon|logo|symbol|image|photo|picture|thumbnail|avatar|banner|card|badge|dot|gear|bell|heart|star|arrow|plus|minus|cross|" +
+            "top[-\\s]?right|top[-\\s]?left|bottom[-\\s]?right|bottom[-\\s]?left|upper|lower|middle|center|corner|left\\s+side|right\\s+side)\\b|" +
+            "লাল|নীল|সবুজ|হলুদ|কমলা|সাদা|কালো|বেগুনি|গোলাপি|আইকন|লোগো|ছবি|থাম্বনেইল|তীর|চিহ্ন|" +
+            "উপরে\\s*ডান|উপরে\\s*বাম|নিচে\\s*ডান|নিচে\\s*বাম|ডান\\s*পাশ|বাম\\s*পাশ|ডানদিকে|বামদিকে|মাঝখানে|কোণায়|কোণায়|" +
+            "लाल|नीला|हरा|पीला|सफेद|काला|आइकन|लोगो|तस्वीर|ऊपर\\s*दाएं|नीचे\\s*बाएं)",
+        RegexOption.IGNORE_CASE
+    )
+
+    fun isVisualAttributeQuery(query: String): Boolean {
+        val clean = query.trim()
+        if (clean.isEmpty()) return false
+        return VISUAL_QUERY_REGEX.containsMatchIn(clean)
+    }
+
+    /**
+     * Parses structured JSON returned by Gemini Vision (supports optional markdown fences,
+     * pixel coordinates `x`/`y`, or normalized 0..1000 coordinates `xNorm`/`yNorm` or `box_2d`).
+     */
+    fun parseGeminiVisionTargetJson(
+        rawResponse: String,
+        screenWidth: Int,
+        screenHeight: Int
+    ): VisualTargetProposal {
+        val safeW = screenWidth.coerceAtLeast(100)
+        val safeH = screenHeight.coerceAtLeast(100)
+        val cleaned = rawResponse.trim()
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+        val jsonStart = cleaned.indexOf('{')
+        val jsonEnd = cleaned.lastIndexOf('}')
+        if (jsonStart < 0 || jsonEnd <= jsonStart) {
+            return VisualTargetProposal(
+                found = false,
+                confidence = 0f,
+                ambiguous = false,
+                label = "",
+                x = -1,
+                y = -1,
+                reason = "Vision model returned non-JSON response."
+            )
+        }
+        val slice = cleaned.substring(jsonStart, jsonEnd + 1)
+        return try {
+            val obj = org.json.JSONObject(slice)
+            val found = obj.optBoolean("found", false)
+            val confidence = obj.optDouble("confidence", 0.0).toFloat().coerceIn(0f, 1f)
+            val ambiguous = obj.optBoolean("ambiguous", false)
+            val label = obj.optString("label", "").trim()
+            val reason = obj.optString("reason", "").trim()
+
+            var resolvedX = -1
+            var resolvedY = -1
+
+            // Prefer resolution-independent normalized 0..1000 coordinates (xNorm/yNorm or box_2d [ymin, xmin, ymax, xmax])
+            // because MediaProjection JPEGs are downscaled to maxDimension=1080 while Accessibility bounds use real display pixels.
+            if (obj.has("xNorm") && obj.has("yNorm")) {
+                val xNorm = obj.optDouble("xNorm", -1.0)
+                val yNorm = obj.optDouble("yNorm", -1.0)
+                if (xNorm in 0.0..1000.0 && yNorm in 0.0..1000.0) {
+                    resolvedX = ((xNorm / 1000.0) * safeW).toInt()
+                    resolvedY = ((yNorm / 1000.0) * safeH).toInt()
+                }
+            }
+            if ((resolvedX < 0 || resolvedY < 0) && obj.has("box_2d")) {
+                val box = obj.optJSONArray("box_2d")
+                if (box != null && box.length() == 4) {
+                    val yMin = box.optDouble(0, -1.0)
+                    val xMin = box.optDouble(1, -1.0)
+                    val yMax = box.optDouble(2, -1.0)
+                    val xMax = box.optDouble(3, -1.0)
+                    if (yMin >= 0 && xMin >= 0 && yMax > yMin && xMax > xMin) {
+                        resolvedX = ((((xMin + xMax) / 2.0) / 1000.0) * safeW).toInt()
+                        resolvedY = ((((yMin + yMax) / 2.0) / 1000.0) * safeH).toInt()
+                    }
+                }
+            }
+            if (resolvedX < 0 || resolvedY < 0) {
+                resolvedX = obj.optInt("x", -1)
+                resolvedY = obj.optInt("y", -1)
+            }
+
+            val validCoords = resolvedX in 1 until safeW && resolvedY in 1 until safeH
+            val alternatives = mutableListOf<VisualTargetAlternative>()
+            val altArr = obj.optJSONArray("alternatives")
+            if (altArr != null) {
+                for (i in 0 until altArr.length()) {
+                    val item = altArr.optJSONObject(i) ?: continue
+                    val altLabel = item.optString("label", "").trim()
+                    val altConf = item.optDouble("confidence", 0.0).toFloat().coerceIn(0f, 1f)
+                    val ax = item.optInt("x", -1)
+                    val ay = item.optInt("y", -1)
+                    if (altLabel.isNotEmpty()) {
+                        alternatives.add(VisualTargetAlternative(altLabel, altConf, ax, ay))
+                    }
+                }
+            }
+
+            VisualTargetProposal(
+                found = found && validCoords,
+                confidence = if (found && validCoords) confidence else 0f,
+                ambiguous = ambiguous,
+                label = label,
+                x = if (validCoords) resolvedX else -1,
+                y = if (validCoords) resolvedY else -1,
+                reason = reason,
+                alternatives = alternatives
+            )
+        } catch (e: Exception) {
+            VisualTargetProposal(
+                found = false,
+                confidence = 0f,
+                ambiguous = false,
+                label = "",
+                x = -1,
+                y = -1,
+                reason = "Could not parse visual target JSON: ${e.message}"
+            )
+        }
+    }
+
+    /**
+     * Revalidates a Gemini Vision target proposal against the live Accessibility hierarchy:
+     * - Refuses low-confidence guesses (< MIN_CONFIDENCE).
+     * - Clarifies ambiguous targets instead of blindly clicking.
+     * - Strictly blocks password or sensitive nodes overlapping the target point.
+     * - Prefers clicking the enclosing clickable Accessibility node over raw coordinates.
+     */
+    fun revalidateTargetAgainstAccessibilityTree(
+        query: String,
+        proposal: VisualTargetProposal,
+        liveNodes: List<AccessibleNodeSnapshot>,
+        screenWidth: Int,
+        screenHeight: Int,
+        minConfidence: Float = MIN_CONFIDENCE
+    ): VisualClickPlan {
+        if (!proposal.found) {
+            return VisualClickPlan.NotFound(
+                proposal.reason.ifBlank { "Could not visually locate \"$query\" on the current screen." }
+            )
+        }
+
+        val closeAlternatives = proposal.alternatives.filter {
+            it.confidence >= minConfidence * 0.85f &&
+                (proposal.confidence - it.confidence) <= AMBIGUITY_CONFIDENCE_DELTA &&
+                !it.label.equals(proposal.label, ignoreCase = true)
+        }
+        if (proposal.ambiguous || closeAlternatives.isNotEmpty()) {
+            val options = buildList {
+                if (proposal.label.isNotBlank()) add(proposal.label)
+                closeAlternatives.forEach { if (it.label.isNotBlank()) add(it.label) }
+            }.distinct().take(4)
+            return VisualClickPlan.ClarifyAmbiguous(
+                query = query,
+                options = options,
+                reason = "Multiple visual elements match \"$query\". Please specify which one to tap."
+            )
+        }
+
+        if (proposal.confidence < minConfidence) {
+            return VisualClickPlan.RefuseLowConfidence(
+                query = query,
+                confidence = proposal.confidence,
+                reason = "Visual match confidence (${(proposal.confidence * 100).toInt()}%) is too low to click safely."
+            )
+        }
+
+        if (proposal.x !in 1 until screenWidth || proposal.y !in 1 until screenHeight) {
+            return VisualClickPlan.NotFound("Proposed visual coordinates (${proposal.x}, ${proposal.y}) are outside screen bounds.")
+        }
+
+        // Security check: block if ANY password or sensitive node overlaps the target point
+        val containingAll = liveNodes.filter { node ->
+            node.bounds.isValidVisible &&
+                proposal.x in node.bounds.left..node.bounds.right &&
+                proposal.y in node.bounds.top..node.bounds.bottom
+        }
+        if (containingAll.any { it.isPassword || AccessibilityGuard.isSensitiveInputHint(it.combinedLabel.ifEmpty { it.hintText.orEmpty() }) }) {
+            return VisualClickPlan.BlockedSensitive(
+                "Blocked visual click because the target overlaps a password, PIN, or OTP field."
+            )
+        }
+
+        // Prefer tightest visible, enabled clickable node (or nearest clickable ancestor) covering (x, y)
+        val nodesById = liveNodes.associateBy { it.nodeId }
+        val visibleContaining = containingAll
+            .filter { it.isVisibleToUser && it.isEnabled && !it.isPassword }
+            .sortedBy { it.bounds.width.toLong() * it.bounds.height.toLong() }
+
+        for (node in visibleContaining) {
+            val clickable = AccessibilityTreeResolver.findNearestClickableNode(node, nodesById, maxDepth = 4)
+            if (clickable != null && !clickable.isPassword && clickable.isEnabled) {
+                // Avoid clicking a full-screen root container (> 85% of screen area)
+                val areaRatio = (clickable.bounds.width.toLong() * clickable.bounds.height.toLong()).toDouble() /
+                    (screenWidth.toLong() * screenHeight.toLong()).coerceAtLeast(1L).toDouble()
+                if (areaRatio <= 0.85) {
+                    val resolvedLabel = proposal.label.ifBlank { node.combinedLabel.ifBlank { clickable.combinedLabel.ifBlank { query } } }
+                    return VisualClickPlan.ClickAccessibilityNode(
+                        matchNode = node,
+                        clickableAncestor = clickable,
+                        resolvedBounds = clickable.bounds,
+                        label = resolvedLabel,
+                        confidence = proposal.confidence
+                    )
+                }
+            }
+        }
+
+        return VisualClickPlan.ClickVerifiedCoordinates(
+            x = proposal.x,
+            y = proposal.y,
+            label = proposal.label.ifBlank { query },
+            confidence = proposal.confidence
+        )
+    }
+}
+
+

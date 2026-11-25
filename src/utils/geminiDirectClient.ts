@@ -1140,8 +1140,8 @@ export function buildDirectLiveSetupMessage(options: {
         disabled: false,
         startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
         endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
-        prefixPaddingMs: 100,
-        silenceDurationMs: 300,
+        prefixPaddingMs: 120,
+        silenceDurationMs: 320,
       },
     };
   }

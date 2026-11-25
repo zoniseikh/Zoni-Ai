@@ -3,6 +3,7 @@ package com.zoni.jarvis.assistant.ui
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -10,6 +11,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.view.WindowManager
 import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
@@ -636,6 +638,10 @@ class MainActivity : ComponentActivity() {
             intent.getBooleanExtra(EXTRA_AUTO_VOICE, false) ||
             wakeTriggered
 
+        if (wakeTriggered || shouldAutoVoice) {
+            applyWakeLockScreenFlags()
+        }
+
         if (shouldAutoVoice) {
             if (hasBundledReactDashboard()) {
                 val payload = JSONObject()
@@ -656,6 +662,27 @@ class MainActivity : ComponentActivity() {
                     viewModel.sendTextMessage(remainingCmd)
                 }
             }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun applyWakeLockScreenFlags() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                setShowWhenLocked(true)
+                setTurnScreenOn(true)
+            } else {
+                window.addFlags(
+                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                )
+            }
+            val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+            if (km != null && km.isKeyguardLocked) {
+                km.requestDismissKeyguard(this, null)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Lock-screen wake flags skipped: ${e.message}")
         }
     }
 
