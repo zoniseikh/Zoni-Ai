@@ -248,11 +248,29 @@ object AppNameResolver {
 
 class AppLauncher(private val context: Context) {
 
+    @Volatile
+    private var cachedApps: List<InstalledAppInfo>? = null
+
+    @Volatile
+    private var cachedAtMs: Long = 0L
+
+    fun invalidateAppCache() {
+        cachedApps = null
+        cachedAtMs = 0L
+    }
+
     /**
      * Discovers all installed launchable Android apps using PackageManager
      * (`ACTION_MAIN` + `CATEGORY_LAUNCHER`), without requiring QUERY_ALL_PACKAGES.
+     * Uses a lightweight 60-second in-memory cache to avoid redundant IPC scans on low-end devices.
      */
-    fun listInstalledApps(): List<InstalledAppInfo> {
+    fun listInstalledApps(forceRefresh: Boolean = false): List<InstalledAppInfo> {
+        val now = System.currentTimeMillis()
+        val existing = cachedApps
+        if (!forceRefresh && existing != null && existing.isNotEmpty() && (now - cachedAtMs) < APP_CACHE_TTL_MS) {
+            return existing
+        }
+
         val pm = context.packageManager
         val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
             addCategory(Intent.CATEGORY_LAUNCHER)
@@ -272,7 +290,12 @@ class AppLauncher(private val context: Context) {
                 deduped[pkg] = InstalledAppInfo(label = label, packageName = pkg)
             }
         }
-        return deduped.values.sortedBy { it.label.lowercase() }
+        val sorted = deduped.values.sortedBy { it.label.lowercase() }
+        if (sorted.isNotEmpty()) {
+            cachedApps = sorted
+            cachedAtMs = now
+        }
+        return sorted
     }
 
     fun listInstalledAppsAsJson(limit: Int = 150): String {
@@ -412,5 +435,6 @@ class AppLauncher(private val context: Context) {
 
     companion object {
         private const val TAG = "ZoniAppLauncher"
+        private const val APP_CACHE_TTL_MS = 60_000L
     }
 }

@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
@@ -520,6 +521,53 @@ interface WakeWordDetectorBackend {
 }
 
 /**
+ * Pure JVM-testable guard for preventing duplicate wake-word activations and computing bounded
+ * exponential recovery backoff after microphone preemption or AudioRecord errors.
+ */
+object WakeWordLifecycleGuard {
+    private val ACTIVE_CONVERSATION_STATES = setOf(
+        VoiceLifecycleState.WAKE_WORD_DETECTED,
+        VoiceLifecycleState.ACTIVATING,
+        VoiceLifecycleState.CONNECTING,
+        VoiceLifecycleState.CONNECTED,
+        VoiceLifecycleState.LISTENING,
+        VoiceLifecycleState.PROCESSING,
+        VoiceLifecycleState.SPEAKING
+    )
+
+    fun isConversationOrActivationInProgress(state: VoiceLifecycleState): Boolean =
+        state in ACTIVE_CONVERSATION_STATES
+
+    fun shouldAcceptWakeTrigger(
+        currentState: VoiceLifecycleState,
+        lastAcceptedAtMs: Long,
+        nowMs: Long = System.currentTimeMillis(),
+        cooldownMs: Long = 2800L
+    ): Boolean {
+        if (isConversationOrActivationInProgress(currentState)) return false
+        if (lastAcceptedAtMs > 0L && (nowMs - lastAcceptedAtMs) < cooldownMs) return false
+        return true
+    }
+
+    fun computeMicRecoveryBackoffMs(consecutiveFailures: Int): Long {
+        val step = consecutiveFailures.coerceIn(1, 5)
+        return when (step) {
+            1 -> 600L
+            2 -> 1200L
+            3 -> 2500L
+            4 -> 4500L
+            else -> 6000L
+        }
+    }
+
+    fun isTelecomAudioModeBusy(audioMode: Int): Boolean {
+        return audioMode == AudioManager.MODE_IN_CALL ||
+            audioMode == AudioManager.MODE_IN_COMMUNICATION ||
+            audioMode == AudioManager.MODE_RINGTONE
+    }
+}
+
+/**
  * Production On-Device Two-Stage ZONI Wake-Word Engine:
  *
  * Stage 1 (Always-on Local Acoustic Gate):
@@ -596,6 +644,8 @@ class ZoniWakeWordEngine(
     override fun pauseForConversation() {
         isPausedForConversation = true
         _isListening.value = false
+        recoveryJob?.cancel()
+        recoveryJob = null
         stopAcousticRecorderOnly()
         cancelVerifierOnMain()
     }
@@ -604,6 +654,7 @@ class ZoniWakeWordEngine(
         if (!isRunning) return
         isPausedForConversation = false
         isVerifyingPhrase = false
+        consecutiveRecoveryAttempts = 0
         startAcousticGateLoop()
     }
 
@@ -612,16 +663,73 @@ class ZoniWakeWordEngine(
         isPausedForConversation = false
         isVerifyingPhrase = false
         _isListening.value = false
+        recoveryJob?.cancel()
+        recoveryJob = null
         stopAcousticRecorderOnly()
         cancelVerifierOnMain()
         onDetectedCallback = null
         onErrorCallback = null
     }
 
+    private val audioManager: AudioManager? by lazy {
+        context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    }
+
+    @Volatile
+    private var consecutiveRecoveryAttempts: Int = 0
+
+    private var recoveryJob: Job? = null
+
+    private fun isPhoneCallActive(): Boolean {
+        val mode = try {
+            audioManager?.mode ?: AudioManager.MODE_NORMAL
+        } catch (_: Exception) {
+            AudioManager.MODE_NORMAL
+        }
+        return WakeWordLifecycleGuard.isTelecomAudioModeBusy(mode)
+    }
+
+    private fun scheduleMicRecovery(reason: String) {
+        if (!isRunning || isPausedForConversation || isVerifyingPhrase) return
+        recoveryJob?.cancel()
+        val attempt = (++consecutiveRecoveryAttempts).coerceAtMost(MAX_MIC_RECOVERY_ATTEMPTS + 1)
+        if (attempt > MAX_MIC_RECOVERY_ATTEMPTS) {
+            Log.w(TAG, "Wake-word mic recovery exhausted after $MAX_MIC_RECOVERY_ATTEMPTS attempts: $reason")
+            _isListening.value = false
+            onErrorCallback?.invoke(reason)
+            return
+        }
+        val backoffMs = WakeWordLifecycleGuard.computeMicRecoveryBackoffMs(attempt)
+        Log.i(TAG, "Scheduling wake-word mic recovery #$attempt in ${backoffMs}ms ($reason)")
+        recoveryJob = scope.launch {
+            delay(backoffMs)
+            if (isRunning && !isPausedForConversation && !isVerifyingPhrase) {
+                startAcousticGateLoop()
+            }
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun startAcousticGateLoop(): Boolean {
         if (!isRunning || isPausedForConversation) return false
+        recoveryJob?.cancel()
+        recoveryJob = null
         stopAcousticRecorderOnly()
+
+        if (isPhoneCallActive()) {
+            _isListening.value = false
+            // Yield microphone politely during active call/ringing without burning CPU or erroring permanently
+            recoveryJob = scope.launch {
+                while (isActive && isRunning && !isPausedForConversation && isPhoneCallActive()) {
+                    delay(1500L)
+                }
+                if (isRunning && !isPausedForConversation && !isVerifyingPhrase) {
+                    consecutiveRecoveryAttempts = 0
+                    startAcousticGateLoop()
+                }
+            }
+            return true
+        }
 
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
@@ -644,19 +752,20 @@ class ZoniWakeWordEngine(
             )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create AudioRecord for wake-word gate", e)
-            onErrorCallback?.invoke("Unable to initialize microphone for wake-word listening: ${e.message}")
+            scheduleMicRecovery("Unable to initialize microphone for wake-word listening: ${e.message}")
             return false
         }
 
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
             try { recorder.release() } catch (_: Exception) {}
-            onErrorCallback?.invoke("Microphone hardware is busy or unavailable for wake-word detection.")
+            scheduleMicRecovery("Microphone hardware is busy or preempted by another app.")
             return false
         }
 
         audioRecord = recorder
         return try {
             recorder.startRecording()
+            consecutiveRecoveryAttempts = 0
             _isListening.value = true
             preRollBuffer.clear()
             val gate = AcousticWakeGate(config = config, sampleRateHz = SAMPLE_RATE)
@@ -664,16 +773,38 @@ class ZoniWakeWordEngine(
 
             captureJob = scope.launch {
                 val frame = ShortArray(FRAME_SAMPLES)
+                var consecutiveReadErrors = 0
+                var frameCounter = 0
                 while (isActive && isRunning && !isPausedForConversation && !isVerifyingPhrase) {
+                    // Periodically check for incoming/active call (~every 600ms) and yield mic immediately
+                    if ((++frameCounter % 15) == 0 && isPhoneCallActive()) {
+                        Log.i(TAG, "Phone/VoIP call detected; yielding wake-word microphone cleanly.")
+                        _isListening.value = false
+                        stopAcousticRecorderOnly()
+                        startAcousticGateLoop()
+                        break
+                    }
+
                     val read = try {
                         recorder.read(frame, 0, frame.size)
                     } catch (_: Exception) {
-                        -1
+                        AudioRecord.ERROR_INVALID_OPERATION
                     }
                     if (read <= 0) {
-                        delay(40L)
+                        consecutiveReadErrors++
+                        val isDead = read == AudioRecord.ERROR_DEAD_OBJECT ||
+                            consecutiveReadErrors >= MAX_CONSECUTIVE_READ_ERRORS
+                        if (isDead) {
+                            Log.w(TAG, "AudioRecord interrupted (read=$read, errors=$consecutiveReadErrors); recovering.")
+                            _isListening.value = false
+                            stopAcousticRecorderOnly()
+                            scheduleMicRecovery("Microphone stream interrupted; attempting automatic recovery.")
+                            break
+                        }
+                        delay(80L)
                         continue
                     }
+                    consecutiveReadErrors = 0
                     preRollBuffer.write(frame, read)
                     val analysis = gate.processPcm16Frame(frame, read)
 
@@ -705,7 +836,7 @@ class ZoniWakeWordEngine(
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start AudioRecord recording", e)
             stopAcousticRecorderOnly()
-            onErrorCallback?.invoke("Microphone capture failed: ${e.message}")
+            scheduleMicRecovery("Microphone capture interrupted: ${e.message}")
             false
         }
     }
@@ -957,5 +1088,7 @@ class ZoniWakeWordEngine(
         // 1.8s rolling pre-roll buffer at 16kHz
         private const val PRE_ROLL_SAMPLES = 28800
         private const val VERIFY_WINDOW_MS = 2300L
+        private const val MAX_CONSECUTIVE_READ_ERRORS = 6
+        private const val MAX_MIC_RECOVERY_ATTEMPTS = 5
     }
 }

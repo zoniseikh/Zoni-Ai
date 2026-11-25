@@ -17,16 +17,18 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         CallSessionEntity::class,
         CallSummaryEntity::class,
         ConversationEntity::class,
+        MemoryEntity::class,
         TaskExecutionEntity::class,
         ConsentRecordEntity::class,
         UserPreferencesEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class ZoniDatabase : RoomDatabase() {
     abstract fun callSessionDao(): CallSessionDao
     abstract fun conversationDao(): ConversationDao
+    abstract fun memoryDao(): MemoryDao
     abstract fun taskExecutionDao(): TaskExecutionDao
     abstract fun consentRecordDao(): ConsentRecordDao
     abstract fun userPreferencesDao(): UserPreferencesDao
@@ -36,11 +38,42 @@ abstract class ZoniDatabase : RoomDatabase() {
         private var INSTANCE: ZoniDatabase? = null
 
         /**
-         * Preserves existing conversations & call history across future schema upgrades.
+         * Non-destructive migration from version 1 to version 2.
+         * Preserves 100% of existing conversations, call history, tasks, consents, and preferences,
+         * adds performance indices on conversations, and creates the encrypted local memory_entries table.
          */
         val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                // Non-destructive forward migration hook preserving existing conversations
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_conversations_createdAtMs` ON `conversations` (`createdAtMs`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_conversations_role` ON `conversations` (`role`)"
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `memory_entries` (" +
+                        "`id` TEXT NOT NULL, " +
+                        "`category` TEXT NOT NULL, " +
+                        "`factKey` TEXT NOT NULL, " +
+                        "`valueEncrypted` TEXT NOT NULL, " +
+                        "`isEncrypted` INTEGER NOT NULL, " +
+                        "`searchKeywords` TEXT NOT NULL, " +
+                        "`usageCount` INTEGER NOT NULL, " +
+                        "`userApproved` INTEGER NOT NULL, " +
+                        "`createdAtMs` INTEGER NOT NULL, " +
+                        "`updatedAtMs` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`id`)" +
+                        ")"
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_memory_entries_factKey` ON `memory_entries` (`factKey`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_memory_entries_category` ON `memory_entries` (`category`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_memory_entries_updatedAtMs` ON `memory_entries` (`updatedAtMs`)"
+                )
             }
         }
 

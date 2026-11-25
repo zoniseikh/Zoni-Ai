@@ -2,13 +2,18 @@ package com.zoni.jarvis.assistant.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Base64
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import java.security.SecureRandom
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * Android Keystore-backed BYOK secret manager for Zoni AI.
- * Stores ONLY the user's own Gemini API Key and Live session resumption handle
- * using AES256-GCM MasterKey + EncryptedSharedPreferences.
+ * Stores ONLY the user's own Gemini API Key, Live session resumption handle,
+ * and on-device local memory AES-256-GCM key using AES256-GCM MasterKey + EncryptedSharedPreferences.
  *
  * No developer API key and no mandatory backend server URL exist in this app.
  */
@@ -117,6 +122,71 @@ class SecureKeyManager(context: Context) {
         return securePrefs.getBoolean(KEY_ONBOARDING_COMPLETED, false)
     }
 
+    /**
+     * Returns or creates a 256-bit AES key stored inside the Keystore-backed EncryptedSharedPreferences
+     * to encrypt sensitive local conversation memory records at rest.
+     */
+    @Synchronized
+    private fun getOrCreateMemoryAesKeyBytes(): ByteArray? {
+        return try {
+            val existing = securePrefs.getString(KEY_MEMORY_AES_256, null)?.trim()
+            if (!existing.isNullOrEmpty()) {
+                val decoded = Base64.decode(existing, Base64.NO_WRAP)
+                if (decoded.size == 32) return decoded
+            }
+            val fresh = ByteArray(32)
+            SecureRandom().nextBytes(fresh)
+            val encoded = Base64.encodeToString(fresh, Base64.NO_WRAP)
+            securePrefs.edit().putString(KEY_MEMORY_AES_256, encoded).apply()
+            fresh
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Encrypts local memory text on-device using AES-256-GCM.
+     * Returns Pair(storedValue, isEncrypted).
+     */
+    fun encryptLocalMemoryText(plainText: String): Pair<String, Boolean> {
+        if (plainText.isEmpty()) return "" to false
+        return try {
+            val keyBytes = getOrCreateMemoryAesKeyBytes() ?: return plainText to false
+            val iv = ByteArray(12)
+            SecureRandom().nextBytes(iv)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+            val encrypted = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
+            val combined = ByteArray(iv.size + encrypted.size)
+            System.arraycopy(iv, 0, combined, 0, iv.size)
+            System.arraycopy(encrypted, 0, combined, iv.size, encrypted.size)
+            val encoded = Base64.encodeToString(combined, Base64.NO_WRAP)
+            "$ENC_PREFIX$encoded" to true
+        } catch (_: Exception) {
+            plainText to false
+        }
+    }
+
+    /**
+     * Decrypts an on-device AES-256-GCM memory value. Backward-compatible with unencrypted rows.
+     */
+    fun decryptLocalMemoryText(storedValue: String, isEncrypted: Boolean): String {
+        if (storedValue.isEmpty()) return ""
+        if (!isEncrypted || !storedValue.startsWith(ENC_PREFIX)) return storedValue
+        return try {
+            val keyBytes = getOrCreateMemoryAesKeyBytes() ?: return ""
+            val raw = Base64.decode(storedValue.removePrefix(ENC_PREFIX), Base64.NO_WRAP)
+            if (raw.size <= 12) return ""
+            val iv = raw.copyOfRange(0, 12)
+            val cipherBytes = raw.copyOfRange(12, raw.size)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+            String(cipher.doFinal(cipherBytes), Charsets.UTF_8)
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
     data class ApiKeyValidationResult(
         val valid: Boolean,
         val normalizedKey: String = "",
@@ -131,6 +201,8 @@ class SecureKeyManager(context: Context) {
         private const val KEY_RESUMPTION_HANDLE = "zoni_live_resumption_handle"
         private const val KEY_GEMINI_API_KEY = "gemini_api_key_encrypted"
         private const val KEY_ONBOARDING_COMPLETED = "zoni_onboarding_completed"
+        private const val KEY_MEMORY_AES_256 = "zoni_local_memory_aes_256_key"
+        private const val ENC_PREFIX = "enc:v1:"
 
         private val GEMINI_KEY_PATTERN = Regex("^[A-Za-z0-9._\\-~+=]{16,512}$")
         private val INVISIBLE_CLIPBOARD_CHARS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060\\uFEFF]")

@@ -1929,6 +1929,190 @@ object VisualClickIntelligenceEngine {
             confidence = proposal.confidence
         )
     }
+
+    /**
+     * On-device Accessibility-first spatial & role resolver for natural Bengali/English/Hindi
+     * visual directives like "ডান পাশের বাটন", "right side button", "top right icon",
+     * "এই ছবিটা", "open this photo" — resolves unambiguously via AccessibilityNodeInfo
+     * WITHOUT taking any screenshot or calling Gemini Vision when possible.
+     */
+    fun resolveSpatialAccessibilityTarget(
+        nodes: List<AccessibleNodeSnapshot>,
+        rawQuery: String,
+        screenWidth: Int,
+        screenHeight: Int
+    ): VisualClickPlan? {
+        val clean = rawQuery.trim()
+        if (clean.isEmpty() || screenWidth <= 0 || screenHeight <= 0) return null
+        if (AccessibilityGuard.isSensitiveInputHint(clean)) {
+            return VisualClickPlan.BlockedSensitive(
+                "Blocked visual/spatial click because the request targets a password, PIN, or OTP field."
+            )
+        }
+        val lower = clean.lowercase()
+
+        // Color-specific queries require real visual pixels (Accessibility doesn't expose button colors)
+        val mentionsColor = Regex(
+            "(?:\\b(?:red|blue|green|yellow|orange|white|black|purple|pink|grey|gray)\\b|" +
+                "লাল|নীল|সবুজ|হলুদ|কমলা|সাদা|কালো|বেগুনি|গোলাপি|लाल|नीला|हरा|पीला)",
+            RegexOption.IGNORE_CASE
+        ).containsMatchIn(lower)
+        if (mentionsColor) return null
+
+        val wantsRight = Regex("(?:\\bright\\b|ডান\\s*পাশ|ডানদিক|ডান|दाएं|दाएँ)", RegexOption.IGNORE_CASE).containsMatchIn(lower)
+        val wantsLeft = Regex("(?:\\bleft\\b|বাম\\s*পাশ|বামদিক|বাম|বাঁ|बाएं|बाएँ)", RegexOption.IGNORE_CASE).containsMatchIn(lower)
+        val wantsTop = Regex("(?:\\btop\\b|\\bupper\\b|উপরে|উপরের|ওপরে|ऊपर)", RegexOption.IGNORE_CASE).containsMatchIn(lower)
+        val wantsBottom = Regex("(?:\\bbottom\\b|\\blower\\b|নিচে|নিচের|नीचे)", RegexOption.IGNORE_CASE).containsMatchIn(lower)
+        val wantsCenter = Regex("(?:\\bcenter\\b|\\bmiddle\\b|মাঝখানে|মাঝের|बीच)", RegexOption.IGNORE_CASE).containsMatchIn(lower)
+
+        val wantsImage = Regex("(?:\\b(?:image|photo|picture|thumbnail)\\b|ছবিটা|ছবিটি|ছবি|ফটো|থাম্বনেইল|तस्वीर|फोटो)", RegexOption.IGNORE_CASE).containsMatchIn(lower)
+        val wantsButton = Regex("(?:\\b(?:button|btn|icon)\\b|বাটন|বটন|আইকন|बटन|आइकन)", RegexOption.IGNORE_CASE).containsMatchIn(lower)
+
+        val hasSpatialHint = wantsRight || wantsLeft || wantsTop || wantsBottom || wantsCenter
+        if (!hasSpatialHint && !wantsImage) return null
+
+        val nodesById = nodes.associateBy { it.nodeId }
+        val screenArea = screenWidth.toLong() * screenHeight.toLong()
+
+        data class ScoredSpatial(
+            val node: AccessibleNodeSnapshot,
+            val clickable: AccessibleNodeSnapshot,
+            val label: String,
+            val score: Int
+        )
+
+        val candidates = mutableListOf<ScoredSpatial>()
+        for (node in nodes) {
+            if (node.isPassword || !node.isVisibleToUser || !node.isEnabled) continue
+            if (!node.bounds.isValidVisible) continue
+            val combined = node.combinedLabel.ifEmpty { node.hintText.orEmpty() }
+            if (AccessibilityGuard.isSensitiveInputHint(combined)) continue
+
+            val clickable = AccessibilityTreeResolver.findNearestClickableNode(node, nodesById, maxDepth = 4) ?: continue
+            if (clickable.isPassword || !clickable.isEnabled || !clickable.bounds.isValidVisible) continue
+
+            val areaRatio = (clickable.bounds.width.toLong() * clickable.bounds.height.toLong()).toDouble() /
+                screenArea.coerceAtLeast(1L).toDouble()
+            if (areaRatio > 0.72) continue // skip full-screen layout wrappers
+
+            val cx = clickable.bounds.centerX.toDouble() / screenWidth.toDouble()
+            val cy = clickable.bounds.centerY.toDouble() / screenHeight.toDouble()
+
+            if (wantsRight && cx < 0.55) continue
+            if (wantsLeft && cx > 0.45) continue
+            if (wantsTop && cy > 0.40) continue
+            if (wantsBottom && cy < 0.60) continue
+            if (wantsCenter && (cx !in 0.25..0.75 || cy !in 0.25..0.75)) continue
+
+            val cls = "${node.className.orEmpty()} ${clickable.className.orEmpty()}".lowercase()
+            val vid = "${node.viewIdResourceName.orEmpty()} ${clickable.viewIdResourceName.orEmpty()}".lowercase()
+            val isImageLike = cls.contains("imageview") || vid.contains("image") || vid.contains("photo") ||
+                vid.contains("thumb") || vid.contains("media") || vid.contains("picture")
+            val isButtonLike = cls.contains("button") || cls.contains("imagebutton") ||
+                vid.contains("btn") || vid.contains("button") || vid.contains("fab") || vid.contains("action")
+
+            if (wantsImage && !isImageLike) continue
+
+            var score = 70
+            if (wantsImage && isImageLike) {
+                score += 20
+                if (clickable.bounds.width >= 160 && clickable.bounds.height >= 160) score += 10
+            }
+            if (wantsButton && isButtonLike) score += 16
+            if (wantsRight) score += ((cx - 0.5) * 30).toInt().coerceAtLeast(0)
+            if (wantsLeft) score += ((0.5 - cx) * 30).toInt().coerceAtLeast(0)
+            if (wantsTop) score += ((0.5 - cy) * 24).toInt().coerceAtLeast(0)
+            if (wantsBottom) score += ((cy - 0.5) * 24).toInt().coerceAtLeast(0)
+
+            val label = combined.ifBlank { clickable.combinedLabel.ifBlank { clean } }
+            candidates.add(ScoredSpatial(node, clickable, label, score))
+        }
+
+        val deduped = candidates
+            .sortedByDescending { it.score }
+            .distinctBy { it.clickable.nodeId }
+
+        if (deduped.isEmpty()) return null
+        if (deduped.size == 1 || (deduped[0].score - deduped[1].score) >= 10) {
+            val winner = deduped[0]
+            return VisualClickPlan.ClickAccessibilityNode(
+                matchNode = winner.node,
+                clickableAncestor = winner.clickable,
+                resolvedBounds = winner.clickable.bounds,
+                label = winner.label,
+                confidence = 0.86f
+            )
+        }
+
+        // If user specifically asked for an image/photo and multiple large photos exist, clarify honestly
+        val options = deduped.take(4).mapIndexed { idx, item ->
+            item.label.takeIf { it.isNotBlank() && !it.equals(clean, ignoreCase = true) } ?: "Option ${idx + 1}"
+        }
+        return VisualClickPlan.ClarifyAmbiguous(
+            query = clean,
+            options = options,
+            reason = "Multiple visible elements match \"$clean\". Please specify which one to tap."
+        )
+    }
+}
+
+/**
+ * Lightweight short-lived cache keyed by (screenFingerprint + normalizedQuery) so unchanged screens
+ * never waste bandwidth or battery re-capturing and re-uploading identical screenshots to Gemini Vision.
+ */
+object VisualScreenFingerprintCache {
+    private const val TTL_MS = 10_000L
+    private const val MAX_ENTRIES = 24
+
+    private data class CacheEntry(
+        val proposal: VisualTargetProposal,
+        val cachedAtMs: Long
+    )
+
+    private val entries = java.util.concurrent.ConcurrentHashMap<String, CacheEntry>()
+
+    fun buildScreenFingerprint(
+        activePackage: String,
+        lastWindowStateChangeMs: Long,
+        lastWindowContentChangeMs: Long,
+        visibleLabels: List<String>
+    ): String {
+        val labelDigest = visibleLabels.take(24).joinToString("|").hashCode()
+        return "${activePackage.trim().lowercase()}|$lastWindowStateChangeMs|$lastWindowContentChangeMs|$labelDigest"
+    }
+
+    fun get(
+        screenFingerprint: String,
+        query: String,
+        nowMs: Long = System.currentTimeMillis()
+    ): VisualTargetProposal? {
+        val key = "$screenFingerprint::${query.trim().lowercase()}"
+        val entry = entries[key] ?: return null
+        if ((nowMs - entry.cachedAtMs) > TTL_MS) {
+            entries.remove(key)
+            return null
+        }
+        return entry.proposal
+    }
+
+    fun put(
+        screenFingerprint: String,
+        query: String,
+        proposal: VisualTargetProposal,
+        nowMs: Long = System.currentTimeMillis()
+    ) {
+        if (!proposal.found || proposal.confidence < VisualClickIntelligenceEngine.MIN_CONFIDENCE) return
+        val key = "$screenFingerprint::${query.trim().lowercase()}"
+        entries[key] = CacheEntry(proposal = proposal, cachedAtMs = nowMs)
+        if (entries.size > MAX_ENTRIES) {
+            val cutoff = nowMs - TTL_MS
+            entries.entries.removeIf { it.value.cachedAtMs < cutoff }
+        }
+    }
+
+    fun clearForTests() {
+        entries.clear()
+    }
 }
 
 

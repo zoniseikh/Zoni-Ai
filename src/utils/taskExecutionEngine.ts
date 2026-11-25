@@ -856,13 +856,38 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
     };
   }
 
-  // Bengali & Hindi visible button/control click ("Facebook-এ Like বাটনে ক্লিক করো", "লাল বাটনে চাপ দাও", "<label>-এ ক্লিক করো")
+  // Visual image / photo open ("এই ছবিটা ওপেন করো", "open this image", "open this photo")
+  const openImageMatch =
+    segment.match(/^(?:open|view|show)\s+(?:this|the)\s+(image|photo|picture|thumbnail)$/i) ||
+    segment.match(/^(?:এই\s*)?(ছবিটা|ছবিটি|ছবি|ফটোটা|ফটো|থাম্বনেইল)\s*(?:ওপেন\s*করো|খোলো|খুলে\s*দাও|দেখাও)$/i);
+  if (openImageMatch && openImageMatch[1]) {
+    const imgTarget = openImageMatch[1].trim();
+    return {
+      stepId,
+      tool: 'accessibility_action',
+      args: { command: `tap:${imgTarget}` },
+      requiredPermissions: ['ACCESSIBILITY_SERVICE'],
+      requiresUserConfirmation: false,
+      honestOutcomeNote: `Attempts to open visible "${imgTarget}" via Accessibility or visual recognition.`,
+    };
+  }
+
+  // Bengali & Hindi visible button/control click ("Facebook-এ Like বাটনে ক্লিক করো", "লাল বাটনে চাপ দাও", "ডান পাশের বাটনে ক্লিক করো")
   const bnTapMatch = segment.match(
-    /^(?:(?:facebook|ফেসবুক|youtube|ইউটিউব)(?:-?এ|\s*এ)\s+)?(.+?)\s*(?:বাটনে|বাটনটিতে|বটনে|আইকনে|অপশনে)?\s*(?:ক্লিক\s*করো|ট্যাপ\s*করো|চাপ\s*দাও|চাপো|क्लिक\s*करो|टैप\s*करो|दबाओ)$/i
+    /^(?:(?:facebook|ফেসবুক|youtube|ইউটিউব)(?:-?এ|\s*এ)\s+)?(.+?)\s*(বাটনে|বাটনটিতে|বটনে|আইকনে|অপশনে)?\s*(?:ক্লিক\s*করো|ট্যাপ\s*করো|চাপ\s*দাও|চাপো|क्लिक\s*करो|टैप\s*करो|दबाओ)$/i
   );
   if (bnTapMatch && bnTapMatch[1]) {
     const rawTarget = bnTapMatch[1].trim().replace(/(?:-এ|-তে)$/, '').trim();
-    const normalizedTarget = /^এই$/i.test(rawTarget) ? 'button' : rawTarget;
+    const roleSuffix = (bnTapMatch[2] || '').trim();
+    const isSpatialOrColor =
+      /(?:লাল|নীল|সবুজ|হলুদ|কমলা|সাদা|কালো|ডান|বাম|উপরে|নিচে|মাঝখানে|right|left|top|bottom|red|blue|green)/i.test(
+        rawTarget
+      );
+    let normalizedTarget = /^এই$/i.test(rawTarget) ? 'button' : rawTarget;
+    if (isSpatialOrColor && roleSuffix) {
+      const cleanRole = roleSuffix.replace(/(?:টিতে|ে)$/, '');
+      normalizedTarget = `${normalizedTarget} ${cleanRole}`.trim();
+    }
     return {
       stepId,
       tool: 'accessibility_action',
@@ -1299,9 +1324,9 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
   }
 
   // Bengali WhatsApp-first phrasing:
-  // "WhatsApp-এ রাহুলকে একটা মেসেজ পাঠিয়ে দাও" / "হোয়াটসঅ্যাপে রাহুলকে মেসেজ পাঠাও: আমি আসছি" / "WhatsApp-এ মাকে বলো আমি বাড়ি ফিরছি"
+  // "WhatsApp-এ রাহুলকে একটা মেসেজ পাঠিয়ে দাও" / "হোয়াটসঅ্যাপে রাহুলকে মেসেজ পাঠাও: আমি আসছি" / "WhatsApp-এ রহিমকে মেসেজ পাঠাও: আমি আজ বিকেলে আসব।"
   const waAppFirstBn = segment.match(
-    /^(?:হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|whatsapp)(?:-?এ|\s*এ)?\s+(.+?)(?:কে|-\s*কে)\s*(?:একটা\s+|একটি\s+)?(?:মেসেজ\s*)?(?:পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|পাঠাও|করে\s*দাও|করো|দাও|বলো|লিখে\s*দাও|লেখো)(?:\s*[:,-]?\s*(.+))?$/i
+    /^(?:হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|whatsapp)(?:-?এ|\s*এ|ে)?\s+(.+?)(?:কে|-\s*কে)\s*(?:একটা\s+|একটি\s+)?(?:মেসেজ\s*)?(?:পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|পাঠাও|করে\s*দাও|করো|দাও|বলো|লিখে\s*দাও|লেখো)(?:\s*[:,-]?\s*(.+))?$/i
   );
   if (waAppFirstBn && waAppFirstBn[1]) {
     const recipient = normalizeRelationName(waAppFirstBn[1]);
@@ -1323,7 +1348,7 @@ function parseSingleSegmentToStep(rawSegment: string, stepId: string): TaskStep 
   // Bengali Recipient-first WhatsApp phrasing:
   // "রাহুলকে WhatsApp মেসেজ পাঠাও: আমি আসছি।" / "রাহুলকে WhatsApp-এ মেসেজ পাঠাও: আমি আজ আসতে পারব না" / "মাকে WhatsApp-এ বলো আমি বাড়ি ফিরছি"
   const waNamedBn = segment.match(
-    /^(.+?)(?:কে|-\s*কে)\s*(?:হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|whatsapp)(?:-?এ|\s*এ)?\s*(?:একটা\s+|একটি\s+)?(?:মেসেজ\s*)?(?:পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|পাঠাও|করে\s*দাও|করো|দাও|বলো|লিখে\s*দাও|লেখো)(?:\s*[:,-]?\s*(.+))?$/i
+    /^(.+?)(?:কে|-\s*কে)\s*(?:হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|whatsapp)(?:-?এ|\s*এ|ে)?\s*(?:একটা\s+|একটি\s+)?(?:মেসেজ\s*)?(?:পাঠিয়ে\s*দাও|পাঠিয়ে\s*দাও|পাঠাও|করে\s*দাও|করো|দাও|বলো|লিখে\s*দাও|লেখো)(?:\s*[:,-]?\s*(.+))?$/i
   );
   if (waNamedBn && waNamedBn[1]) {
     const recipient = normalizeRelationName(waNamedBn[1]);

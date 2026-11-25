@@ -235,11 +235,30 @@ class CommandDispatcher {
         if (tapEn != null && tapEn.groupValues[1].isNotBlank()) {
             return VoiceCommand.TapVisibleElement(tapEn.groupValues[1].trim())
         }
-        val tapBn = Regex("^(.+?)\\s*(?:বাটনে|বাটনটিতে|আইকনে|অপশনে)?\\s*(?:ট্যাপ\\s*করো|ক্লিক\\s*করো|চাপ\\s*দাও|চাপো)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
+        val openImageEn = Regex("^(?:open|view|show)\\s+(?:this|the)\\s+(image|photo|picture|thumbnail)[.,?!]*$", RegexOption.IGNORE_CASE).find(raw)
+        if (openImageEn != null) {
+            return VoiceCommand.TapVisibleElement(openImageEn.groupValues[1].trim())
+        }
+        val openImageBn = Regex("^(?:এই\\s*)?(ছবিটা|ছবিটি|ছবি|ফটোটা|ফটো|থাম্বনেইল)\\s*(?:ওপেন\\s*করো|খোলো|খুলে\\s*দাও|দেখাও)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
+        if (openImageBn != null) {
+            return VoiceCommand.TapVisibleElement(openImageBn.groupValues[1].trim())
+        }
+        val tapBn = Regex("^(.+?)\\s*(বাটনে|বাটনটিতে|আইকনে|অপশনে)?\\s*(?:ট্যাপ\\s*করো|ক্লিক\\s*করো|চাপ\\s*দাও|চাপো)[.,?!।]*$", RegexOption.IGNORE_CASE).find(raw)
         if (tapBn != null && tapBn.groupValues[1].isNotBlank()) {
-            val cleanedTarget = tapBn.groupValues[1].trim().replace(Regex("(?:-এ|-তে)$"), "").trim()
-            if (cleanedTarget.isNotBlank()) {
-                return VoiceCommand.TapVisibleElement(cleanedTarget)
+            val baseTarget = tapBn.groupValues[1].trim().replace(Regex("(?:-এ|-তে)$"), "").trim()
+            val roleWord = tapBn.groupValues[2].trim()
+            val isSpatialOrColor = Regex(
+                "(?:লাল|নীল|সবুজ|হলুদ|কমলা|সাদা|কালো|ডান|বাম|উপরে|নিচে|মাঝখানে|right|left|top|bottom|red|blue|green)",
+                RegexOption.IGNORE_CASE
+            ).containsMatchIn(baseTarget)
+            val finalTarget = if (isSpatialOrColor && roleWord.isNotEmpty()) {
+                val roleClean = roleWord.replace(Regex("(?:টিতে|ে)$"), "")
+                "$baseTarget $roleClean".trim()
+            } else {
+                baseTarget
+            }
+            if (finalTarget.isNotBlank()) {
+                return VoiceCommand.TapVisibleElement(finalTarget)
             }
         }
         return null
@@ -469,13 +488,13 @@ class CommandDispatcher {
     }
 
     private fun parseWhatsAppDraftCommand(raw: String): VoiceCommand.PrepareWhatsAppMessage? {
-        // 1. Bengali: "রাহুলকে WhatsApp-এ মেসেজ পাঠাও: আমি আজ আসতে পারব না।"
-        //    "মাকে WhatsApp-এ বলো আমি বাড়ি ফিরছি।"
-        //    "পাপাকে মেসেজ করো আমি পরে ফোন করব।"
-        //    "রাহুলকে একটা মেসেজ লিখে দাও।"
+        // 1. Bengali:
+        //    - WhatsApp-first: "WhatsApp-এ রহিমকে মেসেজ পাঠাও: আমি আজ বিকেলে আসব।" / "হোয়াটসঅ্যাপে রাহুলকে বলো আমি আসছি"
+        //    - Recipient-first: "রাহুলকে WhatsApp-এ মেসেজ পাঠাও: আমি আজ আসতে পারব না।" / "রাহুলকে একটা মেসেজ লিখে দাও।"
         val bnPatterns = listOf(
-            Regex("^(?:আমার\\s+)?(.+?)(?:কে|-কে)\\s*(?:হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|whatsapp)(?:-?এ)?\\s*(?:একটা\\s+)?(?:মেসেজ\\s*)?(?:পাঠাও|করো|লিখে\\s*দাও|বলো|দাও)\\s*[:,-]?\\s*(.*)$", RegexOption.IGNORE_CASE),
-            Regex("^(?:আমার\\s+)?(.+?)(?:কে|-কে)\\s*(?:একটা\\s+)?মেসেজ\\s*(?:পাঠাও|করো|লিখে\\s*দাও|দাও)\\s*[:,-]?\\s*(.*)$", RegexOption.IGNORE_CASE)
+            Regex("^(?:হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|whatsapp)(?:-?এ|\\s*এ|ে)?\\s+(?:আমার\\s+)?(.+?)(?:কে|-কে)\\s*(?:একটা\\s+|একটি\\s+)?(?:মেসেজ\\s*)?(?:পাঠিয়ে\\s*দাও|পাঠিয়ে\\s*দাও|পাঠাও|করে\\s*দাও|করো|লিখে\\s*দাও|লেখো|বলো|দাও)\\s*[:,-]?\\s*(.*)$", RegexOption.IGNORE_CASE),
+            Regex("^(?:আমার\\s+)?(.+?)(?:কে|-কে)\\s*(?:হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|whatsapp)(?:-?এ|\\s*এ|ে)?\\s*(?:একটা\\s+|একটি\\s+)?(?:মেসেজ\\s*)?(?:পাঠিয়ে\\s*দাও|পাঠিয়ে\\s*দাও|পাঠাও|করে\\s*দাও|করো|লিখে\\s*দাও|লেখো|বলো|দাও)\\s*[:,-]?\\s*(.*)$", RegexOption.IGNORE_CASE),
+            Regex("^(?:আমার\\s+)?(.+?)(?:কে|-কে)\\s*(?:একটা\\s+|একটি\\s+)?মেসেজ\\s*(?:পাঠিয়ে\\s*দাও|পাঠিয়ে\\s*দাও|পাঠাও|করে\\s*দাও|করো|লিখে\\s*দাও|লেখো|দাও)\\s*[:,-]?\\s*(.*)$", RegexOption.IGNORE_CASE)
         )
         for (pattern in bnPatterns) {
             val m = pattern.find(raw)

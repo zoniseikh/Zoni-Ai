@@ -4,24 +4,31 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.zoni.jarvis.assistant.ZoniApplication
+import com.zoni.jarvis.assistant.action.AllowedActionType
+import com.zoni.jarvis.assistant.action.TypedActionRequest
 import com.zoni.jarvis.assistant.audio.LiveAudioEngine
 import com.zoni.jarvis.assistant.data.ZoniUserSettings
 import com.zoni.jarvis.assistant.domain.ActionType
 import com.zoni.jarvis.assistant.domain.AssistantState
 import com.zoni.jarvis.assistant.domain.BengaliDateTimeEngine
 import com.zoni.jarvis.assistant.domain.ChatMessage
+import com.zoni.jarvis.assistant.domain.CommandDispatcher
 import com.zoni.jarvis.assistant.domain.CompanionMode
 import com.zoni.jarvis.assistant.domain.MessageRole
 import com.zoni.jarvis.assistant.domain.MobileAssistantEngine
 import com.zoni.jarvis.assistant.domain.SupportedLanguage
+import com.zoni.jarvis.assistant.domain.VoiceCommand
 import com.zoni.jarvis.assistant.domain.VoiceProfile
 import com.zoni.jarvis.assistant.domain.WsConnectionStatus
 import com.zoni.jarvis.assistant.hardware.AndroidPermissionsSnapshot
 import com.zoni.jarvis.assistant.hardware.BatterySnapshot
 import com.zoni.jarvis.assistant.network.LiveServerEvent
+import com.zoni.jarvis.assistant.network.NetworkQualityMonitor
+import com.zoni.jarvis.assistant.network.NetworkQualityState
 import com.zoni.jarvis.assistant.network.ZoniLiveSessionClient
 import com.zoni.jarvis.assistant.service.FloatingOrbService
 import com.zoni.jarvis.assistant.service.ZoniForegroundService
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -29,6 +36,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.UUID
 import kotlin.math.sin
 
 data class ZoniUiState(
@@ -55,7 +64,8 @@ data class ZoniUiState(
     val permissions: AndroidPermissionsSnapshot? = null,
     val geminiKeyConfigured: Boolean = false,
     val geminiKeyMasked: String? = null,
-    val isKeystoreBacked: Boolean = false
+    val isKeystoreBacked: Boolean = false,
+    val networkQuality: NetworkQualityState = NetworkQualityState.STRONG
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -63,6 +73,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as ZoniApplication
     private val preferences = app.preferences
     private val hardware = app.hardwareController
+    private val localMemoryRepository = app.localMemoryRepository
+    private val commandDispatcher = CommandDispatcher()
 
     private val _uiState = MutableStateFlow(ZoniUiState())
     val uiState: StateFlow<ZoniUiState> = _uiState.asStateFlow()
@@ -83,13 +95,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         handleLiveEvent(event)
     }
 
+    private val networkMonitor = NetworkQualityMonitor(app) { quality ->
+        liveClient.updateNetworkQuality(quality)
+        _uiState.update { it.copy(networkQuality = quality) }
+    }
+
     private var userSpeechTurnId = 1
     private var currentAssistantTurnId = 1
     private var initializedConnection = false
     private var pendingVoiceStart = false
+    private val persistedLiveMessageIds = HashSet<String>()
 
     init {
+        networkMonitor.start()
+        liveClient.updateNetworkQuality(networkMonitor.currentQuality)
+        _uiState.update { it.copy(networkQuality = networkMonitor.currentQuality) }
         refreshSystemStatus()
+
+        // Restore persisted local conversation history from Room ZoniDatabase asynchronously
+        viewModelScope.launch {
+            val savedRows = localMemoryRepository.loadRecentConversations(limit = 60, offset = 0)
+            if (savedRows.isNotEmpty()) {
+                val restored = savedRows.map { row ->
+                    ChatMessage(
+                        id = row.id,
+                        role = if (row.role.equals("user", ignoreCase = true)) MessageRole.USER else MessageRole.ASSISTANT,
+                        text = row.text,
+                        lang = when {
+                            row.language.startsWith("en", ignoreCase = true) -> SupportedLanguage.ENGLISH
+                            row.language.startsWith("hi", ignoreCase = true) -> SupportedLanguage.HINDI
+                            else -> SupportedLanguage.BENGALI
+                        },
+                        timestampMillis = row.createdAtMs
+                    )
+                }
+                _uiState.update { state ->
+                    if (state.messages.size <= 1 && state.messages.firstOrNull()?.id == "welcome-1") {
+                        state.copy(messages = restored)
+                    } else {
+                        state
+                    }
+                }
+            }
+        }
 
         // Observe persisted user settings
         viewModelScope.launch {
@@ -139,16 +187,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Live IST clock + heartbeat pulse loop
+        // Live IST clock + heartbeat pulse loop (only emit StateFlow updates when values change)
         viewModelScope.launch {
             while (isActive) {
                 val bpm = 72 + (sin(System.currentTimeMillis() / 1500.0) * 4).toInt()
-                _uiState.update {
-                    it.copy(
-                        istClockText = BengaliDateTimeEngine.formatClock24Ist(),
-                        heartRate = bpm,
-                        isFloatingOrbRunning = FloatingOrbService.isRunning
-                    )
+                val nextClock = BengaliDateTimeEngine.formatClock24Ist()
+                val nextOrb = FloatingOrbService.isRunning
+                val current = _uiState.value
+                if (current.istClockText != nextClock ||
+                    current.heartRate != bpm ||
+                    current.isFloatingOrbRunning != nextOrb
+                ) {
+                    _uiState.update {
+                        it.copy(
+                            istClockText = nextClock,
+                            heartRate = bpm,
+                            isFloatingOrbRunning = nextOrb
+                        )
+                    }
                 }
                 delay(1000L)
             }
@@ -278,6 +334,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             is LiveServerEvent.TurnComplete -> {
                 audioEngine.setAssistantSpeaking(false)
                 audioEngine.resetEndOfSpeechDetector()
+                val finalizedTurnId = event.turnId
+                val userMsgId = "live-user-speech-$finalizedTurnId"
+                val assistantMsgId = "live-assistant-turn-$finalizedTurnId"
+                val snapshotMessages = _uiState.value.messages
+                viewModelScope.launch {
+                    snapshotMessages.firstOrNull { it.id == userMsgId }?.let { msg ->
+                        if (persistedLiveMessageIds.add(msg.id)) {
+                            localMemoryRepository.saveMessage("user", msg.text, msg.lang.code, msg.id, msg.timestampMillis)
+                        }
+                    }
+                    snapshotMessages.firstOrNull { it.id == assistantMsgId }?.let { msg ->
+                        if (persistedLiveMessageIds.add(msg.id)) {
+                            localMemoryRepository.saveMessage("assistant", msg.text, msg.lang.code, msg.id, msg.timestampMillis)
+                        }
+                    }
+                }
                 currentAssistantTurnId = event.turnId + 1
                 userSpeechTurnId += 1
                 _uiState.update {
@@ -488,11 +560,131 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 4. Send through shared Gemini Live WebSocket session
+        // 4. Local-first offline memory recall & deterministic on-device command execution (zero Gemini wait!)
         appendMessage(MessageRole.USER, text, settings.activeLanguage)
         audioEngine.stopAllPlayback()
-        _uiState.update { it.copy(assistantState = AssistantState.THINKING) }
-        liveClient.sendClientText(text)
+
+        viewModelScope.launch {
+            // 4a. Check offline local memory recall first
+            val recall = localMemoryRepository.tryLocalMemoryRecall(text, settings.activeLanguage.code)
+            if (recall.handledOffline && recall.replyText.isNotBlank()) {
+                appendMessage(MessageRole.ASSISTANT, recall.replyText, settings.activeLanguage)
+                _uiState.update { it.copy(latestTranscript = recall.replyText, assistantState = AssistantState.IDLE) }
+                return@launch
+            }
+
+            // 4b. Execute deterministic local device/app/accessibility/WhatsApp/call commands WITHOUT waiting for Gemini Cloud
+            val localRequest = mapVoiceCommandToLocalTypedRequest(commandDispatcher.parseCommand(text))
+            if (localRequest != null) {
+                val result = withContext(Dispatchers.IO) {
+                    hardware.deviceActionExecutor.executeTypedAction(localRequest)
+                }
+                localMemoryRepository.recordFrequentCommand(text)
+                appendMessage(MessageRole.ASSISTANT, result.message, settings.activeLanguage)
+                _uiState.update { it.copy(latestTranscript = result.message, assistantState = AssistantState.IDLE) }
+                return@launch
+            }
+
+            // 5. Cloud Gemini Live path: honestly detect offline state instead of hanging
+            val currentQuality = networkMonitor.refreshNow()
+            if (currentQuality == NetworkQualityState.OFFLINE) {
+                val offlineMsg = when (settings.activeLanguage) {
+                    SupportedLanguage.BENGALI -> "এখন ইন্টারনেট সংযোগ নেই। লোকাল কমান্ড (অ্যাপ খোলা, কল, টর্চ, ক্লিক, লোকাল মেমোরি) চালু আছে, তবে Gemini AI উত্তরের জন্য ইন্টারনেট প্রয়োজন।"
+                    SupportedLanguage.HINDI -> "अभी इंटरनेट कनेक्शन नहीं है। लोकल कमांड चल सकते हैं, लेकिन Gemini AI उत्तर के लिए इंटरनेट ज़रूरी है।"
+                    SupportedLanguage.ENGLISH -> "You are currently offline. Local device actions and local memory recall still work, while Gemini AI replies require an internet connection."
+                }
+                appendMessage(MessageRole.ASSISTANT, offlineMsg, settings.activeLanguage)
+                _uiState.update {
+                    it.copy(
+                        networkQuality = currentQuality,
+                        latestTranscript = offlineMsg,
+                        assistantState = AssistantState.IDLE
+                    )
+                }
+                return@launch
+            }
+
+            // Inject only a compact bounded local-memory snippet (never full history)
+            val compactContext = localMemoryRepository.buildCompactContextForQuery(text)
+            val outboundPayload = if (compactContext.isNotBlank()) {
+                "$compactContext\nUser: $text"
+            } else {
+                text
+            }
+            _uiState.update { it.copy(assistantState = AssistantState.THINKING) }
+            liveClient.sendClientText(outboundPayload, clientMsgId = "txt-${text.hashCode()}-${System.currentTimeMillis() / 3000L}")
+        }
+    }
+
+    private fun mapVoiceCommandToLocalTypedRequest(cmd: VoiceCommand): TypedActionRequest? {
+        fun build(type: AllowedActionType, args: Map<String, String> = emptyMap()) = TypedActionRequest(
+            actionId = "loc_${UUID.randomUUID().toString().take(10)}",
+            actionType = type,
+            arguments = args,
+            requiredPermissions = type.requiredPermissions,
+            requiresConfirmation = false,
+            timeoutMs = type.defaultTimeoutMs
+        )
+        return when (cmd) {
+            is VoiceCommand.OpenApp -> build(AllowedActionType.OPEN_APP, mapOf("app_name" to cmd.appQuery))
+            is VoiceCommand.ScrollScreen -> build(AllowedActionType.SCROLL_SCREEN, mapOf("direction" to cmd.direction))
+            is VoiceCommand.NavigateGlobal -> when (cmd.action.lowercase()) {
+                "home", "go_home" -> build(AllowedActionType.GO_HOME)
+                "back", "go_back" -> build(AllowedActionType.GO_BACK)
+                else -> null
+            }
+            is VoiceCommand.TapVisibleElement -> build(AllowedActionType.CLICK_VISIBLE_ELEMENT, mapOf("target" to cmd.targetLabel))
+            is VoiceCommand.ClickYouTubeVideo -> build(
+                AllowedActionType.CLICK_YOUTUBE_VIDEO,
+                buildMap {
+                    cmd.index?.let { put("index", it.toString()) }
+                    if (cmd.targetHint.isNotBlank()) put("target", cmd.targetHint)
+                    if (cmd.query.isNotBlank()) put("query", cmd.query)
+                }
+            )
+            is VoiceCommand.ClickYouTubeSearchResult -> build(
+                AllowedActionType.CLICK_YOUTUBE_SEARCH_RESULT,
+                mapOf("index" to cmd.index.toString(), "query" to cmd.query)
+            )
+            is VoiceCommand.ClickWhatsAppContact -> build(
+                AllowedActionType.CLICK_WHATSAPP_CONTACT,
+                buildMap {
+                    if (cmd.contactName.isNotBlank()) put("contact_name", cmd.contactName)
+                    cmd.index?.let { put("index", it.toString()) }
+                }
+            )
+            is VoiceCommand.OpenWhatsAppChat -> build(
+                AllowedActionType.OPEN_WHATSAPP_CHAT,
+                buildMap {
+                    if (cmd.contactName.isNotBlank()) put("contact_name", cmd.contactName)
+                    cmd.index?.let { put("index", it.toString()) }
+                }
+            )
+            is VoiceCommand.TypeWhatsAppMessage -> build(
+                AllowedActionType.TYPE_WHATSAPP_MESSAGE,
+                mapOf("recipient" to cmd.recipient, "message" to cmd.message)
+            )
+            is VoiceCommand.PrepareWhatsAppMessage -> build(
+                AllowedActionType.SEND_WHATSAPP_MESSAGE,
+                mapOf("recipient" to cmd.recipient, "message" to cmd.message)
+            )
+            is VoiceCommand.VerifyWhatsAppSend -> build(
+                AllowedActionType.VERIFY_WHATSAPP_SEND,
+                mapOf("recipient" to cmd.recipient, "message" to cmd.message)
+            )
+            is VoiceCommand.SendSms -> build(
+                AllowedActionType.PREPARE_SMS,
+                mapOf("recipient" to cmd.recipient, "message" to cmd.message)
+            )
+            is VoiceCommand.CallContact -> build(AllowedActionType.CALL_CONTACT, mapOf("recipient" to cmd.contactName))
+            is VoiceCommand.CallDirectNumber -> build(AllowedActionType.CALL_CONTACT, mapOf("phone_number" to cmd.phoneNumber))
+            is VoiceCommand.AnswerIncomingCall -> build(AllowedActionType.ANSWER_INCOMING_CALL)
+            is VoiceCommand.RejectIncomingCall -> build(AllowedActionType.REJECT_INCOMING_CALL)
+            is VoiceCommand.EndActiveCall -> build(AllowedActionType.END_ACTIVE_CALL)
+            is VoiceCommand.ToggleFlashlight -> build(AllowedActionType.FLASHLIGHT_CONTROL, mapOf("enable" to cmd.enable.toString()))
+            is VoiceCommand.OpenSettings -> build(AllowedActionType.OPEN_SYSTEM_SETTINGS, mapOf("target" to cmd.label))
+            else -> null
+        }
     }
 
     fun updateAffectionName(newName: String) {
@@ -624,6 +816,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearMessages() {
         _uiState.update { it.copy(messages = emptyList()) }
+        viewModelScope.launch {
+            localMemoryRepository.clearConversationHistory()
+        }
+    }
+
+    fun clearLongTermMemory() {
+        viewModelScope.launch {
+            localMemoryRepository.clearLongTermMemory()
+        }
     }
 
     // Native Hardware Actions exposed to Android Hardware Hub
@@ -648,19 +849,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun appendMessage(role: MessageRole, text: String, lang: SupportedLanguage) {
+        val now = System.currentTimeMillis()
+        val msgId = "msg-$now-${UUID.randomUUID().toString().take(6)}"
         _uiState.update { state ->
             state.copy(
                 messages = state.messages + ChatMessage(
-                    id = "msg-${System.currentTimeMillis()}-${state.messages.size}",
+                    id = msgId,
                     role = role,
                     text = text,
-                    lang = lang
+                    lang = lang,
+                    timestampMillis = now
                 )
+            )
+        }
+        viewModelScope.launch {
+            localMemoryRepository.saveMessage(
+                role = if (role == MessageRole.USER) "user" else "assistant",
+                text = text,
+                language = lang.code,
+                id = msgId,
+                createdAtMs = now
             )
         }
     }
 
     override fun onCleared() {
+        networkMonitor.stop()
         audioEngine.release()
         liveClient.disconnect()
         super.onCleared()

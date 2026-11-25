@@ -168,16 +168,19 @@ class ZoniNotificationListenerService : NotificationListenerService() {
 
         /**
          * Finds an active, reply-capable WhatsApp notification key matching the sender name
-         * so the user can optionally send an explicitly approved reply via RemoteInput.
+         * (supports Bengali/English/Hindi transliteration via MultilingualNameMatcher)
+         * ONLY when an actual active incoming notification exposes a RemoteInput reply action.
          */
         fun findReplyableWhatsAppNotificationKey(senderQuery: String): String? {
-            val clean = senderQuery.trim().lowercase()
+            val clean = senderQuery.trim()
             if (clean.isEmpty()) return null
+            val lower = clean.lowercase()
             val match = recentNotifications.firstOrNull { item ->
                 item.isWhatsApp &&
                     item.canReply &&
                     replyActionsByKey.containsKey(item.key) &&
-                    item.title.lowercase().contains(clean)
+                    (item.title.lowercase().contains(lower) ||
+                        MultilingualNameMatcher.matchesQuery(item.title, clean))
             }
             return match?.key
         }

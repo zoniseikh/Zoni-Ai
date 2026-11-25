@@ -81,7 +81,50 @@ class ZoniLiveSessionClient(
     @Volatile
     private var resumptionHandle: String? = null
 
+    @Volatile
+    private var networkQuality: NetworkQualityState = NetworkQualityState.STRONG
+
+    @Volatile
+    private var pendingReconnectWhenOnline: Boolean = false
+
     fun isConnected(): Boolean = webSocket != null && isSessionReady
+
+    fun updateNetworkQuality(quality: NetworkQualityState) {
+        val prev = networkQuality
+        networkQuality = quality
+        if (quality == NetworkQualityState.OFFLINE) {
+            reconnectJob?.cancel()
+            if (!isClosedManually && lastApiKey.isNotBlank() && nonRetryableError == null) {
+                pendingReconnectWhenOnline = true
+            }
+            return
+        }
+        if (prev == NetworkQualityState.OFFLINE &&
+            pendingReconnectWhenOnline &&
+            !isClosedManually &&
+            nonRetryableError == null &&
+            lastApiKey.isNotBlank() &&
+            !isConnected() &&
+            !isConnecting
+        ) {
+            pendingReconnectWhenOnline = false
+            reconnectAttempt = 0
+            connect(
+                apiKey = lastApiKey,
+                mode = lastMode,
+                affectionName = lastAffectionName,
+                voice = lastVoice,
+                language = lastLanguage,
+                forceReconnect = false
+            )
+        }
+    }
+
+    private data class QueuedTextMessage(
+        val id: String,
+        val payload: String,
+        val enqueuedAtMs: Long
+    )
 
     private var lastApiKey: String = ""
     private var lastMode: CompanionMode = CompanionMode.ROMANTIC
@@ -89,7 +132,8 @@ class ZoniLiveSessionClient(
     private var lastVoice: VoiceProfile = VoiceProfile.KORE
     private var lastLanguage: SupportedLanguage = SupportedLanguage.BENGALI
 
-    private val outgoingQueue = ConcurrentLinkedQueue<String>()
+    private val outgoingQueue = ConcurrentLinkedQueue<QueuedTextMessage>()
+    private val recentDispatchedIds = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     fun connect(
         apiKey: String,
@@ -279,6 +323,12 @@ class ZoniLiveSessionClient(
             onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.ERROR))
             return
         }
+        if (networkQuality == NetworkQualityState.OFFLINE) {
+            pendingReconnectWhenOnline = true
+            reconnectJob?.cancel()
+            onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.DISCONNECTED))
+            return
+        }
         if (!isGracefulRotation && reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
             isRotatingSession = false
             onEvent(LiveServerEvent.StatusChanged(WsConnectionStatus.ERROR))
@@ -400,8 +450,13 @@ class ZoniLiveSessionClient(
 
     fun sendAudioChunk(base64Pcm16k: String) {
         if (!isSessionReady || base64Pcm16k.isBlank()) return
+        val ws = webSocket ?: return
+        // Drop stale PCM frame when network buffer is congested to avoid multi-second voice lag
+        if (NetworkQualityPolicy.shouldDropAudioChunkForBackpressure(ws.queueSize(), networkQuality)) {
+            return
+        }
         hasPendingSpeechAudio = true
-        webSocket?.send(buildDirectAudioPayload(base64Pcm16k))
+        ws.send(buildDirectAudioPayload(base64Pcm16k))
     }
 
     fun sendAudioStreamEnd() {
@@ -413,7 +468,17 @@ class ZoniLiveSessionClient(
     fun sendClientText(text: String, clientMsgId: String = "msg-${System.currentTimeMillis()}") {
         val trimmed = text.trim().take(4000)
         if (trimmed.isEmpty()) return
-        sendOrQueue(buildDirectClientTextPayload(trimmed))
+        val now = System.currentTimeMillis()
+        val prev = recentDispatchedIds[clientMsgId]
+        if (prev != null && (now - prev) < DUPLICATE_MESSAGE_WINDOW_MS) {
+            return
+        }
+        recentDispatchedIds[clientMsgId] = now
+        if (recentDispatchedIds.size > 64) {
+            val cutoff = now - 60_000L
+            recentDispatchedIds.entries.removeIf { it.value < cutoff }
+        }
+        sendOrQueue(buildDirectClientTextPayload(trimmed), clientMsgId)
     }
 
     fun sendConfigUpdate(
@@ -431,7 +496,7 @@ class ZoniLiveSessionClient(
             lang?.let { append("Respond naturally in ${it.displayLabel}. ") }
             append("Apply immediately.]")
         }
-        sendOrQueue(buildDirectClientTextPayload(directive))
+        sendOrQueue(buildDirectClientTextPayload(directive), "cfg-${System.currentTimeMillis()}")
     }
 
     fun sendInterrupt() {
@@ -443,27 +508,37 @@ class ZoniLiveSessionClient(
                     .put("turnComplete", false)
             )
             .toString()
-        sendOrQueue(payload)
+        sendOrQueue(payload, "int-${System.currentTimeMillis()}")
     }
 
-    private fun sendOrQueue(serialized: String) {
+    private fun sendOrQueue(serialized: String, messageId: String) {
         val ws = webSocket
         if (ws != null && isSessionReady && ws.send(serialized)) {
             return
         }
-        if (outgoingQueue.size < 30) {
-            outgoingQueue.offer(serialized)
+        if (outgoingQueue.none { it.id == messageId } && outgoingQueue.size < MAX_OUTGOING_QUEUE_SIZE) {
+            outgoingQueue.offer(QueuedTextMessage(messageId, serialized, System.currentTimeMillis()))
         }
-        if (lastApiKey.isNotBlank() && ws == null && !isConnecting && nonRetryableError == null) {
+        if (networkQuality != NetworkQualityState.OFFLINE &&
+            lastApiKey.isNotBlank() &&
+            ws == null &&
+            !isConnecting &&
+            nonRetryableError == null
+        ) {
             connect(lastApiKey, lastMode, lastAffectionName, lastVoice, lastLanguage)
         }
     }
 
     private fun flushQueue() {
         val ws = webSocket ?: return
+        val now = System.currentTimeMillis()
         while (outgoingQueue.isNotEmpty()) {
             val next = outgoingQueue.poll() ?: break
-            ws.send(next)
+            // Never replay stale user commands after a long disconnect
+            if ((now - next.enqueuedAtMs) > QUEUED_MESSAGE_TTL_MS) {
+                continue
+            }
+            ws.send(next.payload)
         }
     }
 
@@ -502,6 +577,9 @@ class ZoniLiveSessionClient(
         )
 
         private const val MAX_RECONNECT_ATTEMPTS = 5
+        private const val MAX_OUTGOING_QUEUE_SIZE = 16
+        private const val QUEUED_MESSAGE_TTL_MS = 12_000L
+        private const val DUPLICATE_MESSAGE_WINDOW_MS = 4_000L
         const val HEALTHY_SESSION_RESET_MS = 10_000L
 
         fun buildDirectSetupPayload(

@@ -44,13 +44,40 @@ data class CallSummaryEntity(
     val createdAtMs: Long = System.currentTimeMillis()
 )
 
-@Entity(tableName = "conversations")
+@Entity(
+    tableName = "conversations",
+    indices = [
+        Index(value = ["createdAtMs"], name = "index_conversations_createdAtMs"),
+        Index(value = ["role"], name = "index_conversations_role")
+    ]
+)
 data class ConversationEntity(
     @PrimaryKey val id: String,
     val role: String, // "user" | "assistant"
     val text: String,
     val language: String = "bn-BD",
     val createdAtMs: Long = System.currentTimeMillis()
+)
+
+@Entity(
+    tableName = "memory_entries",
+    indices = [
+        Index(value = ["factKey"], unique = true, name = "index_memory_entries_factKey"),
+        Index(value = ["category"], name = "index_memory_entries_category"),
+        Index(value = ["updatedAtMs"], name = "index_memory_entries_updatedAtMs")
+    ]
+)
+data class MemoryEntity(
+    @PrimaryKey val id: String,
+    val category: String, // "language" | "preference" | "personal_fact" | "frequent_command" | "context"
+    val factKey: String,
+    val valueEncrypted: String,
+    val isEncrypted: Boolean = true,
+    val searchKeywords: String = "",
+    val usageCount: Int = 1,
+    val userApproved: Boolean = true,
+    val createdAtMs: Long = System.currentTimeMillis(),
+    val updatedAtMs: Long = System.currentTimeMillis()
 )
 
 @Entity(tableName = "task_executions")

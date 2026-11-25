@@ -91,6 +91,18 @@ export interface NativeAndroidBridge {
   getGeminiApiKeyStatusJson?: () => string;
   getGeminiApiKeyForRequest?: () => string;
   openOnboardingWizard?: () => boolean;
+
+  // Local Conversation Memory & Encrypted Long-Term Memory (Room v2)
+  saveLocalConversationMessage?: (role: string, text: string, language: string) => boolean;
+  getLocalConversationHistoryJson?: (limit: number, offset: number) => string;
+  getLocalMemorySummaryJson?: () => string;
+  recallLocalMemoryJson?: (query: string, language: string) => string;
+  buildCompactMemoryContext?: (query: string) => string;
+  clearLocalConversationHistory?: () => boolean;
+  clearLocalLongTermMemory?: () => boolean;
+
+  // Network Quality Snapshot (Low-Internet Optimization)
+  getNetworkQualityJson?: () => string;
 }
 
 export type AndroidRuntimeMode =
@@ -1085,4 +1097,124 @@ export function getNativeGeminiApiKeyForRequest(): string {
     return '';
   }
 }
+
+// --- Native Room Local Conversation & Long-Term Memory Bridge Helpers ---
+
+export interface NativeNetworkQualitySnapshot {
+  quality: 'offline' | 'weak' | 'strong';
+  online: boolean;
+  weak: boolean;
+}
+
+export function saveLocalConversationMessageViaNativeBridge(
+  role: 'user' | 'assistant',
+  text: string,
+  language: string = 'bn-BD'
+): boolean | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.saveLocalConversationMessage) return null;
+  try {
+    return Boolean(bridge.saveLocalConversationMessage(role, text, language));
+  } catch {
+    return null;
+  }
+}
+
+export function getLocalConversationHistoryViaNativeBridge(
+  limit: number = 60,
+  offset: number = 0
+): Array<{ id: string; role: 'user' | 'assistant'; text: string; language: string; createdAtMs: number }> | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getLocalConversationHistoryJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.getLocalConversationHistoryJson(limit, offset));
+    return Array.isArray(parsed?.messages) ? parsed.messages : [];
+  } catch {
+    return null;
+  }
+}
+
+export function getLocalMemorySummaryViaNativeBridge(): {
+  conversationCount: number;
+  memoryCount: number;
+  encryptedAtRest: boolean;
+} | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getLocalMemorySummaryJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.getLocalMemorySummaryJson());
+    return {
+      conversationCount: Number(parsed?.conversationCount || 0),
+      memoryCount: Number(parsed?.memoryCount || 0),
+      encryptedAtRest: Boolean(parsed?.encryptedAtRest),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function recallLocalMemoryViaNativeBridge(
+  query: string,
+  language: string = 'bn-BD'
+): { isMemoryQuery: boolean; handledOffline: boolean; replyText: string } | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.recallLocalMemoryJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.recallLocalMemoryJson(query, language));
+    return {
+      isMemoryQuery: Boolean(parsed?.isMemoryQuery),
+      handledOffline: Boolean(parsed?.handledOffline),
+      replyText: String(parsed?.replyText || ''),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function buildCompactMemoryContextViaNativeBridge(query: string): string | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.buildCompactMemoryContext) return null;
+  try {
+    return String(bridge.buildCompactMemoryContext(query) || '');
+  } catch {
+    return null;
+  }
+}
+
+export function clearLocalConversationHistoryViaNativeBridge(): boolean | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.clearLocalConversationHistory) return null;
+  try {
+    return Boolean(bridge.clearLocalConversationHistory());
+  } catch {
+    return null;
+  }
+}
+
+export function clearLocalLongTermMemoryViaNativeBridge(): boolean | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.clearLocalLongTermMemory) return null;
+  try {
+    return Boolean(bridge.clearLocalLongTermMemory());
+  } catch {
+    return null;
+  }
+}
+
+export function getNativeNetworkQuality(): NativeNetworkQualitySnapshot | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getNetworkQualityJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.getNetworkQualityJson());
+    const q = parsed?.quality === 'offline' || parsed?.quality === 'weak' ? parsed.quality : 'strong';
+    return {
+      quality: q,
+      online: q !== 'offline',
+      weak: q === 'weak',
+    };
+  } catch {
+    return null;
+  }
+}
+
 

@@ -751,18 +751,21 @@ class DeviceActionExecutor(private val context: Context) {
         val cleanTarget = target.trim()
         val canUseVision = ScreenCaptureManager.isActive() && keyManager.hasApiKey()
 
-        // Visual-attribute queries ("red button", "লাল বাটন", "top right icon") try Vision+Revalidation first when active
-        if (index == null && canUseVision && VisualClickIntelligenceEngine.isVisualAttributeQuery(cleanTarget)) {
+        // Visual/spatial queries ("red button", "লাল বাটন", "ডান পাশের বাটন", "এই ছবিটা"):
+        // clickVisualTargetWithRevalidation runs on-device Accessibility-first spatial resolution BEFORE needing Vision pixels,
+        // so spatial directives work completely offline without screenshots!
+        if (index == null && ZoniAccessibilityService.isConnected() && VisualClickIntelligenceEngine.isVisualAttributeQuery(cleanTarget)) {
             val visualOutcome = ZoniAccessibilityService.clickVisualTargetWithRevalidation(
                 query = cleanTarget,
                 context = context,
-                apiKey = keyManager.getApiKey().orEmpty()
+                apiKey = if (canUseVision) keyManager.getApiKey().orEmpty() else ""
             )
             if (visualOutcome.success ||
                 visualOutcome.failureReason == "multiple_elements" ||
                 visualOutcome.failureReason == "sensitive_target_blocked" ||
                 visualOutcome.failureReason == "protected_banking_or_auth_screen" ||
-                visualOutcome.failureReason == "sensitive_screen_content"
+                visualOutcome.failureReason == "sensitive_screen_content" ||
+                visualOutcome.failureReason == "screen_changed_during_vision"
             ) {
                 return wrapAccessibilityResult(request, visualOutcome.toJson())
             }
@@ -1289,12 +1292,31 @@ class DeviceActionExecutor(private val context: Context) {
                 }
 
                 if (ZoniAccessibilityService.isConnected() && messageText.isNotBlank()) {
-                    val sendOutcome = ZoniAccessibilityService.sendApprovedWhatsAppMessage(
+                    var sendOutcome = ZoniAccessibilityService.sendApprovedWhatsAppMessage(
                         expectedRecipient = recipientName,
                         expectedPhone = phoneNumber,
                         expectedMessage = messageText,
                         pendingActionId = request.actionId
                     )
+                    // If wa.me landed on WhatsApp chat list instead of the chat header, try ONE safe in-app contact search fallback
+                    if (!sendOutcome.success &&
+                        (sendOutcome.failureReason == "recipient_verification_failed" ||
+                            sendOutcome.failureReason == "composer_not_found")
+                    ) {
+                        val contactClick = ZoniAccessibilityService.clickWhatsAppContact(
+                            contactQuery = recipientName,
+                            ordinalIndex = null,
+                            searchIfMissing = true
+                        )
+                        if (contactClick.success) {
+                            sendOutcome = ZoniAccessibilityService.sendApprovedWhatsAppMessage(
+                                expectedRecipient = recipientName,
+                                expectedPhone = phoneNumber,
+                                expectedMessage = messageText,
+                                pendingActionId = "${request.actionId}_retry"
+                            )
+                        }
+                    }
                     if (sendOutcome.success && sendOutcome.verified) {
                         return TypedActionResult(
                             actionId = request.actionId,
@@ -1311,16 +1333,25 @@ class DeviceActionExecutor(private val context: Context) {
                                 .put("messageText", messageText)
                         )
                     }
-                    if (sendOutcome.failureReason != "send_verification_failed") {
+                    val isUnverifiedAttempt = sendOutcome.failureReason == "send_verification_failed"
+                    if (!isUnverifiedAttempt) {
                         WhatsAppSendDeduplicator.releaseDirectSend("whatsapp", phoneNumber, messageText)
+                    }
+                    val honestStatus = when (sendOutcome.failureReason) {
+                        "send_verification_failed" -> "send_attempted_unverified"
+                        "send_button_not_found" -> "send_button_not_found"
+                        "send_click_rejected" -> "send_click_rejected"
+                        else -> "opened_whatsapp_draft_ready_to_send"
                     }
                     return TypedActionResult(
                         actionId = request.actionId,
                         actionType = actionType.toolName,
-                        success = sendOutcome.failureReason != "send_button_not_found" && sendOutcome.failureReason != "send_click_rejected",
+                        success = !isUnverifiedAttempt &&
+                            sendOutcome.failureReason != "send_button_not_found" &&
+                            sendOutcome.failureReason != "send_click_rejected",
                         verified = false,
-                        status = if (sendOutcome.failureReason == "send_button_not_found") "send_button_not_found" else "opened_whatsapp_draft_ready_to_send",
-                        executionStatus = sendOutcome.executionStatus.ifBlank { "opened_whatsapp_draft_ready_to_send" },
+                        status = honestStatus,
+                        executionStatus = honestStatus,
                         target = recipientName,
                         message = sendOutcome.message,
                         failureReason = sendOutcome.failureReason,
@@ -1329,7 +1360,32 @@ class DeviceActionExecutor(private val context: Context) {
                             .put("phoneNumber", phoneNumber)
                             .put("messageText", messageText)
                             .put("autoSendAttempted", true)
+                            .put("sentVerified", false)
                     )
+                }
+
+                // Use official Notification RemoteInput ONLY when Accessibility is unavailable AND an active replyable WhatsApp notification exists
+                if (!ZoniAccessibilityService.isConnected() && messageText.isNotBlank()) {
+                    val replyKey = ZoniNotificationListenerService.findReplyableWhatsAppNotificationKey(recipientName)
+                    if (!replyKey.isNullOrBlank() &&
+                        ZoniNotificationListenerService.sendReply(context, replyKey, messageText)
+                    ) {
+                        return TypedActionResult(
+                            actionId = request.actionId,
+                            actionType = actionType.toolName,
+                            success = true,
+                            verified = true,
+                            status = "whatsapp_replied_via_notification",
+                            executionStatus = "whatsapp_replied_via_notification",
+                            target = recipientName,
+                            message = "Replied to $recipientName's active WhatsApp notification directly via Android Notification RemoteInput.",
+                            data = JSONObject()
+                                .put("contactName", recipientName)
+                                .put("phoneNumber", phoneNumber)
+                                .put("messageText", messageText)
+                                .put("method", "notification_remote_input")
+                        )
+                    }
                 }
 
                 if (messageText.isNotBlank()) {

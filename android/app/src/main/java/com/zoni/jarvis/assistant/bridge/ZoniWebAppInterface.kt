@@ -8,7 +8,10 @@ import android.webkit.JavascriptInterface
 import com.zoni.jarvis.assistant.BuildConfig
 import com.zoni.jarvis.assistant.calling.SimCallManager
 import com.zoni.jarvis.assistant.data.SecureKeyManager
+import com.zoni.jarvis.assistant.db.LocalMemoryRepository
+import com.zoni.jarvis.assistant.db.ZoniDatabase
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
+import com.zoni.jarvis.assistant.network.NetworkQualityMonitor
 import com.zoni.jarvis.assistant.screen.ScreenCaptureManager
 import com.zoni.jarvis.assistant.service.AutoReplyRuleManager
 import com.zoni.jarvis.assistant.service.FloatingOrbService
@@ -16,6 +19,7 @@ import com.zoni.jarvis.assistant.service.ZoniAccessibilityService
 import com.zoni.jarvis.assistant.service.ZoniNotificationListenerService
 import com.zoni.jarvis.assistant.ui.onboarding.OnboardingActivity
 import kotlinx.coroutines.runBlocking
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -37,6 +41,9 @@ class ZoniWebAppInterface(
     private val onRequestCallControlRole: (() -> Unit)? = null
 ) {
     private val preferences by lazy { com.zoni.jarvis.assistant.data.ZoniPreferences(context.applicationContext) }
+    private val localMemoryRepo by lazy {
+        LocalMemoryRepository(ZoniDatabase.getInstance(context.applicationContext), keyManager)
+    }
 
     // --- Typed Allowlisted Action Engine (36 tools) ---
 
@@ -349,6 +356,18 @@ class ZoniWebAppInterface(
 
     @JavascriptInterface
     fun captureScreenFrameJson(): String {
+        // Strict privacy guard: NEVER capture pixels on banking, payment, OTP, or password screens
+        val (isProtected, blockReason) = ZoniAccessibilityService.isCurrentScreenProtected()
+        if (isProtected) {
+            return JSONObject()
+                .put("success", false)
+                .put("base64Jpeg", "")
+                .put("width", 0)
+                .put("height", 0)
+                .put("blockedSensitive", true)
+                .put("error", blockReason.ifBlank { "Blocked screen capture on protected banking, payment, or password screen." })
+                .toString()
+        }
         val res = ScreenCaptureManager.captureSingleFrameBase64(context)
         return JSONObject()
             .put("success", res.success)
@@ -511,6 +530,82 @@ class ZoniWebAppInterface(
             .put("accessibilityEnabled", snap.accessibilityEnabled)
             .put("defaultAssistant", snap.defaultAssistant)
             .put("screenCaptureActive", ScreenCaptureManager.isActive())
+            .toString()
+    }
+
+    // --- Local Conversation Memory & Encrypted Long-Term Memory (Room ZoniDatabase v2) ---
+
+    @JavascriptInterface
+    fun saveLocalConversationMessage(role: String, text: String, language: String): Boolean = runBlocking {
+        localMemoryRepo.saveMessage(
+            role = role.ifBlank { "user" },
+            text = text,
+            language = language.ifBlank { "bn-BD" }
+        )
+    }
+
+    @JavascriptInterface
+    fun getLocalConversationHistoryJson(limit: Int, offset: Int): String = runBlocking {
+        val rows = localMemoryRepo.loadRecentConversations(limit.coerceIn(1, 200), offset.coerceAtLeast(0))
+        val arr = JSONArray()
+        rows.forEach { row ->
+            arr.put(
+                JSONObject()
+                    .put("id", row.id)
+                    .put("role", row.role)
+                    .put("text", row.text)
+                    .put("language", row.language)
+                    .put("createdAtMs", row.createdAtMs)
+            )
+        }
+        JSONObject()
+            .put("success", true)
+            .put("count", rows.size)
+            .put("messages", arr)
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun getLocalMemorySummaryJson(): String = runBlocking {
+        localMemoryRepo.getMemorySummaryJson(40)
+    }
+
+    @JavascriptInterface
+    fun recallLocalMemoryJson(query: String, language: String): String = runBlocking {
+        val res = localMemoryRepo.tryLocalMemoryRecall(query, language.ifBlank { "bn-BD" })
+        JSONObject()
+            .put("isMemoryQuery", res.isMemoryQuery)
+            .put("handledOffline", res.handledOffline)
+            .put("replyText", res.replyText)
+            .put("matchedFactCount", res.matchedFacts.size)
+            .put("matchedMessageCount", res.matchedMessages.size)
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun buildCompactMemoryContext(query: String): String = runBlocking {
+        localMemoryRepo.buildCompactContextForQuery(query)
+    }
+
+    @JavascriptInterface
+    fun clearLocalConversationHistory(): Boolean = runBlocking {
+        localMemoryRepo.clearConversationHistory()
+    }
+
+    @JavascriptInterface
+    fun clearLocalLongTermMemory(): Boolean = runBlocking {
+        localMemoryRepo.clearLongTermMemory()
+    }
+
+    // --- Network Quality Snapshot (Low-Internet Optimization) ---
+
+    @JavascriptInterface
+    fun getNetworkQualityJson(): String {
+        val state = NetworkQualityMonitor.snapshotQuality(context)
+        return JSONObject()
+            .put("quality", state.name.lowercase())
+            .put("online", state != com.zoni.jarvis.assistant.network.NetworkQualityState.OFFLINE)
+            .put("weak", state == com.zoni.jarvis.assistant.network.NetworkQualityState.WEAK)
             .toString()
     }
 

@@ -35,7 +35,53 @@ interface ConversationDao {
     @Query("SELECT * FROM conversations ORDER BY createdAtMs ASC LIMIT :limit")
     suspend fun getMessages(limit: Int = 200): List<ConversationEntity>
 
+    @Query("SELECT * FROM conversations ORDER BY createdAtMs DESC LIMIT :limit OFFSET :offset")
+    suspend fun getRecentMessagesPaged(limit: Int = 50, offset: Int = 0): List<ConversationEntity>
+
+    @Query("SELECT * FROM conversations WHERE text LIKE '%' || :query || '%' ORDER BY createdAtMs DESC LIMIT :limit")
+    suspend fun searchMessages(query: String, limit: Int = 20): List<ConversationEntity>
+
+    @Query("SELECT COUNT(*) FROM conversations")
+    suspend fun getMessageCount(): Int
+
+    @Query(
+        "DELETE FROM conversations WHERE id NOT IN (" +
+            "SELECT id FROM conversations ORDER BY createdAtMs DESC LIMIT :maxRows" +
+            ")"
+    )
+    suspend fun pruneToRecent(maxRows: Int = 500)
+
     @Query("DELETE FROM conversations")
+    suspend fun clearAll()
+}
+
+@Dao
+interface MemoryDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertMemory(entry: MemoryEntity)
+
+    @Query("SELECT * FROM memory_entries WHERE factKey = :factKey LIMIT 1")
+    suspend fun findByFactKey(factKey: String): MemoryEntity?
+
+    @Query("SELECT * FROM memory_entries WHERE userApproved = 1 ORDER BY usageCount DESC, updatedAtMs DESC LIMIT :limit")
+    suspend fun getTopMemories(limit: Int = 50): List<MemoryEntity>
+
+    @Query("SELECT * FROM memory_entries WHERE category = :category AND userApproved = 1 ORDER BY usageCount DESC, updatedAtMs DESC LIMIT :limit")
+    suspend fun getByCategory(category: String, limit: Int = 30): List<MemoryEntity>
+
+    @Query("SELECT * FROM memory_entries WHERE searchKeywords LIKE '%' || :keyword || '%' AND userApproved = 1 ORDER BY usageCount DESC, updatedAtMs DESC LIMIT :limit")
+    suspend fun searchByKeyword(keyword: String, limit: Int = 20): List<MemoryEntity>
+
+    @Query("DELETE FROM memory_entries WHERE factKey = :factKey")
+    suspend fun deleteByFactKey(factKey: String)
+
+    @Query("DELETE FROM memory_entries WHERE category = :category")
+    suspend fun deleteByCategory(category: String)
+
+    @Query("SELECT COUNT(*) FROM memory_entries")
+    suspend fun getMemoryCount(): Int
+
+    @Query("DELETE FROM memory_entries")
     suspend fun clearAll()
 }
 

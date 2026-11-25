@@ -4,7 +4,10 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import com.zoni.jarvis.assistant.data.SecureKeyManager
 import com.zoni.jarvis.assistant.data.ZoniPreferences
+import com.zoni.jarvis.assistant.db.LocalMemoryRepository
+import com.zoni.jarvis.assistant.db.ZoniDatabase
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
 
 class ZoniApplication : Application() {
@@ -14,6 +17,14 @@ class ZoniApplication : Application() {
 
     lateinit var hardwareController: AndroidHardwareController
         private set
+
+    val database: ZoniDatabase by lazy {
+        ZoniDatabase.getInstance(this)
+    }
+
+    val localMemoryRepository: LocalMemoryRepository by lazy {
+        LocalMemoryRepository(database, SecureKeyManager(this))
+    }
 
     override fun onCreate() {
         super.onCreate()

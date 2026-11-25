@@ -69,9 +69,18 @@ import {
   parseDirectLiveServerMessage,
   sendDirectGeminiChat,
   sendDirectGeminiToolFeedback,
+  shouldDropLiveAudioForBackpressure,
   synthesizeDirectGeminiTts,
   verifyDirectGeminiApiKey,
 } from './utils/geminiDirectClient';
+import {
+  clearAllLocalConversationHistory,
+  clearAllLocalLongTermMemory,
+  getCompactLocalMemoryContext,
+  loadLocalConversationHistory,
+  persistLocalConversationTurn,
+  tryOfflineLocalMemoryRecall,
+} from './utils/localMemory';
 import {
   getNativeAndroidBridge,
   detectAndroidRuntimeMode,
@@ -526,6 +535,19 @@ export default function App() {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('zoni_selected_affection_name');
       if (saved && saved.trim()) initialName = saved.trim();
+      const restored = loadLocalConversationHistory(60, 0);
+      if (restored.length > 0) {
+        return restored.map((row) => ({
+          id: row.id,
+          role: row.role,
+          text: row.text,
+          timestamp: new Date(row.createdAtMs || Date.now()),
+          lang:
+            row.language === 'en-US' || row.language === 'hi-IN' || row.language === 'bn-BD'
+              ? row.language
+              : 'bn-BD',
+        }));
+      }
     }
     return [
       {
@@ -537,6 +559,18 @@ export default function App() {
       },
     ];
   });
+
+  // Persist finalized conversation messages locally (Room v2 on Android APK, localStorage on web)
+  const persistedMessageIdsRef = useRef<Set<string>>(new Set(messages.map((m) => m.id)));
+  useEffect(() => {
+    for (const msg of messages) {
+      if (!msg.id || msg.id === 'welcome-1' || msg.id.startsWith('live-')) continue;
+      if (persistedMessageIdsRef.current.has(msg.id)) continue;
+      if (!msg.text || !msg.text.trim()) continue;
+      persistedMessageIdsRef.current.add(msg.id);
+      persistLocalConversationTurn(msg.role, msg.text, msg.lang || 'bn-BD');
+    }
+  }, [messages]);
 
   // Shared WebSocket & Audio refs (using useRef to avoid stale closures inside callbacks)
   const liveAudioPlayerRef = useRef<LiveAudioPlayer | null>(null);
@@ -1782,6 +1816,7 @@ export default function App() {
         let finalReply = '';
 
         if (userApiKey) {
+          const compactMemory = getCompactLocalMemoryContext(cleanText);
           const directRes = await sendDirectGeminiChat({
             apiKey: userApiKey,
             message: cleanText,
@@ -1790,6 +1825,7 @@ export default function App() {
             selectedAffectionName: selectedAffectionNameRef.current,
             lang: activeLanguageRef.current,
             preferredModel: preferredChatModelRef.current,
+            memoryContext: compactMemory || undefined,
           });
           serverToolCalls = directRes.toolCalls;
           finalReply = directRes.reply.trim();
@@ -3340,10 +3376,16 @@ export default function App() {
           const pcm16k = resampleFloat32Pcm(rawChannelData, actualSampleRate, 16000);
           const base64Audio = pcm16ToBase64(pcm16k);
           try {
-            if (liveTransportModeRef.current === 'byok_direct') {
-              wsRef.current.send(JSON.stringify(buildDirectLiveAudioMessage(base64Audio)));
-            } else {
-              wsRef.current.send(JSON.stringify({ audio: base64Audio }));
+            const weakNet =
+              typeof navigator !== 'undefined' &&
+              Boolean((navigator as any).connection?.effectiveType) &&
+              ['slow-2g', '2g', '3g'].includes(String((navigator as any).connection.effectiveType));
+            if (!shouldDropLiveAudioForBackpressure(wsRef.current.bufferedAmount || 0, weakNet)) {
+              if (liveTransportModeRef.current === 'byok_direct') {
+                wsRef.current.send(JSON.stringify(buildDirectLiveAudioMessage(base64Audio)));
+              } else {
+                wsRef.current.send(JSON.stringify({ audio: base64Audio }));
+              }
             }
 
             const frameDurationMs = (pcm16k.length / 16000) * 1000;
@@ -3772,6 +3814,45 @@ export default function App() {
 
       // Advance user speech turn counter so any subsequent voice speech appears after this message
       userSpeechTurnIdRef.current += 1;
+
+      // 3b. Local-first offline memory clear & recall (instant, zero Gemini wait)
+      const lowerClearCmd = cleanText.toLowerCase();
+      if (
+        lowerClearCmd === 'clear memory' ||
+        lowerClearCmd === 'clear long term memory' ||
+        lowerClearCmd.includes('মেমোরি ক্লিয়ার') ||
+        lowerClearCmd.includes('মেমোরি মুছে দাও')
+      ) {
+        clearAllLocalLongTermMemory();
+        const clearedMsg =
+          activeLanguage === 'bn-BD'
+            ? 'লোকাল লং-টার্ম মেমোরি নিরাপদে মুছে ফেলা হয়েছে।'
+            : 'Local long-term memory has been cleared safely.';
+        setMessages((prev) => [
+          ...prev,
+          { id: `${clientMsgId}-memclr`, role: 'assistant', text: clearedMsg, timestamp: new Date(), lang: activeLanguage },
+        ]);
+        setLatestTranscript(clearedMsg);
+        setAssistantState('idle');
+        return;
+      }
+
+      const localMemoryRecall = tryOfflineLocalMemoryRecall(cleanText, activeLanguage);
+      if (localMemoryRecall.handledOffline && localMemoryRecall.replyText) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${clientMsgId}-memrecall`,
+            role: 'assistant',
+            text: localMemoryRecall.replyText,
+            timestamp: new Date(),
+            lang: activeLanguage,
+          },
+        ]);
+        setLatestTranscript(localMemoryRecall.replyText);
+        setAssistantState('idle');
+        return;
+      }
 
       // Unlock audio context on user submit gesture so Gemini Live audio response plays seamlessly
       getAudioContext();
@@ -4405,7 +4486,10 @@ export default function App() {
         onClose={() => setIsChatDrawerOpen(false)}
         messages={messages}
         onReplayAudio={handleReplayAudio}
-        onClearMessages={() => setMessages([])}
+        onClearMessages={() => {
+          setMessages([]);
+          clearAllLocalConversationHistory();
+        }}
         selectedAffectionName={selectedAffectionName}
         userNickname={selectedAffectionName}
       />

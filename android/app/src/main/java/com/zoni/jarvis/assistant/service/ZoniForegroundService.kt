@@ -26,6 +26,7 @@ import com.zoni.jarvis.assistant.ui.MainActivity
 import com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState
 import com.zoni.jarvis.assistant.wakeword.WakeWordConfig
 import com.zoni.jarvis.assistant.wakeword.WakeWordDetectionEvent
+import com.zoni.jarvis.assistant.wakeword.WakeWordLifecycleGuard
 import com.zoni.jarvis.assistant.wakeword.WakeWordStatusSnapshot
 import com.zoni.jarvis.assistant.wakeword.ZoniWakeWordEngine
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -57,6 +58,8 @@ class ZoniForegroundService : Service() {
     private val serviceHandler = Handler(Looper.getMainLooper())
     private var wakeLockRenewRunnable: Runnable? = null
     private var activationRecoveryRunnable: Runnable? = null
+    @Volatile
+    private var lastAcceptedWakeAtMs: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -205,7 +208,16 @@ class ZoniForegroundService : Service() {
         }
     }
 
+    @Synchronized
     private fun handleWakeWordDetected(event: WakeWordDetectionEvent) {
+        val currentState = _statusFlow.value.voiceState
+        val nowMs = System.currentTimeMillis()
+        if (!WakeWordLifecycleGuard.shouldAcceptWakeTrigger(currentState, lastAcceptedWakeAtMs, nowMs)) {
+            Log.d(TAG, "Ignoring duplicate/overlapping wake trigger while voiceState=$currentState")
+            return
+        }
+        lastAcceptedWakeAtMs = nowMs
+        releaseWakeLock()
         Log.i(TAG, "ZONI wake word triggered: ${event.matchedVariant} (${event.confidence})")
         updateSnapshot(
             listening = false,

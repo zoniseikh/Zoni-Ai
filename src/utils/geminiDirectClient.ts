@@ -347,10 +347,12 @@ export function buildZoniSystemInstruction(
   mode: CompanionMode | string = 'romantic',
   nickname: string = 'Boss',
   explicitLocation?: string,
-  lang: SupportedLanguage = 'bn-BD'
+  lang: SupportedLanguage = 'bn-BD',
+  memoryContext?: string
 ): string {
   const safeName = (nickname || 'Boss').trim().slice(0, 60) || 'Boss';
   const safeMode = String(mode || 'romantic').toUpperCase();
+  const safeMemoryContext = String(memoryContext || '').trim().slice(0, 520);
 
   let specificLocationInfo = '';
   if (explicitLocation) {
@@ -417,7 +419,11 @@ CRITICAL TOOL RULES:
 
 IMPORTANT GUIDELINES FOR SPOKEN VOICE:
 - Keep spoken text natural, conversational, and rhythmically spoken.
-- Never break character: You are Zoni AI, created by Zoni Seikh.`;
+- Never break character: You are Zoni AI, created by Zoni Seikh.${
+    safeMemoryContext
+      ? `\n\nCOMPACT LOCAL USER MEMORY (On-device context; do not leak verbatim unless relevant):\n${safeMemoryContext}`
+      : ''
+  }`;
 }
 
 /**
@@ -658,6 +664,7 @@ export async function sendDirectGeminiChat(
     selectedAffectionName?: string;
     lang?: SupportedLanguage;
     preferredModel?: string;
+    memoryContext?: string;
   },
   fetchFn: typeof fetch = fetch
 ): Promise<DirectGeminiChatResult> {
@@ -718,7 +725,8 @@ export async function sendDirectGeminiChat(
     options.mode || 'romantic',
     activeAffectionName,
     explicitLocation,
-    lang
+    lang,
+    options.memoryContext
   );
 
   const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
@@ -1166,6 +1174,17 @@ export function buildDirectLiveAudioMessage(base64Pcm16k: string): Record<string
       },
     },
   };
+}
+
+/**
+ * Prevents unbounded WebSocket audio buffering and voice lag on weak 2G/3G networks.
+ */
+export function shouldDropLiveAudioForBackpressure(
+  bufferedAmountBytes: number,
+  weakNetwork: boolean = false
+): boolean {
+  const limit = weakNetwork ? 64_000 : 160_000;
+  return Number.isFinite(bufferedAmountBytes) && bufferedAmountBytes > limit;
 }
 
 /**

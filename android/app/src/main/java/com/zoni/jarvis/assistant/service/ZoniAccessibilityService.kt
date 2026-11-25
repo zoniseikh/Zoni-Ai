@@ -242,7 +242,11 @@ class ZoniAccessibilityService : AccessibilityService() {
         )
     }
 
-    fun tapElementByTextDetailed(targetText: String, ordinalIndex: Int? = null): AccessibilityActionOutcome {
+    fun tapElementByTextDetailed(
+        targetText: String,
+        ordinalIndex: Int? = null,
+        skipDedup: Boolean = false
+    ): AccessibilityActionOutcome {
         val query = targetText.trim()
         if (query.isEmpty()) {
             return AccessibilityActionOutcome(
@@ -275,6 +279,19 @@ class ZoniAccessibilityService : AccessibilityService() {
         )
         val activePkg = root.packageName?.toString().orEmpty()
         checkScreenSafety(root, "tap_visible_element")?.let { return it }
+
+        if (!skipDedup && !UiActionDeduplicator.tryAcquire(activePkg, "tap_visible_element", "$query#${ordinalIndex ?: 0}")) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "tap_visible_element",
+                activePackage = activePkg,
+                message = "Prevented accidental duplicate tap on \"$query\".",
+                failureReason = "duplicate_tap_prevented",
+                target = query,
+                executionStatus = "duplicate_blocked"
+            )
+        }
 
         val beforeLabels = collectVisibleLabels(root, 40)
 
@@ -317,6 +334,9 @@ class ZoniAccessibilityService : AccessibilityService() {
                 val cand = res.candidate
                 val liveMatch = nodeMap[cand.matchNode.nodeId]
                 val liveClickable = cand.clickableNode?.let { nodeMap[it.nodeId] }
+                // Pre-click live revalidation for dynamic layouts
+                liveMatch?.refresh()
+                liveClickable?.refresh()
                 if (liveMatch?.isPassword == true || liveClickable?.isPassword == true) {
                     return AccessibilityActionOutcome(
                         success = false,
@@ -325,6 +345,19 @@ class ZoniAccessibilityService : AccessibilityService() {
                         activePackage = activePkg,
                         message = "Blocked tapping a password field for security.",
                         failureReason = "password_field_blocked"
+                    )
+                }
+                val stillVisible = (liveMatch?.isVisibleToUser != false) && (liveClickable?.isVisibleToUser != false)
+                val stillEnabled = (liveMatch?.isEnabled != false) && (liveClickable?.isEnabled != false)
+                if (!stillVisible || !stillEnabled) {
+                    return AccessibilityActionOutcome(
+                        success = false,
+                        verified = false,
+                        actionType = "tap_visible_element",
+                        activePackage = activePkg,
+                        message = "Element \"${cand.label}\" moved or became unavailable before clicking.",
+                        failureReason = "element_changed_before_click",
+                        target = cand.label
                     )
                 }
                 val clickStartMs = System.currentTimeMillis()
@@ -1328,7 +1361,13 @@ class ZoniAccessibilityService : AccessibilityService() {
         }
         // Route Facebook visible controls (Like, Comment, Share, Menu, Notifications, Search, tabs) to FacebookUiControlEngine
         if (FacebookUiControlEngine.isFacebookPackage(activePkg)) {
-            return clickFacebookControl(targetText, index)
+            val fbOutcome = clickFacebookControl(targetText, index)
+            if (fbOutcome.success || fbOutcome.failureReason != "facebook_control_not_found") {
+                return fbOutcome
+            }
+            // Fall back to universal Accessibility matching for custom Facebook labels/posts
+            return tapElementByTextDetailed(targetText, index, skipDedup = true)
+                .copy(actionType = "click_visible_element", target = targetText)
         }
         if (!UiActionDeduplicator.tryAcquire(activePkg, "click_visible_element", "$targetText#${index ?: 0}")) {
             return AccessibilityActionOutcome(
@@ -1342,7 +1381,8 @@ class ZoniAccessibilityService : AccessibilityService() {
                 executionStatus = "duplicate_blocked"
             )
         }
-        return tapElementByTextDetailed(targetText, index).copy(actionType = "click_visible_element", target = targetText)
+        return tapElementByTextDetailed(targetText, index, skipDedup = true)
+            .copy(actionType = "click_visible_element", target = targetText)
     }
 
     // ========================================================================
@@ -1404,45 +1444,6 @@ class ZoniAccessibilityService : AccessibilityService() {
             )
         }
 
-        // 2. Require active user-authorized MediaProjection screen capture + user's BYOK Gemini API key
-        if (!ScreenCaptureManager.isActive()) {
-            return AccessibilityActionOutcome(
-                success = false,
-                verified = true,
-                actionType = "click_visual_element",
-                activePackage = activePkg,
-                message = "Screen awareness (MediaProjection) is not enabled. Enable Screen Awareness to click unlabeled visual elements.",
-                failureReason = "screen_capture_not_active",
-                target = cleanQuery,
-                executionStatus = "permission_missing"
-            )
-        }
-        if (apiKey.isBlank()) {
-            return AccessibilityActionOutcome(
-                success = false,
-                verified = true,
-                actionType = "click_visual_element",
-                activePackage = activePkg,
-                message = "Gemini API Key is required for visual screen recognition. Add your key in Settings.",
-                failureReason = "gemini_api_key_missing",
-                target = cleanQuery
-            )
-        }
-
-        // 3. Capture ONE on-demand screen frame
-        val frame = ScreenCaptureManager.captureSingleFrameBase64(context)
-        if (!frame.success || frame.base64Jpeg.isBlank()) {
-            return AccessibilityActionOutcome(
-                success = false,
-                verified = true,
-                actionType = "click_visual_element",
-                activePackage = activePkg,
-                message = frame.error.ifBlank { "Could not capture the current screen frame for visual recognition." },
-                failureReason = "screen_capture_failed",
-                target = cleanQuery
-            )
-        }
-
         val (screenW, screenH) = try {
             val wm = context.getSystemService(Context.WINDOW_SERVICE) as? android.view.WindowManager
             if (wm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -1462,41 +1463,174 @@ class ZoniAccessibilityService : AccessibilityService() {
             metrics.widthPixels.coerceAtLeast(360) to metrics.heightPixels.coerceAtLeast(640)
         }
         val beforeLabels = collectVisibleLabels(rootBefore, 40)
+        val windowStateBeforeMs = lastWindowStateChangeMs
+        val (beforeSnapshots, beforeNodeMap) = captureNodeSnapshotTree(rootBefore)
 
-        // 4. Ask Gemini Vision (`gemini-2.5-flash`) to localize the exact visual target
-        val visionResult = GeminiRepository.locateVisualTargetOnScreenBlocking(
-            apiKey = apiKey,
-            base64Jpeg = frame.base64Jpeg,
-            userQuery = cleanQuery,
+        // 2. Accessibility-first spatial & role resolution (zero screenshot, zero network, works offline!)
+        val spatialPlan = VisualClickIntelligenceEngine.resolveSpatialAccessibilityTarget(
+            nodes = beforeSnapshots,
+            rawQuery = cleanQuery,
             screenWidth = screenW,
-            screenHeight = screenH,
-            visibleLabelsHint = beforeLabels
+            screenHeight = screenH
         )
-        val rawVisionJson = when (visionResult) {
-            is GeminiResult.Success -> visionResult.text
-            is GeminiResult.NetworkError -> return AccessibilityActionOutcome(
+        when (spatialPlan) {
+            is VisualClickPlan.BlockedSensitive -> return AccessibilityActionOutcome(
                 success = false,
-                verified = false,
+                verified = true,
                 actionType = "click_visual_element",
                 activePackage = activePkg,
-                message = visionResult.message,
-                failureReason = "vision_network_error",
-                target = cleanQuery
+                message = spatialPlan.reason,
+                failureReason = "sensitive_target_blocked",
+                target = cleanQuery,
+                executionStatus = "blocked_sensitive"
             )
-            is GeminiResult.GenericError -> return AccessibilityActionOutcome(
-                success = false,
-                verified = false,
-                actionType = "click_visual_element",
-                activePackage = activePkg,
-                message = visionResult.message,
-                failureReason = "vision_api_error",
-                target = cleanQuery
-            )
+            is VisualClickPlan.ClarifyAmbiguous -> {
+                val arr = JSONArray()
+                spatialPlan.options.forEachIndexed { idx, opt ->
+                    arr.put(JSONObject().put("index", idx + 1).put("label", opt))
+                }
+                return AccessibilityActionOutcome(
+                    success = false,
+                    verified = true,
+                    actionType = "click_visual_element",
+                    activePackage = activePkg,
+                    message = spatialPlan.reason,
+                    failureReason = "multiple_elements",
+                    target = cleanQuery,
+                    executionStatus = "multiple_elements",
+                    data = JSONObject().put("candidates", arr)
+                )
+            }
+            is VisualClickPlan.ClickAccessibilityNode -> {
+                val liveMatch = beforeNodeMap[spatialPlan.matchNode.nodeId]
+                val liveClickable = spatialPlan.clickableAncestor?.let { beforeNodeMap[it.nodeId] }
+                liveMatch?.refresh()
+                liveClickable?.refresh()
+                val clickStartMs = System.currentTimeMillis()
+                val (clicked, method) = performSmartClickOnResolvedTarget(
+                    liveMatch,
+                    liveClickable,
+                    spatialPlan.resolvedBounds
+                )
+                if (clicked) {
+                    val eventObserved = waitForUiTransitionEvent(clickStartMs, maxWaitMs = 750L)
+                    val afterRoot = rootInActiveWindow
+                    val afterSnapshots = if (afterRoot != null) captureNodeSnapshotTree(afterRoot, 160).first else emptyList()
+                    val verification = UniversalUiAutomationEngine.verifyClickOutcome(
+                        beforeLabels = beforeLabels,
+                        afterNodes = afterSnapshots,
+                        clickedLabel = spatialPlan.label,
+                        accessibilityEventObserved = eventObserved
+                    )
+                    return AccessibilityActionOutcome(
+                        success = true,
+                        verified = verification.stateChanged,
+                        actionType = "click_visual_element",
+                        activePackage = afterRoot?.packageName?.toString().orEmpty().ifBlank { activePkg },
+                        message = verification.evidence,
+                        target = spatialPlan.label,
+                        executionStatus = verification.status,
+                        data = JSONObject()
+                            .put("method", "accessibility_spatial_$method")
+                            .put("confidence", spatialPlan.confidence.toDouble())
+                            .put("target", spatialPlan.label)
+                            .put("stateChanged", verification.stateChanged)
+                    )
+                }
+            }
+            else -> {
+                // Fall through to Gemini Vision when color/unlabeled pixel understanding is required
+            }
         }
 
-        val proposal = VisualClickIntelligenceEngine.parseGeminiVisionTargetJson(rawVisionJson, screenW, screenH)
+        // 3. Check unchanged-screen visual fingerprint cache before capturing or uploading any screenshot
+        val screenFingerprint = VisualScreenFingerprintCache.buildScreenFingerprint(
+            activePackage = activePkg,
+            lastWindowStateChangeMs = lastWindowStateChangeMs,
+            lastWindowContentChangeMs = lastWindowContentChangeMs,
+            visibleLabels = beforeLabels
+        )
+        val cachedProposal = VisualScreenFingerprintCache.get(screenFingerprint, cleanQuery)
 
-        // 5. Re-capture LIVE Accessibility tree & re-verify safety right before clicking
+        val proposal = if (cachedProposal != null) {
+            cachedProposal
+        } else {
+            // Require active user-authorized MediaProjection screen capture + user's BYOK Gemini API key
+            if (!ScreenCaptureManager.isActive()) {
+                return AccessibilityActionOutcome(
+                    success = false,
+                    verified = true,
+                    actionType = "click_visual_element",
+                    activePackage = activePkg,
+                    message = "Screen awareness (MediaProjection) is not enabled. Enable Screen Awareness to click unlabeled visual elements.",
+                    failureReason = "screen_capture_not_active",
+                    target = cleanQuery,
+                    executionStatus = "permission_missing"
+                )
+            }
+            if (apiKey.isBlank()) {
+                return AccessibilityActionOutcome(
+                    success = false,
+                    verified = true,
+                    actionType = "click_visual_element",
+                    activePackage = activePkg,
+                    message = "Gemini API Key is required for visual screen recognition. Add your key in Settings.",
+                    failureReason = "gemini_api_key_missing",
+                    target = cleanQuery
+                )
+            }
+
+            // Capture ONE on-demand screen frame
+            val frame = ScreenCaptureManager.captureSingleFrameBase64(context)
+            if (!frame.success || frame.base64Jpeg.isBlank()) {
+                return AccessibilityActionOutcome(
+                    success = false,
+                    verified = true,
+                    actionType = "click_visual_element",
+                    activePackage = activePkg,
+                    message = frame.error.ifBlank { "Could not capture the current screen frame for visual recognition." },
+                    failureReason = "screen_capture_failed",
+                    target = cleanQuery
+                )
+            }
+
+            // Ask Gemini Vision (`gemini-2.5-flash`) to localize the exact visual target
+            val visionResult = GeminiRepository.locateVisualTargetOnScreenBlocking(
+                apiKey = apiKey,
+                base64Jpeg = frame.base64Jpeg,
+                userQuery = cleanQuery,
+                screenWidth = screenW,
+                screenHeight = screenH,
+                visibleLabelsHint = beforeLabels
+            )
+            val rawVisionJson = when (visionResult) {
+                is GeminiResult.Success -> visionResult.text
+                is GeminiResult.NetworkError -> return AccessibilityActionOutcome(
+                    success = false,
+                    verified = false,
+                    actionType = "click_visual_element",
+                    activePackage = activePkg,
+                    message = visionResult.message,
+                    failureReason = "vision_network_error",
+                    target = cleanQuery
+                )
+                is GeminiResult.GenericError -> return AccessibilityActionOutcome(
+                    success = false,
+                    verified = false,
+                    actionType = "click_visual_element",
+                    activePackage = activePkg,
+                    message = visionResult.message,
+                    failureReason = "vision_api_error",
+                    target = cleanQuery
+                )
+            }
+
+            VisualClickIntelligenceEngine.parseGeminiVisionTargetJson(rawVisionJson, screenW, screenH).also { parsed ->
+                VisualScreenFingerprintCache.put(screenFingerprint, cleanQuery, parsed)
+            }
+        }
+
+        // 5. Re-capture LIVE Accessibility tree & re-verify screen continuity + safety right before clicking
         val liveRoot = rootInActiveWindow ?: return AccessibilityActionOutcome(
             success = false,
             verified = false,
@@ -1506,6 +1640,20 @@ class ZoniAccessibilityService : AccessibilityService() {
             failureReason = "no_active_window",
             target = cleanQuery
         )
+        val livePkg = liveRoot.packageName?.toString().orEmpty()
+        if ((livePkg.isNotBlank() && !livePkg.equals(activePkg, ignoreCase = true)) ||
+            lastWindowStateChangeMs > windowStateBeforeMs
+        ) {
+            return AccessibilityActionOutcome(
+                success = false,
+                verified = true,
+                actionType = "click_visual_element",
+                activePackage = livePkg.ifBlank { activePkg },
+                message = "The active screen changed while identifying \"$cleanQuery\", so Zoni stopped safely instead of clicking a stale target.",
+                failureReason = "screen_changed_during_vision",
+                target = cleanQuery
+            )
+        }
         checkScreenSafety(liveRoot, "click_visual_element")?.let { return it }
         val (liveSnapshots, liveNodeMap) = captureNodeSnapshotTree(liveRoot)
 
@@ -2649,6 +2797,25 @@ class ZoniAccessibilityService : AccessibilityService() {
         private var lastWindowContentChangeMs: Long = 0L
 
         fun isConnected(): Boolean = instance != null
+
+        /**
+         * Checks whether the currently visible screen belongs to a protected banking/payment/auth app
+         * or contains sensitive password/OTP/card content so screen capture is strictly blocked.
+         */
+        fun isCurrentScreenProtected(): Pair<Boolean, String> {
+            val svc = instance ?: return Pair(false, "")
+            val root = try {
+                svc.rootInActiveWindow
+            } catch (_: Exception) {
+                null
+            }
+            val blocked = svc.checkScreenSafety(root, "screen_capture_guard")
+            return if (blocked != null) {
+                Pair(true, blocked.message)
+            } else {
+                Pair(false, "")
+            }
+        }
 
         fun getVisibleScreenText(maxItems: Int = 80): String =
             instance?.dumpVisibleScreenText(maxItems).orEmpty()
