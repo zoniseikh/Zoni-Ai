@@ -3,7 +3,14 @@ import { CompanionMode, SystemVitals } from '../types';
 import { playProceduralSfx } from '../utils/audio';
 import { PREDEFINED_AFFECTION_OPTIONS } from './GfStatusPanel';
 import { WsConnectionStatus } from '../utils/liveSessionProtocol';
-import type { ServerHealthSnapshot } from '../utils/apiConfig';
+import {
+  deleteGeminiApiKey,
+  getGeminiApiKeyForRequest,
+  getGeminiApiKeyStatus,
+  saveGeminiApiKey,
+  type ServerHealthSnapshot,
+} from '../utils/apiConfig';
+import { verifyDirectGeminiApiKey } from '../utils/geminiDirectClient';
 import type { DeviceActionDiagnosticsState } from '../utils/liveToolRelay';
 import { ASSISTANT_TOOL_SPECS } from '../utils/assistantActionRegistry';
 import type { WakeWordStatusSnapshot, VoiceLifecycleState } from '../utils/voiceLifecycle';
@@ -32,6 +39,10 @@ import {
   Square,
   ShieldCheck,
   Save,
+  Key,
+  Eye,
+  EyeOff,
+  Trash2,
 } from 'lucide-react';
 
 export type GeminiConnectionSnapshot = ServerHealthSnapshot;
@@ -96,6 +107,12 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
   const [customInput, setCustomInput] = useState(selectedAffectionName || 'Boss');
   const [wakePhraseInput, setWakePhraseInput] = useState(wakeWordStatus?.wakePhrase || 'Zoni');
   const [wakePhraseSavedNotice, setWakePhraseSavedNotice] = useState<string | null>(null);
+  const [geminiKeyDraft, setGeminiKeyDraft] = useState('');
+  const [showDraftKey, setShowDraftKey] = useState(false);
+  const [isEditingKey, setIsEditingKey] = useState(false);
+  const [keyBusy, setKeyBusy] = useState(false);
+  const [keyFeedback, setKeyFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  const [keyStatusVersion, setKeyStatusVersion] = useState(0);
 
   useEffect(() => {
     setCustomInput(selectedAffectionName || 'Boss');
@@ -108,13 +125,22 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
   }, [wakeWordStatus?.wakePhrase]);
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      setGeminiKeyDraft('');
+      setShowDraftKey(false);
+      setIsEditingKey(false);
+      setKeyFeedback(null);
+      return;
+    }
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
     };
+    const handleKeyUpdated = () => setKeyStatusVersion((v) => v + 1);
     window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('zoni:gemini-key-updated', handleKeyUpdated);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('zoni:gemini-key-updated', handleKeyUpdated);
     };
   }, [isOpen, onClose]);
 
@@ -147,12 +173,68 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
   );
   const isCustomNameActive = !isPredefinedMatch;
 
-  const wsBadge = (() => {
-    if (backendHealth?.checked && !backendHealth.reachable) {
-      return { label: backendHealth.statusText || 'SERVER OFFLINE', cls: 'text-rose-400' };
+  void keyStatusVersion;
+  const geminiKeyStatus = getGeminiApiKeyStatus();
+
+  const handleSaveGeminiKeyInline = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (vitals.soundFxEnabled) playProceduralSfx('click');
+    setKeyBusy(true);
+    setKeyFeedback(null);
+    const saved = saveGeminiApiKey(geminiKeyDraft);
+    if (!saved.ok) {
+      setKeyBusy(false);
+      setKeyFeedback({ ok: false, text: saved.error || 'Invalid Gemini API Key.' });
+      return;
     }
-    if (backendHealth?.checked && !backendHealth.geminiConfigured) {
-      return { label: backendHealth.statusText || 'AI SERVICE STANDBY', cls: 'text-amber-400' };
+    const verifyRes = await verifyDirectGeminiApiKey(
+      getGeminiApiKeyForRequest(),
+      fetch,
+      vitals.activeLanguage
+    );
+    setGeminiKeyDraft('');
+    setShowDraftKey(false);
+    setIsEditingKey(false);
+    setKeyStatusVersion((v) => v + 1);
+    setKeyBusy(false);
+    setKeyFeedback({ ok: verifyRes.ok, text: verifyRes.message });
+    onGeminiKeyChanged?.();
+  };
+
+  const handleTestSavedGeminiKey = async () => {
+    if (vitals.soundFxEnabled) playProceduralSfx('click');
+    setKeyBusy(true);
+    setKeyFeedback(null);
+    const verifyRes = await verifyDirectGeminiApiKey(
+      getGeminiApiKeyForRequest(),
+      fetch,
+      vitals.activeLanguage
+    );
+    setKeyBusy(false);
+    setKeyFeedback({ ok: verifyRes.ok, text: verifyRes.message });
+    onGeminiKeyChanged?.();
+  };
+
+  const handleDeleteGeminiKeyInline = () => {
+    if (vitals.soundFxEnabled) playProceduralSfx('click');
+    deleteGeminiApiKey();
+    setGeminiKeyDraft('');
+    setShowDraftKey(false);
+    setIsEditingKey(false);
+    setKeyStatusVersion((v) => v + 1);
+    setKeyFeedback({
+      ok: true,
+      text: 'Saved Gemini API Key deleted.',
+    });
+    onGeminiKeyChanged?.();
+  };
+
+  const wsBadge = (() => {
+    if (!geminiKeyStatus.configured && backendHealth?.checked && !backendHealth.geminiConfigured) {
+      return { label: backendHealth.statusText || 'API KEY REQUIRED', cls: 'text-amber-400' };
+    }
+    if (geminiKeyStatus.configured && backendHealth?.checked && !backendHealth.geminiConfigured) {
+      return { label: backendHealth.statusText || 'INVALID API KEY', cls: 'text-rose-400' };
     }
     switch (wsStatus) {
       case 'connected':
@@ -165,7 +247,7 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
       case 'reconnecting':
         return { label: 'RECONNECTING...', cls: 'text-amber-300' };
       case 'error':
-        return { label: 'LIVE STANDBY (SERVER CHAT READY)', cls: 'text-amber-300' };
+        return { label: 'LIVE STANDBY (CHAT READY)', cls: 'text-amber-300' };
       default:
         return { label: 'DISCONNECTED', cls: 'text-slate-400' };
     }
@@ -687,19 +769,49 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
             </p>
           </section>
 
-          {/* SECTION 5: GEMINI LIVE & SERVER CONNECTION */}
+          {/* SECTION 5: GEMINI API KEY (BYOK) & LIVE CONNECTION */}
           <section
             data-testid="gemini-server-settings-section"
             className="p-4 rounded-xl bg-slate-900/60 border border-cyan-500/30 space-y-2.5 font-mono text-xs"
           >
             <h4 className="font-sci-fi text-[11px] text-cyan-300 tracking-wider uppercase block pb-1 border-b border-cyan-500/20">
-              5. Gemini Live &amp; Server Connection:
+              5. Gemini API Key &amp; Live Connection:
             </h4>
             <div className="flex items-center justify-between gap-2 py-1 border-b border-cyan-500/10">
               <span className="text-slate-400 shrink-0">CONNECTION MODE:</span>
               <span className="text-cyan-300 flex items-center gap-1.5 font-bold text-right">
-                <Radio className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                MANAGED SERVER-SIDE GEMINI API
+                {geminiKeyStatus.configured ? (
+                  <>
+                    <Key className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    DIRECT GOOGLE GEMINI (YOUR API KEY)
+                  </>
+                ) : backendHealth?.geminiConfigured ? (
+                  <>
+                    <Radio className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                    MANAGED SERVER-SIDE GEMINI API
+                  </>
+                ) : (
+                  <>
+                    <Key className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    GEMINI API KEY REQUIRED
+                  </>
+                )}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-cyan-500/10">
+              <span className="text-slate-400 shrink-0">MASKED API KEY:</span>
+              <span
+                data-testid="settings-masked-key"
+                className={geminiKeyStatus.configured ? 'text-emerald-300 font-bold text-right' : 'text-slate-400 text-right'}
+              >
+                {geminiKeyStatus.configured ? geminiKeyStatus.maskedPreview : 'NOT CONFIGURED'}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-2 py-1 border-b border-cyan-500/10">
+              <span className="text-slate-400 shrink-0">KEY STORAGE:</span>
+              <span className="text-cyan-200 text-right flex items-center gap-1">
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span>{geminiKeyStatus.storageLabel}</span>
               </span>
             </div>
             <div className="flex items-center justify-between gap-2 py-1 border-b border-cyan-500/10">
@@ -710,7 +822,7 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
               <span className="text-slate-400 shrink-0">LIVE LINK STATUS:</span>
               <span className={`${wsBadge.cls} font-bold text-right`}>{wsBadge.label}</span>
             </div>
-            <div className="flex items-center justify-between gap-2 py-1 border-b border-cyan-500/10">
+            <div className="flex items-center justify-between gap-2 py-1">
               <span className="text-slate-400 shrink-0">AI SERVICE STATUS:</span>
               <span
                 data-testid="settings-gemini-service-status"
@@ -722,20 +834,27 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
                     : 'text-cyan-300 font-bold text-right'
                 }
               >
-                {backendHealth?.geminiConfigured
+                {geminiKeyStatus.configured && backendHealth?.geminiConfigured
+                  ? 'READY (YOUR GEMINI KEY)'
+                  : backendHealth?.geminiConfigured
                   ? 'READY (SERVER MANAGED)'
                   : backendHealth?.checked
                   ? backendHealth.statusText
                   : 'CHECKING...'}
               </span>
             </div>
-            <div className="flex items-center justify-between gap-2 py-1">
-              <span className="text-slate-400 shrink-0">ASSISTANT TOOLS:</span>
-              <span className="text-cyan-200 text-right flex items-center gap-1">
-                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                <span>{backendHealth?.toolsCount ?? ASSISTANT_TOOL_SPECS.length} ACTIVE TOOLS</span>
-              </span>
-            </div>
+
+            {keyFeedback && (
+              <div
+                className={`p-2.5 rounded-lg border font-sans text-[11px] flex items-start gap-2 ${
+                  keyFeedback.ok
+                    ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-200'
+                    : 'bg-rose-950/40 border-rose-500/40 text-rose-200'
+                }`}
+              >
+                <span>{keyFeedback.text}</span>
+              </div>
+            )}
 
             {backendHealth?.checked && !backendHealth.geminiConfigured && backendHealth.configurationError && (
               <div className="p-2.5 rounded-lg bg-amber-950/40 border border-amber-500/40 text-amber-200 font-sans text-[11px] flex items-start gap-2">
@@ -744,11 +863,104 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
               </div>
             )}
 
+            {/* Inline BYOK Gemini API Key Editor */}
+            {(!geminiKeyStatus.configured || isEditingKey) && (
+              <form
+                onSubmit={handleSaveGeminiKeyInline}
+                className="pt-2 space-y-2 border-t border-cyan-500/15"
+              >
+                <label
+                  htmlFor="settings-gemini-api-key-input"
+                  className="block text-[11px] font-hud text-cyan-200 font-bold uppercase tracking-wider"
+                >
+                  {geminiKeyStatus.configured ? 'Enter New Gemini API Key' : 'Enter Your Own Gemini API Key'}
+                </label>
+                <div className="relative flex items-center">
+                  <input
+                    id="settings-gemini-api-key-input"
+                    data-testid="settings-gemini-key-input"
+                    type={showDraftKey ? 'text' : 'password'}
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    value={geminiKeyDraft}
+                    onChange={(e) => setGeminiKeyDraft(e.target.value)}
+                    placeholder="Paste your Gemini API Key (AIza... or AQ....)"
+                    className="w-full pr-9 pl-3 py-2 rounded-lg bg-slate-950 border border-cyan-500/40 text-xs font-mono text-cyan-100 placeholder:text-slate-500 focus:outline-none focus:border-cyan-400"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowDraftKey((prev) => !prev)}
+                    aria-label={showDraftKey ? 'Hide Gemini API key' : 'Show Gemini API key'}
+                    className="absolute right-2 p-1 text-slate-400 hover:text-cyan-300 cursor-pointer"
+                  >
+                    {showDraftKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-2 font-hud">
+                  <button
+                    type="submit"
+                    disabled={keyBusy}
+                    data-testid="settings-save-verify-key-btn"
+                    className="px-3 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>{keyBusy ? 'VERIFYING...' : 'SAVE & VERIFY KEY'}</span>
+                  </button>
+                  {isEditingKey && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsEditingKey(false);
+                        setGeminiKeyDraft('');
+                        setShowDraftKey(false);
+                      }}
+                      className="px-3 py-1.5 rounded-lg border border-slate-600 bg-slate-800/60 text-slate-300 text-xs font-bold cursor-pointer"
+                    >
+                      CANCEL
+                    </button>
+                  )}
+                </div>
+              </form>
+            )}
+
             <p className="text-[10px] font-sans text-slate-400 leading-relaxed">
-              All Gemini chat, vision, TTS, and Live audio requests are handled automatically by the Zoni AI server so everyone who opens the app can use it right away.
+              Every user can connect Zoni AI using their own Google Gemini API Key (stored locally / encrypted in Android Keystore on APK—no backend server URL required).
             </p>
 
             <div className="pt-1 flex flex-wrap gap-2 font-hud">
+              {geminiKeyStatus.configured && !isEditingKey && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setIsEditingKey(true)}
+                    data-testid="settings-replace-key-btn"
+                    className="px-3 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-950/50 hover:bg-cyan-900/60 text-cyan-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Key className="w-3.5 h-3.5" />
+                    <span>REPLACE KEY</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={keyBusy}
+                    onClick={() => void handleTestSavedGeminiKey()}
+                    className="px-3 py-1.5 rounded-lg border border-emerald-500/40 bg-emerald-950/50 hover:bg-emerald-900/60 text-emerald-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                  >
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    <span>{keyBusy ? 'TESTING...' : 'VERIFY KEY'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDeleteGeminiKeyInline}
+                    data-testid="settings-delete-key-btn"
+                    className="px-3 py-1.5 rounded-lg border border-rose-500/40 bg-rose-950/50 hover:bg-rose-900/60 text-rose-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>DELETE KEY</span>
+                  </button>
+                </>
+              )}
               {onReconnectLive && (
                 <button
                   type="button"
@@ -769,7 +981,7 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
                   className="px-3 py-1.5 rounded-lg border border-pink-500/40 bg-pink-950/50 hover:bg-pink-900/60 text-pink-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
                 >
                   <ShieldCheck className="w-3.5 h-3.5" />
-                  <span>PERMISSIONS WIZARD</span>
+                  <span>SETUP WIZARD</span>
                 </button>
               )}
             </div>

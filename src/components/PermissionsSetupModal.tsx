@@ -43,8 +43,21 @@ import {
   Shield,
   Monitor,
   Radio,
+  Key,
+  Eye,
+  EyeOff,
+  Trash2,
 } from 'lucide-react';
-import { cleanupLegacyClientStorage, fetchServerStatus } from '../utils/apiConfig';
+import {
+  cleanupLegacyBackendStorage,
+  deleteGeminiApiKey,
+  fetchServerStatus,
+  getGeminiApiKeyForRequest,
+  getGeminiApiKeyStatus,
+  getGeminiConfigError,
+  saveGeminiApiKey,
+} from '../utils/apiConfig';
+import { verifyDirectGeminiApiKey } from '../utils/geminiDirectClient';
 import type { GeminiConnectionSnapshot } from './ZoniSettingsModal';
 
 interface PermissionsSetupModalProps {
@@ -72,14 +85,20 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
   onLocationInitialized,
   onNotificationInitialized,
   soundFxEnabled,
+  activeLanguage = 'bn-BD',
   backendHealth,
   onRefreshBackendHealth,
+  onBackendUrlChanged,
 }) => {
   const [activeStep, setActiveStep] = useState<1 | 2 | 3>(1);
   const [isCheckingServer, setIsCheckingServer] = useState(false);
   const [localServerHealth, setLocalServerHealth] = useState<GeminiConnectionSnapshot | null>(
     backendHealth ?? null
   );
+  const [geminiKeyInput, setGeminiKeyInput] = useState('');
+  const [showDraftKey, setShowDraftKey] = useState(false);
+  const [geminiKeyError, setGeminiKeyError] = useState<string | null>(null);
+  const [keyStatusEpoch, setKeyStatusEpoch] = useState(0);
 
   // Step 2: Permissions State
   const [extraPermissions, setExtraPermissions] = useState<Record<string, boolean>>(() => {
@@ -199,9 +218,9 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
     };
   }, [isOpen]);
 
-  // Clean up obsolete legacy client-side key / backend URL storage on mount
+  // Clean up obsolete legacy backend URL storage on mount (preserves saved BYOK key)
   useEffect(() => {
-    cleanupLegacyClientStorage();
+    cleanupLegacyBackendStorage();
   }, []);
 
   useEffect(() => {
@@ -211,24 +230,56 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
   }, [backendHealth]);
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      setGeminiKeyInput('');
+      setShowDraftKey(false);
+      setGeminiKeyError(null);
+      return;
+    }
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
     };
+    const handleKeyUpdated = () => setKeyStatusEpoch((v) => v + 1);
     window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('zoni:gemini-key-updated', handleKeyUpdated);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('zoni:gemini-key-updated', handleKeyUpdated);
     };
   }, [isOpen, onClose]);
 
   const checkServerHealthNow = async (): Promise<GeminiConnectionSnapshot> => {
     setIsCheckingServer(true);
     try {
-      const snap = onRefreshBackendHealth
-        ? await onRefreshBackendHealth()
-        : await fetchServerStatus();
-      setLocalServerHealth(snap);
-      return snap;
+      if (onRefreshBackendHealth) {
+        const snap = await onRefreshBackendHealth();
+        setLocalServerHealth(snap);
+        return snap;
+      }
+      const lang =
+        activeLanguage === 'hi-IN' || activeLanguage === 'en-US' ? activeLanguage : 'bn-BD';
+      const keyStatus = getGeminiApiKeyStatus();
+      const rawKey = getGeminiApiKeyForRequest();
+      if (keyStatus.configured && rawKey) {
+        const verify = await verifyDirectGeminiApiKey(rawKey, fetch, lang);
+        const directSnap: GeminiConnectionSnapshot = {
+          checked: true,
+          reachable: verify.ok,
+          geminiConfigured: verify.ok,
+          connectionMode: 'byok_direct',
+          statusText: verify.statusText,
+          configurationError: verify.ok ? null : verify.message,
+          maskedKeyPreview: keyStatus.maskedPreview,
+          storageLabel: keyStatus.storageLabel,
+          preferredChatModel: verify.preferredChatModel,
+          preferredLiveModel: verify.preferredLiveModel,
+        };
+        setLocalServerHealth(directSnap);
+        return directSnap;
+      }
+      const serverSnap = await fetchServerStatus(fetch, window, lang);
+      setLocalServerHealth(serverSnap);
+      return serverSnap;
     } finally {
       setIsCheckingServer(false);
     }
@@ -236,6 +287,7 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
 
   useEffect(() => {
     if (!isOpen) return;
+    setKeyStatusEpoch((v) => v + 1);
     void checkServerHealthNow();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
@@ -256,15 +308,61 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
     }, 3500);
   };
 
+  void keyStatusEpoch;
+  const keyStatus = getGeminiApiKeyStatus();
   const activeHealth = localServerHealth ?? backendHealth ?? null;
+  const resolvedLang =
+    activeLanguage === 'hi-IN' || activeLanguage === 'en-US' ? activeLanguage : 'bn-BD';
+  const missingKeyPrompt = getGeminiConfigError(undefined, resolvedLang);
+
+  const handleSaveAndVerifyGeminiKey = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (soundFxEnabled) playProceduralSfx('click');
+    setGeminiKeyError(null);
+
+    const saved = saveGeminiApiKey(geminiKeyInput);
+    if (!saved.ok) {
+      setGeminiKeyError(saved.error || 'Invalid Gemini API Key.');
+      return;
+    }
+
+    // Clear raw key from form state immediately after saving
+    setGeminiKeyInput('');
+    setShowDraftKey(false);
+    setKeyStatusEpoch((v) => v + 1);
+    onBackendUrlChanged?.();
+
+    const snap = await checkServerHealthNow();
+    if (snap.reachable && snap.geminiConfigured) {
+      showToast('Gemini API Key verified! Direct Google Gemini connection is ready.');
+    } else {
+      showToast(snap.configurationError || 'Key saved, but Google Gemini rejected verification.');
+    }
+  };
+
+  const handleDeleteSavedGeminiKey = async () => {
+    if (soundFxEnabled) playProceduralSfx('click');
+    setGeminiKeyError(null);
+    deleteGeminiApiKey();
+    setGeminiKeyInput('');
+    setShowDraftKey(false);
+    setKeyStatusEpoch((v) => v + 1);
+    onBackendUrlChanged?.();
+    await checkServerHealthNow();
+    showToast('Saved Gemini API Key deleted.');
+  };
 
   const handleRecheckServer = async () => {
     if (soundFxEnabled) playProceduralSfx('click');
     const snap = await checkServerHealthNow();
     if (snap.reachable && snap.geminiConfigured) {
-      showToast('Zoni AI server and Gemini Live are ready!');
+      showToast(
+        snap.connectionMode === 'byok_direct'
+          ? 'Your Gemini API Key is valid and connected!'
+          : 'Zoni AI connection is ready!'
+      );
     } else {
-      showToast(snap.configurationError || 'Zoni AI server is temporarily unavailable.');
+      showToast(snap.configurationError || 'Enter your Gemini API Key to connect.');
     }
   };
 
@@ -502,7 +600,7 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                 </span>
               </div>
               <p className="text-xs text-pink-300/80 font-hud tracking-wide mt-0.5 truncate">
-                {activeStep === 1 && 'Verify Zoni AI Server & Gemini Live connection'}
+                {activeStep === 1 && 'Connect directly with your own Gemini API Key'}
                 {activeStep === 2 && 'Let Zoni Ai use your phone'}
                 {activeStep === 3 && 'Keep Zoni Ai alive in the background'}
               </p>
@@ -529,8 +627,8 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                 : 'border-transparent text-slate-400 hover:text-cyan-200'
             }`}
           >
-            <Radio className="w-3.5 h-3.5" />
-            <span>1. SERVER &amp; LIVE LINK</span>
+            <Key className="w-3.5 h-3.5" />
+            <span>1. GEMINI API KEY</span>
           </button>
           <button
             type="button"
@@ -572,21 +670,20 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
           className="zoni-modal-scroll p-4 sm:p-6 space-y-4"
         >
           {/* ======================================================== */}
-          {/* STEP 1: Managed Server & Gemini Live Connection Status */}
+          {/* STEP 1: User's Own Gemini API Key (BYOK) & Live Connection */}
           {/* ======================================================== */}
           {activeStep === 1 && (
             <div data-testid="setup-server-connection-step" className="space-y-4 animate-in fade-in duration-200">
               <div className="space-y-2">
                 <h4 className="font-sci-fi text-lg sm:text-xl font-bold text-cyan-200 tracking-wide">
-                  Zoni AI Server &amp; Gemini Live Ready
+                  Connect Your Own Gemini API Key
                 </h4>
                 <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
-                  All Gemini chat, streaming voice, vision, and smart-reply features run automatically
-                  through the Zoni AI server—no manual API key setup is required to start talking.
+                  Enter your own Google Gemini API Key to connect Zoni AI directly to Google Gemini Live &amp; REST API—no backend server URL is needed.
                 </p>
               </div>
 
-              {/* Server & Gemini Connection Status Card */}
+              {/* Connection & Key Status Card */}
               <div className="p-4 rounded-xl bg-slate-900/70 border border-cyan-500/30 space-y-3">
                 <div className="flex items-center justify-between gap-2 flex-wrap">
                   <div className="flex items-center gap-2">
@@ -596,7 +693,7 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                       <WifiOff className="w-4 h-4 text-amber-400" />
                     )}
                     <span className="font-hud text-xs font-bold tracking-wider uppercase text-cyan-200">
-                      Server AI Status
+                      Gemini Connection Status
                     </span>
                   </div>
                   <button
@@ -606,13 +703,13 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                     className="px-2.5 py-1 rounded-lg bg-cyan-950/70 border border-cyan-500/40 hover:bg-cyan-900/60 text-cyan-200 text-[11px] font-hud font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
                   >
                     <RefreshCw className={`w-3 h-3 ${isCheckingServer ? 'animate-spin' : ''}`} />
-                    <span>{isCheckingServer ? 'Checking...' : 'Check Status'}</span>
+                    <span>{isCheckingServer ? 'Verifying...' : 'Verify Status'}</span>
                   </button>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs font-hud">
                   <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
-                    <span className="text-[10px] text-slate-400 uppercase block">AI Status</span>
+                    <span className="text-[10px] text-slate-400 uppercase block">Key / AI Status</span>
                     <span
                       data-testid="setup-server-status"
                       className={`font-bold uppercase ${
@@ -624,47 +721,133 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
                       }`}
                     >
                       {isCheckingServer
-                        ? 'CHECKING SERVER...'
+                        ? 'VERIFYING...'
+                        : keyStatus.configured && activeHealth?.geminiConfigured
+                        ? 'DIRECT GEMINI READY'
                         : activeHealth?.geminiConfigured
-                        ? 'READY & ONLINE'
-                        : activeHealth?.statusText || 'CONNECTING...'}
+                        ? 'SERVER AI READY'
+                        : activeHealth?.statusText || 'API KEY REQUIRED'}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
+                    <span className="text-[10px] text-slate-400 uppercase block">Masked Key</span>
+                    <span
+                      data-testid="setup-masked-key"
+                      className="font-mono text-cyan-200"
+                    >
+                      {keyStatus.configured ? keyStatus.maskedPreview : 'Not saved yet'}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
+                    <span className="text-[10px] text-slate-400 uppercase block">Key Storage</span>
+                    <span className="font-bold flex items-center gap-1.5 text-emerald-300">
+                      <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                      <span>{keyStatus.storageLabel}</span>
                     </span>
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
                     <span className="text-[10px] text-slate-400 uppercase block">Transport</span>
-                    <span className="font-mono text-cyan-200">
-                      Server Proxy (/api/* + /live)
-                    </span>
-                  </div>
-                  <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
-                    <span className="text-[10px] text-slate-400 uppercase block">
-                      Live Audio Stream
-                    </span>
-                    <span className="font-bold flex items-center gap-1.5 text-emerald-300">
-                      <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-                      <span>16kHz PCM ⇄ 24kHz PCM</span>
-                    </span>
-                  </div>
-                  <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
-                    <span className="text-[10px] text-slate-400 uppercase block">
-                      Assistant Tools
-                    </span>
                     <span className="font-mono text-cyan-300">
-                      {activeHealth?.toolsCount ?? 36} Active Tools
+                      {keyStatus.configured || activeHealth?.isStandaloneClient
+                        ? 'Gemini Live WSS + REST API'
+                        : 'Server Proxy (/api/* + /live)'}
                     </span>
                   </div>
                 </div>
 
-                {activeHealth?.checked && !activeHealth.geminiConfigured && activeHealth.configurationError && (
+                {!keyStatus.configured && (!activeHealth?.geminiConfigured) && (
                   <div className="p-3 rounded-lg bg-amber-950/50 border border-amber-500/40 text-xs text-amber-200 flex items-start gap-2">
                     <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <span>{activeHealth?.configurationError || missingKeyPrompt}</span>
+                  </div>
+                )}
+
+                {keyStatus.configured && activeHealth?.checked && !activeHealth.geminiConfigured && activeHealth.configurationError && (
+                  <div className="p-3 rounded-lg bg-rose-950/50 border border-rose-500/40 text-xs text-rose-200 flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
                     <span>{activeHealth.configurationError}</span>
                   </div>
                 )}
               </div>
 
+              {/* User BYOK Gemini API Key Entry Form */}
+              <form
+                onSubmit={handleSaveAndVerifyGeminiKey}
+                className="p-4 rounded-xl bg-slate-900/70 border border-cyan-500/30 space-y-3"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <label
+                    htmlFor="zoni-gemini-api-key-input"
+                    className="font-hud text-xs font-bold tracking-wider uppercase text-cyan-200"
+                  >
+                    {keyStatus.configured ? 'Replace Your Gemini API Key' : 'Enter Your Gemini API Key'}
+                  </label>
+                  {keyStatus.configured && (
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteSavedGeminiKey()}
+                      data-testid="setup-delete-key-btn"
+                      className="px-2.5 py-1 rounded-lg bg-rose-950/70 border border-rose-500/40 hover:bg-rose-900/60 text-rose-200 text-[11px] font-hud font-bold flex items-center gap-1 cursor-pointer"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>Delete Key</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="relative flex items-center">
+                  <input
+                    id="zoni-gemini-api-key-input"
+                    data-testid="setup-gemini-key-input"
+                    type={showDraftKey ? 'text' : 'password'}
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    value={geminiKeyInput}
+                    onChange={(e) => {
+                      setGeminiKeyInput(e.target.value);
+                      if (geminiKeyError) setGeminiKeyError(null);
+                    }}
+                    placeholder="Paste your Gemini API Key (AIza... or AQ....)"
+                    className="w-full pr-10 pl-3.5 py-2.5 rounded-xl bg-slate-950/90 border border-cyan-500/40 text-xs sm:text-sm font-mono text-cyan-100 placeholder:text-slate-500 focus:outline-none focus:border-cyan-400"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowDraftKey((prev) => !prev)}
+                    aria-label={showDraftKey ? 'Hide Gemini API key' : 'Show Gemini API key'}
+                    className="absolute right-2.5 p-1 text-slate-400 hover:text-cyan-300 cursor-pointer"
+                  >
+                    {showDraftKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+
+                {geminiKeyError && (
+                  <p
+                    role="alert"
+                    data-testid="setup-gemini-key-error"
+                    className="text-xs font-hud text-rose-400"
+                  >
+                    {geminiKeyError}
+                  </p>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={isCheckingServer}
+                  data-testid="setup-save-verify-key-btn"
+                  className="w-full py-2.5 px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-hud text-xs sm:text-sm font-bold tracking-wider uppercase transition-all shadow-[0_0_15px_rgba(6,182,212,0.35)] cursor-pointer disabled:opacity-60"
+                >
+                  {isCheckingServer ? 'SAVING & VERIFYING...' : 'SAVE & VERIFY'}
+                </button>
+
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  Stored locally on this device (Android Keystore encryption on APK). Never uploaded to any third-party ZONI server and never displayed back in plain text after saving.
+                </p>
+              </form>
+
               {/* Action Buttons */}
-              <div className="pt-2 flex flex-col sm:flex-row gap-2.5">
+              <div className="pt-1 flex flex-col sm:flex-row gap-2.5">
                 <button
                   type="button"
                   onClick={handleContinueToPermissions}

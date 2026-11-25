@@ -110,18 +110,20 @@ export const HudHeader: React.FC<HudHeaderProps> = ({
         icon: <Radio className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />,
       };
     }
-    if (backendHealth?.checked && !backendHealth.reachable) {
-      return {
-        text: backendHealth.statusText || 'SERVER OFFLINE',
-        cls: 'border-rose-500/40 text-rose-300',
-        icon: <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />,
-      };
-    }
     if (backendHealth?.checked && !backendHealth.geminiConfigured) {
       return {
-        text: backendHealth.statusText || 'AI SERVICE STANDBY',
-        cls: 'border-amber-500/40 text-amber-300',
-        icon: <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />,
+        text: backendHealth.statusText || 'API KEY REQUIRED',
+        cls:
+          backendHealth.statusText === 'API KEY REQUIRED'
+            ? 'border-amber-500/50 text-amber-300'
+            : 'border-rose-500/40 text-rose-300',
+        icon: (
+          <ShieldAlert
+            className={`w-3.5 h-3.5 ${
+              backendHealth.statusText === 'API KEY REQUIRED' ? 'text-amber-400' : 'text-rose-400'
+            }`}
+          />
+        ),
       };
     }
     if (wsStatus === 'error') {
