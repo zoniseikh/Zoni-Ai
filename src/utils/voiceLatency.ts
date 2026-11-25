@@ -7,18 +7,32 @@ export type VoicePipelineStage =
   | 'mic_capture'
   | 'audio_processing'
   | 'wake_word_detection'
+  | 'speech_endpoint_detection'
   | 'speech_recognition'
+  | 'intent_classification'
   | 'command_classification'
+  | 'local_action_dispatch'
+  | 'application_launch'
+  | 'accessibility_interaction'
   | 'action_execution'
+  | 'gemini_first_token'
+  | 'first_audible_tts'
   | 'voice_response';
 
 export const ALL_VOICE_PIPELINE_STAGES: readonly VoicePipelineStage[] = [
   'mic_capture',
   'audio_processing',
   'wake_word_detection',
+  'speech_endpoint_detection',
   'speech_recognition',
+  'intent_classification',
   'command_classification',
+  'local_action_dispatch',
+  'application_launch',
+  'accessibility_interaction',
   'action_execution',
+  'gemini_first_token',
+  'first_audible_tts',
   'voice_response',
 ] as const;
 

@@ -146,6 +146,9 @@ data class NearFieldGateDecision(
     val isSpeechActive: Boolean,
     val suppressedByPlaybackEcho: Boolean,
     val shouldSignalAudioStreamEnd: Boolean,
+    val shouldInterruptAssistant: Boolean = false,
+    val endpointDetectionLatencyMs: Long = 0L,
+    val effectiveSilenceEndMs: Long = 380L,
     val rms: Float,
     val zcr: Float,
     val noiseFloorRms: Float
@@ -156,27 +159,51 @@ class NearFieldVoiceGate(
     private val snrStartMultiplier: Float = 2.65f,
     private val snrContinueMultiplier: Float = 1.75f,
     private val minSpeechMs: Long = 130L,
-    private val silenceEndMs: Long = 400L,
-    private val hangoverMs: Long = 220L,
+    private val silenceEndMs: Long = 0L, // <= 0 enables adaptive EOS timeout
+    private val shortCommandSilenceMs: Long = 260L,
+    private val normalSilenceMs: Long = 380L,
+    private val longUtteranceSilenceMs: Long = 520L,
+    private val hangoverMs: Long = 180L,
     private val echoTailHoldoverMs: Long = 260L,
-    private val maxPreRollFrames: Int = 6 // 6 * 50ms = 300ms pre-roll
+    private val maxPreRollFrames: Int = 6, // 6 * 50ms = 300ms pre-roll
+    private val allowBargeIn: Boolean = false,
+    private val bargeInMinRms: Float = 0.085f,
+    private val bargeInHoldMs: Long = 120L,
+    private val primarySpeakerContinueRatio: Float = 0.25f
 ) {
     private var noiseFloorRms: Float = 0.005f
     private var inSpeech: Boolean = false
     private var speechAccumMs: Long = 0L
     private var silenceAccumMs: Long = 0L
+    private var pauseCountInUtterance: Int = 0
+    private var activePrimaryPeakRms: Float = 0f
     private var echoTailRemainingMs: Long = 0L
     private var wasAssistantSpeaking: Boolean = false
+    private var bargeInAccumMs: Long = 0L
     private val preRollQueue = ArrayDeque<ByteArray>()
 
     fun reset() {
         inSpeech = false
         speechAccumMs = 0L
         silenceAccumMs = 0L
+        pauseCountInUtterance = 0
+        activePrimaryPeakRms = 0f
+        bargeInAccumMs = 0L
         preRollQueue.clear()
     }
 
     fun getNoiseFloorRms(): Float = noiseFloorRms
+
+    fun computeAdaptiveSilenceEndMs(): Long {
+        if (silenceEndMs > 0L) return silenceEndMs
+        val base = when {
+            pauseCountInUtterance >= 2 || speechAccumMs >= 2400L -> longUtteranceSilenceMs
+            pauseCountInUtterance >= 1 || speechAccumMs >= 900L -> normalSilenceMs
+            else -> shortCommandSilenceMs
+        }
+        val noiseBoost = if (noiseFloorRms > 0.014f) 40L else 0L
+        return base + noiseBoost
+    }
 
     fun processPcm16LeFrame(
         pcm16Le: ByteArray,
@@ -186,23 +213,73 @@ class NearFieldVoiceGate(
     ): NearFieldGateDecision {
         val safeMs = frameDurationMs.coerceAtLeast(1L)
         val (rms, zcr) = computeRmsAndZcr(pcm16Le, length)
+        val speechLikeZcr = zcr in 0.008f..0.44f
+        val frameCopy = if (length == pcm16Le.size) pcm16Le.copyOf() else pcm16Le.copyOf(length)
 
-        // 1. Suppress assistant playback audio + room reverberation tail
+        // 1. Suppress assistant playback audio + room reverberation tail, while supporting
+        //    controlled loud near-field user barge-in interruption.
         if (isAssistantSpeaking) {
             wasAssistantSpeaking = true
             echoTailRemainingMs = echoTailHoldoverMs
-            reset()
+
+            val bargeInThreshold = max(bargeInMinRms, noiseFloorRms * 4.5f)
+            if (allowBargeIn && rms >= bargeInThreshold && speechLikeZcr) {
+                bargeInAccumMs += safeMs
+                preRollQueue.addLast(frameCopy)
+                while (preRollQueue.size > maxPreRollFrames) {
+                    preRollQueue.removeFirst()
+                }
+                if (bargeInAccumMs >= bargeInHoldMs) {
+                    val flushed = preRollQueue.toList()
+                    preRollQueue.clear()
+                    wasAssistantSpeaking = false
+                    echoTailRemainingMs = 0L
+                    bargeInAccumMs = 0L
+                    inSpeech = true
+                    speechAccumMs = bargeInHoldMs
+                    silenceAccumMs = 0L
+                    pauseCountInUtterance = 0
+                    activePrimaryPeakRms = rms
+                    return NearFieldGateDecision(
+                        shouldTransmitCurrentFrame = true,
+                        preRollFramesToFlush = flushed,
+                        isSpeechActive = true,
+                        suppressedByPlaybackEcho = false,
+                        shouldSignalAudioStreamEnd = false,
+                        shouldInterruptAssistant = true,
+                        endpointDetectionLatencyMs = 0L,
+                        effectiveSilenceEndMs = computeAdaptiveSilenceEndMs(),
+                        rms = rms,
+                        zcr = zcr,
+                        noiseFloorRms = noiseFloorRms
+                    )
+                }
+            } else {
+                bargeInAccumMs = 0L
+                preRollQueue.clear()
+            }
+
+            inSpeech = false
+            speechAccumMs = 0L
+            silenceAccumMs = 0L
+            pauseCountInUtterance = 0
+            activePrimaryPeakRms = 0f
             return NearFieldGateDecision(
                 shouldTransmitCurrentFrame = false,
                 preRollFramesToFlush = emptyList(),
                 isSpeechActive = false,
                 suppressedByPlaybackEcho = true,
                 shouldSignalAudioStreamEnd = false,
+                shouldInterruptAssistant = false,
+                endpointDetectionLatencyMs = 0L,
+                effectiveSilenceEndMs = computeAdaptiveSilenceEndMs(),
                 rms = rms,
                 zcr = zcr,
                 noiseFloorRms = noiseFloorRms
             )
         }
+
+        bargeInAccumMs = 0L
 
         if (wasAssistantSpeaking && echoTailRemainingMs > 0L) {
             echoTailRemainingMs = (echoTailRemainingMs - safeMs).coerceAtLeast(0L)
@@ -216,22 +293,30 @@ class NearFieldVoiceGate(
                 isSpeechActive = false,
                 suppressedByPlaybackEcho = true,
                 shouldSignalAudioStreamEnd = false,
+                shouldInterruptAssistant = false,
+                endpointDetectionLatencyMs = 0L,
+                effectiveSilenceEndMs = computeAdaptiveSilenceEndMs(),
                 rms = rms,
                 zcr = zcr,
                 noiseFloorRms = noiseFloorRms
             )
         }
 
-        val speechLikeZcr = zcr in 0.008f..0.44f
         val startThreshold = max(minSpeechRms, noiseFloorRms * snrStartMultiplier)
-        val continueThreshold = max(minSpeechRms * 0.62f, noiseFloorRms * snrContinueMultiplier)
-        val frameCopy = if (length == pcm16Le.size) pcm16Le.copyOf() else pcm16Le.copyOf(length)
+        val baseContinueThreshold = max(minSpeechRms * 0.62f, noiseFloorRms * snrContinueMultiplier)
+        val primaryLockedContinueThreshold = max(
+            baseContinueThreshold,
+            activePrimaryPeakRms * primarySpeakerContinueRatio
+        )
+        val effectiveSilenceMs = computeAdaptiveSilenceEndMs()
 
         if (!inSpeech) {
             if (rms >= startThreshold && speechLikeZcr) {
                 inSpeech = true
                 speechAccumMs = safeMs
                 silenceAccumMs = 0L
+                pauseCountInUtterance = 0
+                activePrimaryPeakRms = rms
                 val flushed = preRollQueue.toList()
                 preRollQueue.clear()
                 return NearFieldGateDecision(
@@ -240,6 +325,9 @@ class NearFieldVoiceGate(
                     isSpeechActive = true,
                     suppressedByPlaybackEcho = false,
                     shouldSignalAudioStreamEnd = false,
+                    shouldInterruptAssistant = false,
+                    endpointDetectionLatencyMs = 0L,
+                    effectiveSilenceEndMs = computeAdaptiveSilenceEndMs(),
                     rms = rms,
                     zcr = zcr,
                     noiseFloorRms = noiseFloorRms
@@ -258,22 +346,33 @@ class NearFieldVoiceGate(
                 isSpeechActive = false,
                 suppressedByPlaybackEcho = false,
                 shouldSignalAudioStreamEnd = false,
+                shouldInterruptAssistant = false,
+                endpointDetectionLatencyMs = 0L,
+                effectiveSilenceEndMs = effectiveSilenceMs,
                 rms = rms,
                 zcr = zcr,
                 noiseFloorRms = noiseFloorRms
             )
         }
 
-        // Currently in active speech
-        if (rms >= continueThreshold && speechLikeZcr) {
+        // Currently in active speech: primary-speaker energy lock prevents distant background talkers
+        // during a pause from falsely holding the turn open.
+        if (rms >= primaryLockedContinueThreshold && speechLikeZcr) {
+            if (silenceAccumMs >= 140L) {
+                pauseCountInUtterance += 1
+            }
             speechAccumMs += safeMs
             silenceAccumMs = 0L
+            activePrimaryPeakRms = max(activePrimaryPeakRms * 0.98f, rms)
             return NearFieldGateDecision(
                 shouldTransmitCurrentFrame = true,
                 preRollFramesToFlush = emptyList(),
                 isSpeechActive = true,
                 suppressedByPlaybackEcho = false,
                 shouldSignalAudioStreamEnd = false,
+                shouldInterruptAssistant = false,
+                endpointDetectionLatencyMs = 0L,
+                effectiveSilenceEndMs = computeAdaptiveSilenceEndMs(),
                 rms = rms,
                 zcr = zcr,
                 noiseFloorRms = noiseFloorRms
@@ -283,8 +382,9 @@ class NearFieldVoiceGate(
         silenceAccumMs += safeMs
         // Keep streaming brief hangover frames so final consonants are not clipped
         val withinHangover = silenceAccumMs <= hangoverMs
-        if (silenceAccumMs >= silenceEndMs) {
+        if (silenceAccumMs >= effectiveSilenceMs) {
             val hadRealSpeech = speechAccumMs >= minSpeechMs
+            val detectedLatencyMs = if (hadRealSpeech) silenceAccumMs else 0L
             reset()
             return NearFieldGateDecision(
                 shouldTransmitCurrentFrame = false,
@@ -292,6 +392,9 @@ class NearFieldVoiceGate(
                 isSpeechActive = false,
                 suppressedByPlaybackEcho = false,
                 shouldSignalAudioStreamEnd = hadRealSpeech,
+                shouldInterruptAssistant = false,
+                endpointDetectionLatencyMs = detectedLatencyMs,
+                effectiveSilenceEndMs = effectiveSilenceMs,
                 rms = rms,
                 zcr = zcr,
                 noiseFloorRms = noiseFloorRms
@@ -304,6 +407,9 @@ class NearFieldVoiceGate(
             isSpeechActive = withinHangover,
             suppressedByPlaybackEcho = false,
             shouldSignalAudioStreamEnd = false,
+            shouldInterruptAssistant = false,
+            endpointDetectionLatencyMs = 0L,
+            effectiveSilenceEndMs = effectiveSilenceMs,
             rms = rms,
             zcr = zcr,
             noiseFloorRms = noiseFloorRms
@@ -493,6 +599,8 @@ class LiveAudioEngine(
     @SuppressLint("MissingPermission")
     fun startMicrophoneCapture(
         onSpeechEnded: () -> Unit = {},
+        onSpeechEndedWithLatency: ((Long) -> Unit)? = null,
+        onBargeInDetected: () -> Unit = {},
         onBase64PcmChunk: (String) -> Unit
     ): Boolean {
         stopMicrophoneCapture()
@@ -567,7 +675,9 @@ class LiveAudioEngine(
             captureJob = scope.launch {
                 val readBuffer = ByteArray(CHUNK_BYTES)
                 val highPass = SpeechHighPassFilter()
-                val nearFieldGate = NearFieldVoiceGate()
+                val nearFieldGate = NearFieldVoiceGate(
+                    allowBargeIn = (echoCanceler?.enabled == true)
+                )
 
                 while (isActive) {
                     val read = recorder.read(readBuffer, 0, readBuffer.size)
@@ -589,6 +699,19 @@ class LiveAudioEngine(
                             isAssistantSpeaking = isAssistantSpeakingNow
                         )
 
+                        // Controlled near-field barge-in: immediately stop assistant playback so user speaks cleanly
+                        if (gateDecision.shouldInterruptAssistant) {
+                            isAssistantSpeakingNow = false
+                            synchronized(playbackLock) {
+                                try {
+                                    audioTrack?.pause()
+                                    audioTrack?.flush()
+                                } catch (_: Exception) {
+                                }
+                            }
+                            onBargeInDetected()
+                        }
+
                         // Drive Arc Reactor visual level only when not suppressed by playback echo
                         onAmplitudeChanged(
                             if (gateDecision.suppressedByPlaybackEcho) 0f
@@ -609,6 +732,7 @@ class LiveAudioEngine(
                         }
 
                         if (gateDecision.shouldSignalAudioStreamEnd) {
+                            onSpeechEndedWithLatency?.invoke(gateDecision.endpointDetectionLatencyMs)
                             onSpeechEnded()
                         }
                     } else if (isMicMuted) {

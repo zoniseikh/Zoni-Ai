@@ -298,23 +298,38 @@ export interface NearFieldSpeechGateDecision {
   isSpeechActive: boolean;
   suppressedByPlaybackEcho: boolean;
   shouldSignalAudioStreamEnd: boolean;
+  shouldInterruptAssistant: boolean;
+  endpointDetectionLatencyMs: number;
+  effectiveSilenceEndMs: number;
   rms: number;
   zcr: number;
   noiseFloorRms: number;
 }
 
 /**
- * Near-field speech gate with 300ms pre-roll buffer and 260ms playback echo-tail holdover.
- * Prevents streaming silence, steady room noise, and Zoni's own speaker playback to Gemini Live
- * while preserving the user's opening syllable on speech onset.
+ * Adaptive Near-Field Speech Gate with:
+ * - 300ms pre-roll buffer (preserves opening syllables)
+ * - Adaptive End-of-Speech (EOS) timeout: crisp short commands finish fast (~260ms),
+ *   normal commands settle cleanly (~380ms), and long/multi-clause utterances get extra
+ *   pause headroom (~520ms) so mid-sentence pauses never clip final words.
+ * - Background-speaker resistance during active user speech: once the near-field user
+ *   establishes a peak voice level, softer distant chatter during a pause does not
+ *   falsely extend or corrupt the user's endpoint timer.
+ * - Playback echo suppression (+260ms room-reverb tail) with optional controlled near-field
+ *   barge-in: sustained loud near-field speech while Zoni is talking triggers immediate
+ *   interruption (`shouldInterruptAssistant: true`) without allowing assistant echo to
+ *   trigger false commands.
  */
 export class NearFieldSpeechGate {
   private noiseFloorRms = 0.005;
   private inSpeech = false;
   private speechAccumMs = 0;
   private silenceAccumMs = 0;
+  private pauseCountInUtterance = 0;
+  private activePrimaryPeakRms = 0;
   private echoTailRemainingMs = 0;
   private wasAssistantSpeaking = false;
+  private bargeInAccumMs = 0;
   private preRollQueue: Float32Array[] = [];
 
   constructor(
@@ -323,10 +338,25 @@ export class NearFieldSpeechGate {
       snrStartMultiplier?: number;
       snrContinueMultiplier?: number;
       minSpeechMs?: number;
+      /** Explicit fixed silence end override (preserves legacy caller configuration). */
       silenceEndMs?: number;
+      /** Adaptive EOS timeout for short crisp commands (<900ms speech). */
+      shortCommandSilenceMs?: number;
+      /** Adaptive EOS timeout for normal commands (900ms..2400ms speech). */
+      normalSilenceMs?: number;
+      /** Adaptive EOS timeout for long or multi-pause utterances (>=2400ms or >=2 pauses). */
+      longUtteranceSilenceMs?: number;
       hangoverMs?: number;
       echoTailHoldoverMs?: number;
       maxPreRollFrames?: number;
+      /** Enable controlled near-field user barge-in during assistant playback. */
+      allowBargeIn?: boolean;
+      /** Minimum sustained RMS required for loud near-field barge-in above playback echo. */
+      bargeInMinRms?: number;
+      /** Continuous near-field speech duration required to trigger barge-in. */
+      bargeInHoldMs?: number;
+      /** Background-speaker floor ratio relative to the primary user's utterance peak RMS. */
+      primarySpeakerContinueRatio?: number;
     } = {}
   ) {}
 
@@ -334,11 +364,40 @@ export class NearFieldSpeechGate {
     this.inSpeech = false;
     this.speechAccumMs = 0;
     this.silenceAccumMs = 0;
+    this.pauseCountInUtterance = 0;
+    this.activePrimaryPeakRms = 0;
+    this.bargeInAccumMs = 0;
     this.preRollQueue = [];
   }
 
   public getNoiseFloorRms(): number {
     return this.noiseFloorRms;
+  }
+
+  /**
+   * Computes adaptive end-of-speech silence window based on speaking duration,
+   * mid-sentence pauses, and ambient noise floor.
+   */
+  public computeAdaptiveSilenceEndMs(): number {
+    if (typeof this.options.silenceEndMs === 'number' && this.options.silenceEndMs > 0) {
+      return this.options.silenceEndMs;
+    }
+    const shortMs = this.options.shortCommandSilenceMs ?? 260;
+    const normalMs = this.options.normalSilenceMs ?? 380;
+    const longMs = this.options.longUtteranceSilenceMs ?? 520;
+
+    let target: number;
+    if (this.pauseCountInUtterance >= 2 || this.speechAccumMs >= 2400) {
+      target = longMs;
+    } else if (this.pauseCountInUtterance >= 1 || this.speechAccumMs >= 900) {
+      target = normalMs;
+    } else {
+      target = shortMs;
+    }
+
+    // In noisier rooms, add slight stability headroom (up to +40ms) without hurting quiet latency
+    const noiseBoost = this.noiseFloorRms > 0.014 ? 40 : 0;
+    return target + noiseBoost;
   }
 
   public processFrame(
@@ -350,22 +409,75 @@ export class NearFieldSpeechGate {
     const rms = computePcmRms(pcm16k);
     const zcr = computePcmZeroCrossingRate(pcm16k);
     const echoTailHoldoverMs = this.options.echoTailHoldoverMs ?? 260;
+    const speechLikeZcr = zcr >= 0.008 && zcr <= 0.44;
+    const allowBargeIn = this.options.allowBargeIn ?? false;
+    const bargeInMinRms = this.options.bargeInMinRms ?? 0.085;
+    const bargeInHoldMs = this.options.bargeInHoldMs ?? 120;
 
     if (isAssistantSpeaking) {
       this.wasAssistantSpeaking = true;
       this.echoTailRemainingMs = echoTailHoldoverMs;
-      this.reset();
+
+      // Controlled near-field user barge-in: only sustained loud near-field speech
+      // well above ambient + playback echo can interrupt assistant playback.
+      const bargeInThreshold = Math.max(bargeInMinRms, this.noiseFloorRms * 4.5);
+      if (allowBargeIn && rms >= bargeInThreshold && speechLikeZcr) {
+        this.bargeInAccumMs += safeMs;
+        this.preRollQueue.push(new Float32Array(pcm16k));
+        while (this.preRollQueue.length > (this.options.maxPreRollFrames ?? 6)) {
+          this.preRollQueue.shift();
+        }
+        if (this.bargeInAccumMs >= bargeInHoldMs) {
+          const flushed = this.preRollQueue.slice();
+          this.preRollQueue = [];
+          this.wasAssistantSpeaking = false;
+          this.echoTailRemainingMs = 0;
+          this.bargeInAccumMs = 0;
+          this.inSpeech = true;
+          this.speechAccumMs = bargeInHoldMs;
+          this.silenceAccumMs = 0;
+          this.pauseCountInUtterance = 0;
+          this.activePrimaryPeakRms = rms;
+          return {
+            shouldTransmitCurrentFrame: true,
+            preRollFramesToFlush: flushed,
+            isSpeechActive: true,
+            suppressedByPlaybackEcho: false,
+            shouldSignalAudioStreamEnd: false,
+            shouldInterruptAssistant: true,
+            endpointDetectionLatencyMs: 0,
+            effectiveSilenceEndMs: this.computeAdaptiveSilenceEndMs(),
+            rms,
+            zcr,
+            noiseFloorRms: this.noiseFloorRms,
+          };
+        }
+      } else {
+        this.bargeInAccumMs = 0;
+        this.preRollQueue = [];
+      }
+
+      this.inSpeech = false;
+      this.speechAccumMs = 0;
+      this.silenceAccumMs = 0;
+      this.pauseCountInUtterance = 0;
+      this.activePrimaryPeakRms = 0;
       return {
         shouldTransmitCurrentFrame: false,
         preRollFramesToFlush: [],
         isSpeechActive: false,
         suppressedByPlaybackEcho: true,
         shouldSignalAudioStreamEnd: false,
+        shouldInterruptAssistant: false,
+        endpointDetectionLatencyMs: 0,
+        effectiveSilenceEndMs: this.computeAdaptiveSilenceEndMs(),
         rms,
         zcr,
         noiseFloorRms: this.noiseFloorRms,
       };
     }
+
+    this.bargeInAccumMs = 0;
 
     if (this.wasAssistantSpeaking && this.echoTailRemainingMs > 0) {
       this.echoTailRemainingMs = Math.max(0, this.echoTailRemainingMs - safeMs);
@@ -379,6 +491,9 @@ export class NearFieldSpeechGate {
         isSpeechActive: false,
         suppressedByPlaybackEcho: true,
         shouldSignalAudioStreamEnd: false,
+        shouldInterruptAssistant: false,
+        endpointDetectionLatencyMs: 0,
+        effectiveSilenceEndMs: this.computeAdaptiveSilenceEndMs(),
         rms,
         zcr,
         noiseFloorRms: this.noiseFloorRms,
@@ -389,22 +504,28 @@ export class NearFieldSpeechGate {
     const snrStartMultiplier = this.options.snrStartMultiplier ?? 2.65;
     const snrContinueMultiplier = this.options.snrContinueMultiplier ?? 1.75;
     const minSpeechMs = this.options.minSpeechMs ?? 130;
-    const silenceEndMs = this.options.silenceEndMs ?? 400;
-    const hangoverMs = this.options.hangoverMs ?? 220;
+    const hangoverMs = this.options.hangoverMs ?? 180;
     const maxPreRollFrames = this.options.maxPreRollFrames ?? 6;
+    const primarySpeakerContinueRatio = this.options.primarySpeakerContinueRatio ?? 0.25;
 
-    const speechLikeZcr = zcr >= 0.008 && zcr <= 0.44;
     const startThreshold = Math.max(minSpeechRms, this.noiseFloorRms * snrStartMultiplier);
-    const continueThreshold = Math.max(
+    const baseContinueThreshold = Math.max(
       minSpeechRms * 0.62,
       this.noiseFloorRms * snrContinueMultiplier
     );
+    const primaryLockedContinueThreshold = Math.max(
+      baseContinueThreshold,
+      this.activePrimaryPeakRms * primarySpeakerContinueRatio
+    );
+    const effectiveSilenceEndMs = this.computeAdaptiveSilenceEndMs();
 
     if (!this.inSpeech) {
       if (rms >= startThreshold && speechLikeZcr) {
         this.inSpeech = true;
         this.speechAccumMs = safeMs;
         this.silenceAccumMs = 0;
+        this.pauseCountInUtterance = 0;
+        this.activePrimaryPeakRms = rms;
         const flushed = this.preRollQueue.slice();
         this.preRollQueue = [];
         return {
@@ -413,6 +534,9 @@ export class NearFieldSpeechGate {
           isSpeechActive: true,
           suppressedByPlaybackEcho: false,
           shouldSignalAudioStreamEnd: false,
+          shouldInterruptAssistant: false,
+          endpointDetectionLatencyMs: 0,
+          effectiveSilenceEndMs: this.computeAdaptiveSilenceEndMs(),
           rms,
           zcr,
           noiseFloorRms: this.noiseFloorRms,
@@ -433,21 +557,33 @@ export class NearFieldSpeechGate {
         isSpeechActive: false,
         suppressedByPlaybackEcho: false,
         shouldSignalAudioStreamEnd: false,
+        shouldInterruptAssistant: false,
+        endpointDetectionLatencyMs: 0,
+        effectiveSilenceEndMs,
         rms,
         zcr,
         noiseFloorRms: this.noiseFloorRms,
       };
     }
 
-    if (rms >= continueThreshold && speechLikeZcr) {
+    // Active user speech: require energy consistent with the primary near-field speaker so
+    // distant background voices during a pause do not falsely keep the turn open forever.
+    if (rms >= primaryLockedContinueThreshold && speechLikeZcr) {
+      if (this.silenceAccumMs >= 140) {
+        this.pauseCountInUtterance += 1;
+      }
       this.speechAccumMs += safeMs;
       this.silenceAccumMs = 0;
+      this.activePrimaryPeakRms = Math.max(this.activePrimaryPeakRms * 0.98, rms);
       return {
         shouldTransmitCurrentFrame: true,
         preRollFramesToFlush: [],
         isSpeechActive: true,
         suppressedByPlaybackEcho: false,
         shouldSignalAudioStreamEnd: false,
+        shouldInterruptAssistant: false,
+        endpointDetectionLatencyMs: 0,
+        effectiveSilenceEndMs: this.computeAdaptiveSilenceEndMs(),
         rms,
         zcr,
         noiseFloorRms: this.noiseFloorRms,
@@ -456,8 +592,9 @@ export class NearFieldSpeechGate {
 
     this.silenceAccumMs += safeMs;
     const withinHangover = this.silenceAccumMs <= hangoverMs;
-    if (this.silenceAccumMs >= silenceEndMs) {
+    if (this.silenceAccumMs >= effectiveSilenceEndMs) {
       const hadRealSpeech = this.speechAccumMs >= minSpeechMs;
+      const detectedLatencyMs = hadRealSpeech ? this.silenceAccumMs : 0;
       this.reset();
       return {
         shouldTransmitCurrentFrame: false,
@@ -465,6 +602,9 @@ export class NearFieldSpeechGate {
         isSpeechActive: false,
         suppressedByPlaybackEcho: false,
         shouldSignalAudioStreamEnd: hadRealSpeech,
+        shouldInterruptAssistant: false,
+        endpointDetectionLatencyMs: detectedLatencyMs,
+        effectiveSilenceEndMs,
         rms,
         zcr,
         noiseFloorRms: this.noiseFloorRms,
@@ -477,6 +617,9 @@ export class NearFieldSpeechGate {
       isSpeechActive: withinHangover,
       suppressedByPlaybackEcho: false,
       shouldSignalAudioStreamEnd: false,
+      shouldInterruptAssistant: false,
+      endpointDetectionLatencyMs: 0,
+      effectiveSilenceEndMs,
       rms,
       zcr,
       noiseFloorRms: this.noiseFloorRms,

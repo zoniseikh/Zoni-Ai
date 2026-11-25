@@ -28,7 +28,12 @@ import com.zoni.jarvis.assistant.network.NetworkQualityState
 import com.zoni.jarvis.assistant.network.ZoniLiveSessionClient
 import com.zoni.jarvis.assistant.service.FloatingOrbService
 import com.zoni.jarvis.assistant.service.ZoniForegroundService
+import com.zoni.jarvis.assistant.domain.LocalCommandRouter
+import com.zoni.jarvis.assistant.domain.LocalRouteDecisionKind
+import com.zoni.jarvis.assistant.audio.VoicePipelineStage
+import com.zoni.jarvis.assistant.audio.VoiceLatencyTracker
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -105,10 +110,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var initializedConnection = false
     private var pendingVoiceStart = false
     private val persistedLiveMessageIds = HashSet<String>()
-    private val voiceLatencyTracker = com.zoni.jarvis.assistant.audio.VoiceLatencyTracker()
-    private var lastFastLocalCommandKey: String = ""
-    private var lastFastLocalCommandAtMs: Long = 0L
+    private val voiceLatencyTracker = VoiceLatencyTracker()
+    private val localCommandRouter = LocalCommandRouter(commandDispatcher = commandDispatcher)
+    private var pendingVoiceDispatchJob: Job? = null
     private var recordedFirstAudioForTurn: Boolean = false
+    private var recordedFirstTokenForTurn: Boolean = false
 
     init {
         networkMonitor.start()
@@ -285,61 +291,80 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     state.copy(messages = list)
                 }
 
-                // Measure classification + execute safe deterministic local hardware/app commands directly
-                // without waiting for a Gemini cloud round-trip (strictly deduplicated within 2.5s window).
-                voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.COMMAND_CLASSIFICATION)
-                val parsedCmd = commandDispatcher.parseCommand(mergedTranscript)
-                voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.COMMAND_CLASSIFICATION)
+                // Stage 1: Inspect streaming partial safely WITHOUT executing incomplete fragments.
+                voiceLatencyTracker.markStageStart(VoicePipelineStage.INTENT_CLASSIFICATION)
+                val previewRoute = localCommandRouter.route(mergedTranscript, isFinal = false)
+                voiceLatencyTracker.markStageEnd(VoicePipelineStage.INTENT_CLASSIFICATION)
 
-                val nowMs = System.currentTimeMillis()
-                val cmdKey = parsedCmd::class.simpleName + ":" + mergedTranscript.lowercase()
-                val isNewFastCmd = (cmdKey != lastFastLocalCommandKey) || (nowMs - lastFastLocalCommandAtMs > 2500L)
-                if (isNewFastCmd) {
-                    var executedFastLocal = false
-                    when (parsedCmd) {
-                        is com.zoni.jarvis.assistant.domain.VoiceCommand.Flashlight -> {
-                            voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
-                            hardware.setFlashlight(parsedCmd.enable)
-                            voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
-                            executedFastLocal = true
+                if (previewRoute.kind == LocalRouteDecisionKind.REQUIRES_EXPLICIT_AUTHORIZATION ||
+                    previewRoute.kind == LocalRouteDecisionKind.BLOCKED_UNSAFE
+                ) {
+                    pendingVoiceDispatchJob?.cancel()
+                    previewRoute.blockedReason?.let { reason ->
+                        _uiState.update { it.copy(latestTranscript = reason) }
+                    }
+                    return
+                }
+
+                // Wait briefly for streaming chunks to settle before committing local execution so
+                // incomplete partials ("open", "whatsapp-এ", "open youtube and") never fire early.
+                pendingVoiceDispatchJob?.cancel()
+                if (previewRoute.kind == LocalRouteDecisionKind.WAIT_FOR_MORE_SPEECH) {
+                    return
+                }
+
+                val capturedTranscript = mergedTranscript
+                pendingVoiceDispatchJob = viewModelScope.launch {
+                    delay(140L)
+                    voiceLatencyTracker.markStageStart(VoicePipelineStage.COMMAND_CLASSIFICATION)
+                    val finalRoute = localCommandRouter.route(capturedTranscript, isFinal = true)
+                    voiceLatencyTracker.markStageEnd(VoicePipelineStage.COMMAND_CLASSIFICATION)
+
+                    when (finalRoute.kind) {
+                        LocalRouteDecisionKind.LOCAL_DIRECT -> {
+                            val cmd = finalRoute.command ?: return@launch
+                            val localReq = mapVoiceCommandToLocalTypedRequest(cmd) ?: return@launch
+                            val primaryStage = finalRoute.primaryLatencyStage ?: VoicePipelineStage.LOCAL_ACTION_DISPATCH
+                            voiceLatencyTracker.markStageStart(VoicePipelineStage.LOCAL_ACTION_DISPATCH)
+                            voiceLatencyTracker.markStageStart(primaryStage)
+                            voiceLatencyTracker.markStageStart(VoicePipelineStage.ACTION_EXECUTION)
+                            val result = withContext(Dispatchers.IO) {
+                                hardware.deviceActionExecutor.executeTypedAction(localReq)
+                            }
+                            voiceLatencyTracker.markStageEnd(VoicePipelineStage.ACTION_EXECUTION)
+                            voiceLatencyTracker.markStageEnd(primaryStage)
+                            voiceLatencyTracker.markStageEnd(VoicePipelineStage.LOCAL_ACTION_DISPATCH)
+                            voiceLatencyTracker.finishTurn(executedLocally = true)
+                            localMemoryRepository.recordFrequentCommand(capturedTranscript)
+                            _uiState.update { it.copy(latestTranscript = result.message) }
                         }
-                        is com.zoni.jarvis.assistant.domain.VoiceCommand.Volume -> {
-                            voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
-                            hardware.adjustVolume(parsedCmd.action)
-                            voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
-                            executedFastLocal = true
+                        LocalRouteDecisionKind.LOCAL_DATETIME -> {
+                            val dt = finalRoute.dateTimeQuery ?: return@launch
+                            voiceLatencyTracker.markStageStart(VoicePipelineStage.LOCAL_ACTION_DISPATCH)
+                            val reply = when (dt) {
+                                BengaliDateTimeEngine.DateTimeQueryType.TIME -> BengaliDateTimeEngine.formatBengaliSpokenTime()
+                                BengaliDateTimeEngine.DateTimeQueryType.DATE -> BengaliDateTimeEngine.formatBengaliDate()
+                                BengaliDateTimeEngine.DateTimeQueryType.WEEKDAY -> BengaliDateTimeEngine.formatBengaliWeekday()
+                            }
+                            voiceLatencyTracker.markStageEnd(VoicePipelineStage.LOCAL_ACTION_DISPATCH)
+                            voiceLatencyTracker.finishTurn(executedLocally = true)
+                            _uiState.update { it.copy(latestTranscript = reply) }
                         }
-                        is com.zoni.jarvis.assistant.domain.VoiceCommand.OpenCamera -> {
-                            voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
-                            hardware.openCamera()
-                            voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
-                            executedFastLocal = true
-                        }
-                        is com.zoni.jarvis.assistant.domain.VoiceCommand.OpenSettings -> {
-                            voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
-                            hardware.openSystemSettings(parsedCmd.target)
-                            voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
-                            executedFastLocal = true
-                        }
-                        is com.zoni.jarvis.assistant.domain.VoiceCommand.LaunchApp -> {
-                            voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
-                            hardware.launchInstalledApp(parsedCmd.appName)
-                            voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.ACTION_EXECUTION)
-                            executedFastLocal = true
+                        LocalRouteDecisionKind.REQUIRES_EXPLICIT_AUTHORIZATION,
+                        LocalRouteDecisionKind.BLOCKED_UNSAFE -> {
+                            finalRoute.blockedReason?.let { reason ->
+                                _uiState.update { it.copy(latestTranscript = reason) }
+                            }
                         }
                         else -> Unit
-                    }
-                    if (executedFastLocal) {
-                        lastFastLocalCommandKey = cmdKey
-                        lastFastLocalCommandAtMs = nowMs
-                        voiceLatencyTracker.finishTurn(executedLocally = true)
                     }
                 }
             }
             is LiveServerEvent.AudioChunk -> {
                 if (!recordedFirstAudioForTurn) {
                     recordedFirstAudioForTurn = true
-                    voiceLatencyTracker.markStageEnd(com.zoni.jarvis.assistant.audio.VoicePipelineStage.VOICE_RESPONSE)
+                    voiceLatencyTracker.markStageEnd(VoicePipelineStage.FIRST_AUDIBLE_TTS)
+                    voiceLatencyTracker.markStageEnd(VoicePipelineStage.VOICE_RESPONSE)
                 }
                 val st = _uiState.value
                 if (!st.settings.voiceMuted && (st.isLiveActive || st.settings.voiceAutoPlay)) {
@@ -349,6 +374,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             is LiveServerEvent.OutputTranscript -> {
+                if (!recordedFirstTokenForTurn && event.text.isNotBlank()) {
+                    recordedFirstTokenForTurn = true
+                    voiceLatencyTracker.markStageEnd(VoicePipelineStage.GEMINI_FIRST_TOKEN)
+                }
                 val (cleanText, action) = MobileAssistantEngine.extractActionTagFromText(event.text)
                 if (action != null) {
                     hardware.executeAction(action)
@@ -408,6 +437,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 currentAssistantTurnId = event.turnId + 1
                 userSpeechTurnId += 1
                 recordedFirstAudioForTurn = false
+                recordedFirstTokenForTurn = false
                 voiceLatencyTracker.finishTurn(executedLocally = false)
                 _uiState.update {
                     it.copy(
@@ -453,9 +483,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val started = audioEngine.startMicrophoneCapture(
             onSpeechEnded = {
                 recordedFirstAudioForTurn = false
-                voiceLatencyTracker.beginTurn()
-                voiceLatencyTracker.markStageStart(com.zoni.jarvis.assistant.audio.VoicePipelineStage.VOICE_RESPONSE)
+                recordedFirstTokenForTurn = false
+                voiceLatencyTracker.markStageStart(VoicePipelineStage.GEMINI_FIRST_TOKEN)
+                voiceLatencyTracker.markStageStart(VoicePipelineStage.FIRST_AUDIBLE_TTS)
+                voiceLatencyTracker.markStageStart(VoicePipelineStage.VOICE_RESPONSE)
                 liveClient.sendAudioStreamEnd()
+            },
+            onSpeechEndedWithLatency = { eosLatencyMs ->
+                voiceLatencyTracker.beginTurn()
+                voiceLatencyTracker.recordStageDurationMs(
+                    VoicePipelineStage.SPEECH_ENDPOINT_DETECTION,
+                    eosLatencyMs.toDouble()
+                )
+            },
+            onBargeInDetected = {
+                liveClient.sendInterrupt()
+                _uiState.update {
+                    it.copy(assistantState = if (it.isLiveActive) AssistantState.LISTENING else AssistantState.IDLE)
+                }
             }
         ) { base64Chunk ->
             liveClient.sendAudioChunk(base64Chunk)
@@ -635,12 +680,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            // 4b. Execute deterministic local device/app/accessibility/WhatsApp/call commands WITHOUT waiting for Gemini Cloud
-            val localRequest = mapVoiceCommandToLocalTypedRequest(commandDispatcher.parseCommand(text))
+            // 4b. Route through LocalCommandRouter (consequential-action guard + deterministic on-device execution)
+            voiceLatencyTracker.beginTurn()
+            voiceLatencyTracker.markStageStart(VoicePipelineStage.INTENT_CLASSIFICATION)
+            val routeDecision = localCommandRouter.route(text, isFinal = true)
+            voiceLatencyTracker.markStageEnd(VoicePipelineStage.INTENT_CLASSIFICATION)
+
+            if (routeDecision.kind == LocalRouteDecisionKind.REQUIRES_EXPLICIT_AUTHORIZATION ||
+                routeDecision.kind == LocalRouteDecisionKind.BLOCKED_UNSAFE
+            ) {
+                val blockedMsg = routeDecision.blockedReason ?: "This action requires explicit manual authorization."
+                appendMessage(MessageRole.ASSISTANT, blockedMsg, settings.activeLanguage)
+                _uiState.update { it.copy(latestTranscript = blockedMsg, assistantState = AssistantState.IDLE) }
+                return@launch
+            }
+
+            val localCmd = routeDecision.command ?: commandDispatcher.parseCommand(text)
+            val localRequest = mapVoiceCommandToLocalTypedRequest(localCmd)
             if (localRequest != null) {
+                val primaryStage = routeDecision.primaryLatencyStage ?: VoicePipelineStage.LOCAL_ACTION_DISPATCH
+                voiceLatencyTracker.markStageStart(VoicePipelineStage.LOCAL_ACTION_DISPATCH)
+                voiceLatencyTracker.markStageStart(primaryStage)
+                voiceLatencyTracker.markStageStart(VoicePipelineStage.ACTION_EXECUTION)
                 val result = withContext(Dispatchers.IO) {
                     hardware.deviceActionExecutor.executeTypedAction(localRequest)
                 }
+                voiceLatencyTracker.markStageEnd(VoicePipelineStage.ACTION_EXECUTION)
+                voiceLatencyTracker.markStageEnd(primaryStage)
+                voiceLatencyTracker.markStageEnd(VoicePipelineStage.LOCAL_ACTION_DISPATCH)
+                voiceLatencyTracker.finishTurn(executedLocally = true)
                 localMemoryRepository.recordFrequentCommand(text)
                 appendMessage(MessageRole.ASSISTANT, result.message, settings.activeLanguage)
                 _uiState.update { it.copy(latestTranscript = result.message, assistantState = AssistantState.IDLE) }

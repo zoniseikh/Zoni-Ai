@@ -26,6 +26,7 @@ import {
   getIndiaDateTimeSummary,
 } from './bengaliDateTime';
 import { sanitizeGeminiSecret } from './apiConfig';
+import { StreamingSentenceChunker } from './streamingTts';
 
 const CITY_TIMEZONE_MAP: Record<string, string> = {
   kolkata: 'Asia/Kolkata',
@@ -809,6 +810,334 @@ export async function sendDirectGeminiChat(
     blockedToolCalls,
     modelUsed,
   };
+}
+
+export interface StreamDirectGeminiChatResult extends DirectGeminiChatResult {
+  firstTokenLatencyMs: number | null;
+  streamedChunkCount: number;
+  usedStreaming: boolean;
+}
+
+/**
+ * Streaming BYOK Gemini Chat via `streamGenerateContent?alt=sse`.
+ * Emits incremental text deltas and natural sentence segments immediately so
+ * TTS can begin speaking on the very first sentence without waiting for the full reply.
+ * Preserves full 36-tool function calling validation and falls back seamlessly if SSE
+ * streaming is unavailable in the runtime environment.
+ */
+export async function streamDirectGeminiChat(
+  options: {
+    apiKey: string;
+    message: string;
+    history?: Array<{ role: 'user' | 'assistant' | 'model'; text: string }>;
+    mode?: CompanionMode | string;
+    selectedAffectionName?: string;
+    lang?: SupportedLanguage;
+    preferredModel?: string;
+    memoryContext?: string;
+    signal?: AbortSignal;
+    onFirstToken?: (latencyMs: number) => void;
+    onTextDelta?: (delta: string, fullText: string) => void;
+    onSentenceSegment?: (segment: string) => void;
+  },
+  fetchFn: typeof fetch = fetch
+): Promise<StreamDirectGeminiChatResult> {
+  const lang: SupportedLanguage = options.lang || 'bn-BD';
+  const cleanKey = String(options.apiKey || '').trim();
+  const cleanMessage = String(options.message || '').trim().slice(0, 4000);
+  const activeAffectionName =
+    String(options.selectedAffectionName || 'Boss').trim().slice(0, 60) || 'Boss';
+
+  const nowClock = () =>
+    typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
+  const startedAtMs = nowClock();
+
+  // Deterministic Asia/Kolkata time/date/weekday works instantly even offline
+  const dtQuery = detectDateTimeQuery(cleanMessage);
+  if (dtQuery) {
+    const reply =
+      dtQuery === 'time'
+        ? formatBengaliSpokenTime()
+        : dtQuery === 'date'
+        ? formatBengaliDate()
+        : formatBengaliWeekday();
+    const elapsed = Math.max(0, nowClock() - startedAtMs);
+    options.onFirstToken?.(elapsed);
+    options.onTextDelta?.(reply, reply);
+    options.onSentenceSegment?.(reply);
+    return {
+      reply,
+      toolCalls: [],
+      blockedToolCalls: [],
+      modelUsed: 'local-ist-clock',
+      isDirectDateTime: true,
+      firstTokenLatencyMs: elapsed,
+      streamedChunkCount: 1,
+      usedStreaming: false,
+    };
+  }
+
+  if (!cleanKey) {
+    const classified = classifyDirectGeminiError('GEMINI_KEY_MISSING', '', lang);
+    const err: any = new Error(classified.message);
+    err.code = classified.code;
+    err.retryable = false;
+    throw err;
+  }
+
+  const lowerMessage = cleanMessage.toLowerCase();
+  let explicitLocation: string | undefined;
+  for (const cityKey of Object.keys(CITY_TIMEZONE_MAP)) {
+    const regex = new RegExp(`\\b${cityKey}\\b`, 'i');
+    if (regex.test(lowerMessage)) {
+      explicitLocation = cityKey;
+      break;
+    }
+  }
+
+  const systemInstruction = buildZoniSystemInstruction(
+    options.mode || 'romantic',
+    activeAffectionName,
+    explicitLocation,
+    lang,
+    options.memoryContext
+  );
+
+  const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
+  if (Array.isArray(options.history)) {
+    for (const turn of options.history.slice(-10)) {
+      if (turn && typeof turn.text === 'string' && turn.text.trim()) {
+        contents.push({
+          role: turn.role === 'user' ? 'user' : 'model',
+          parts: [{ text: turn.text.trim().slice(0, 4000) }],
+        });
+      }
+    }
+  }
+  contents.push({
+    role: 'user',
+    parts: [{ text: cleanMessage }],
+  });
+
+  const modelOrder = options.preferredModel
+    ? [
+        options.preferredModel,
+        ...DIRECT_CHAT_MODEL_CANDIDATES.filter((m) => m !== options.preferredModel),
+      ]
+    : [...DIRECT_CHAT_MODEL_CANDIDATES];
+
+  const requestBody = {
+    systemInstruction: {
+      parts: [{ text: systemInstruction }],
+    },
+    contents,
+    tools: [
+      {
+        functionDeclarations: buildGeminiFunctionDeclarations(),
+      },
+    ],
+  };
+
+  let lastError: ClassifiedGeminiError | null = null;
+
+  for (let i = 0; i < modelOrder.length; i++) {
+    const model = modelOrder[i];
+    const url = `${GEMINI_REST_BASE_URL}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
+    try {
+      const res = await fetchFn(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': cleanKey,
+        },
+        body: JSON.stringify(requestBody),
+        signal: options.signal,
+      });
+
+      if (!res.ok) {
+        const rawErr = await res.text();
+        let parsedErr: any = {};
+        try {
+          parsedErr = rawErr ? JSON.parse(rawErr) : {};
+        } catch {
+          parsedErr = {};
+        }
+        const classified = classifyDirectGeminiError(
+          res.status,
+          parsedErr?.error?.message || rawErr,
+          lang,
+          cleanKey
+        );
+        lastError = classified;
+        if (
+          (classified.code === 'GEMINI_MODEL_UNAVAILABLE' ||
+            classified.code === 'GEMINI_TEMPORARILY_BUSY') &&
+          i < modelOrder.length - 1
+        ) {
+          continue;
+        }
+        const thrown: any = new Error(classified.message);
+        thrown.code = classified.code;
+        thrown.retryable = classified.retryable;
+        thrown.status = classified.status;
+        throw thrown;
+      }
+
+      if (!res.body || typeof res.body.getReader !== 'function') {
+        // Fallback for environments where Fetch streaming reader is unavailable
+        const nonStream = await sendDirectGeminiChat(options, fetchFn);
+        const elapsed = Math.max(0, nowClock() - startedAtMs);
+        options.onFirstToken?.(elapsed);
+        if (nonStream.reply) {
+          options.onTextDelta?.(nonStream.reply, nonStream.reply);
+          const fallbackChunker = new StreamingSentenceChunker();
+          for (const seg of fallbackChunker.pushDelta(nonStream.reply)) {
+            options.onSentenceSegment?.(seg);
+          }
+          for (const seg of fallbackChunker.flush()) {
+            options.onSentenceSegment?.(seg);
+          }
+        }
+        return {
+          ...nonStream,
+          firstTokenLatencyMs: elapsed,
+          streamedChunkCount: 1,
+          usedStreaming: false,
+        };
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      const chunker = new StreamingSentenceChunker();
+      let sseBuffer = '';
+      let accumulatedText = '';
+      let firstTokenLatencyMs: number | null = null;
+      let streamedChunkCount = 0;
+      const rawFunctionCalls: Array<{
+        id?: string;
+        name?: string;
+        args?: Record<string, unknown>;
+      }> = [];
+
+      const consumeSsePayload = (jsonLine: string) => {
+        const trimmed = jsonLine.trim();
+        if (!trimmed || trimmed === '[DONE]') return;
+        let parsed: any;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          return;
+        }
+        const { text: deltaText, rawFunctionCalls: fcs } =
+          extractRestTextAndFunctionCalls(parsed);
+        if (fcs.length > 0) {
+          rawFunctionCalls.push(...fcs);
+        }
+        if (deltaText) {
+          streamedChunkCount += 1;
+          if (firstTokenLatencyMs === null) {
+            firstTokenLatencyMs = Math.max(0, nowClock() - startedAtMs);
+            options.onFirstToken?.(firstTokenLatencyMs);
+          }
+          accumulatedText += deltaText;
+          options.onTextDelta?.(deltaText, accumulatedText);
+          // Only emit sentence segments for TTS when no tool calls have interrupted the turn
+          if (rawFunctionCalls.length === 0) {
+            const segments = chunker.pushDelta(deltaText);
+            for (const seg of segments) {
+              options.onSentenceSegment?.(seg);
+            }
+          }
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        sseBuffer += decoder.decode(value, { stream: true });
+        const lines = sseBuffer.split(/\r?\n/);
+        sseBuffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line.startsWith('data:')) {
+            consumeSsePayload(line.slice(5));
+          }
+        }
+      }
+
+      if (sseBuffer.trim().startsWith('data:')) {
+        consumeSsePayload(sseBuffer.trim().slice(5));
+      }
+
+      if (rawFunctionCalls.length === 0) {
+        for (const trailing of chunker.flush()) {
+          options.onSentenceSegment?.(trailing);
+        }
+      }
+
+      const validatedToolCalls: ValidatedActionRequest[] = [];
+      const blockedToolCalls: Array<{ name: string; reason: string }> = [];
+      for (const fc of rawFunctionCalls) {
+        const validation = validateGeminiToolCall(
+          String(fc.name || ''),
+          fc.args || {},
+          fc.id
+        );
+        if (validation.valid && validation.request) {
+          validatedToolCalls.push(validation.request);
+        } else {
+          blockedToolCalls.push({
+            name: String(fc.name || 'unknown'),
+            reason: validation.blockedReason || 'Blocked by allowlist policy.',
+          });
+        }
+      }
+
+      const reply =
+        accumulatedText.trim() ||
+        (validatedToolCalls.length > 0
+          ? lang === 'bn-BD'
+            ? `${activeAffectionName}, আপনার অনুরোধ অনুযায়ী অ্যাকশন প্রস্তুত করা হচ্ছে...`
+            : lang === 'hi-IN'
+            ? `${activeAffectionName}, आपके अनुरोध के अनुसार कार्रवाई तैयार की जा रही है...`
+            : `Preparing your requested action, ${activeAffectionName}...`
+          : lang === 'bn-BD'
+          ? `আমি সবসময় আপনার পাশে আছি ${activeAffectionName} ❤️`
+          : `I am always right here with you, ${activeAffectionName} ❤️`);
+
+      return {
+        reply,
+        toolCalls: validatedToolCalls,
+        blockedToolCalls,
+        modelUsed: model,
+        firstTokenLatencyMs,
+        streamedChunkCount,
+        usedStreaming: true,
+      };
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        throw err;
+      }
+      if (err?.code && String(err.code).startsWith('GEMINI_')) {
+        throw err;
+      }
+      const classified = classifyDirectGeminiError(err, '', lang, cleanKey);
+      lastError = classified;
+      const thrown: any = new Error(classified.message);
+      thrown.code = classified.code;
+      thrown.retryable = classified.retryable;
+      thrown.status = classified.status;
+      throw thrown;
+    }
+  }
+
+  const finalErr: any = new Error(
+    lastError?.message || 'Gemini streaming request failed across all configured models.'
+  );
+  finalErr.code = lastError?.code || 'GEMINI_UPSTREAM_ERROR';
+  finalErr.retryable = lastError?.retryable ?? true;
+  throw finalErr;
 }
 
 /**

@@ -11,9 +11,16 @@ enum class VoicePipelineStage(val key: String) {
     MIC_CAPTURE("mic_capture"),
     AUDIO_PROCESSING("audio_processing"),
     WAKE_WORD_DETECTION("wake_word_detection"),
+    SPEECH_ENDPOINT_DETECTION("speech_endpoint_detection"),
     SPEECH_RECOGNITION("speech_recognition"),
+    INTENT_CLASSIFICATION("intent_classification"),
     COMMAND_CLASSIFICATION("command_classification"),
+    LOCAL_ACTION_DISPATCH("local_action_dispatch"),
+    APPLICATION_LAUNCH("application_launch"),
+    ACCESSIBILITY_INTERACTION("accessibility_interaction"),
     ACTION_EXECUTION("action_execution"),
+    GEMINI_FIRST_TOKEN("gemini_first_token"),
+    FIRST_AUDIBLE_TTS("first_audible_tts"),
     VOICE_RESPONSE("voice_response")
 }
 

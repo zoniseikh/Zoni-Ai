@@ -296,9 +296,9 @@ export function detectDateTimeQuery(text: string): 'time' | 'date' | 'weekday' |
 
   // Time query detection
   if (
-    /(?:কয়টা|কয়টা)\s*বাজে/.test(clean) ||
+    /(?:কয়টা|কয়টা|কটা)\s*বাজে/.test(clean) ||
     /(?:সময়|সময়|shomoy)\s*(?:কত|koto|বলো|বলুন)/.test(clean) ||
-    /এখন\s*(?:কয়টা|কয়টা|সময়|সময়)/.test(clean) ||
+    /এখন\s*(?:কয়টা|কয়টা|কটা|সময়|সময়)/.test(clean) ||
     /\bwhat\s*time\s*is\s*it\b/i.test(clean) ||
     /\bwhat\s*(?:is\s*the\s*|['’]s\s*the\s*|is\s*)time\b/i.test(clean) ||
     /\bcurrent\s*time\b/i.test(clean) ||

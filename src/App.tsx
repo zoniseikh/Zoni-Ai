@@ -72,9 +72,18 @@ import {
   sendDirectGeminiChat,
   sendDirectGeminiToolFeedback,
   shouldDropLiveAudioForBackpressure,
+  streamDirectGeminiChat,
   synthesizeDirectGeminiTts,
   verifyDirectGeminiApiKey,
 } from './utils/geminiDirectClient';
+import { StreamingTtsQueue } from './utils/streamingTts';
+import {
+  LocalCommandDeduplicator,
+  buildEnhancedLocalTaskPlan,
+  formatImmediateLocalFeedback,
+  requiresExplicitConsequentialAuthorization,
+  routeVoiceCommandLocalFirst,
+} from './utils/localCommandRouter';
 import {
   clearAllLocalConversationHistory,
   clearAllLocalLongTermMemory,
@@ -123,7 +132,7 @@ import {
   type IncomingCallStatusSnapshot,
   type VoiceLifecycleState,
 } from './utils/voiceLifecycle';
-import { buildStructuredTaskPlan, TaskStep } from './utils/taskExecutionEngine';
+import { TaskStep } from './utils/taskExecutionEngine';
 import {
   ASSISTANT_TOOL_SPECS,
   validateGeminiToolCall,
@@ -619,7 +628,9 @@ export default function App() {
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const fastEosDetectorRef = useRef<FastEndOfSpeechDetector>(new FastEndOfSpeechDetector());
-  const nearFieldGateRef = useRef<NearFieldSpeechGate>(new NearFieldSpeechGate());
+  const nearFieldGateRef = useRef<NearFieldSpeechGate>(
+    new NearFieldSpeechGate({ allowBargeIn: true })
+  );
   const speechHighPassRef = useRef<SpeechHighPassFilter>(new SpeechHighPassFilter());
   const voiceLatencyTrackerRef = useRef<VoiceLatencyTracker>(new VoiceLatencyTracker());
   const lastHandledWakeEventRef = useRef<{ detectedAtMs: number; handledAtMs: number }>({
@@ -632,6 +643,11 @@ export default function App() {
   const liveToolExecutedInTurnRef = useRef<boolean>(false);
   const currentSpeechTranscriptRef = useRef<string>('');
   const voiceTranscriptDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const localCommandDeduplicatorRef = useRef<LocalCommandDeduplicator>(
+    new LocalCommandDeduplicator(2500)
+  );
+  const streamingTtsQueueRef = useRef<StreamingTtsQueue | null>(null);
+  const activeStreamAbortRef = useRef<AbortController | null>(null);
   const recentActionDeduplicatorRef = useRef<RecentActionDeduplicator>(
     new RecentActionDeduplicator(5000)
   );
@@ -679,12 +695,82 @@ export default function App() {
     selectedVoiceRef.current = vitals.selectedVoice;
   }, [vitals.selectedVoice]);
 
+  // Lazily initialized interruptible sentence-by-sentence TTS queue (prevents playback/mic overlap)
+  const getStreamingTtsQueue = useCallback(() => {
+    if (!streamingTtsQueueRef.current) {
+      streamingTtsQueueRef.current = new StreamingTtsQueue({
+        synthesizeSegment: async (segmentText, signal) => {
+          if (signal.aborted || voiceMutedRef.current) return null;
+          const apiKey = getGeminiApiKeyForRequest();
+          if (!apiKey) return null;
+          const audioB64 = await synthesizeDirectGeminiTts({
+            apiKey,
+            text: segmentText,
+            voice: selectedVoiceRef.current || 'Kore',
+            lang: activeLanguageRef.current,
+          });
+          return signal.aborted ? null : audioB64;
+        },
+        playAudioBase64: async (audioBase64) => {
+          if (voiceMutedRef.current) return;
+          liveAudioPlayerRef.current?.playPcmChunk(audioBase64, 24000);
+          // Estimate PCM duration (~24kHz 16-bit mono = 48000 bytes/sec) so queued segments serialize cleanly
+          const approxBytes = Math.floor((audioBase64.length * 3) / 4);
+          const durationMs = Math.max(120, Math.min(12000, Math.round((approxBytes / 48000) * 1000)));
+          await new Promise<void>((resolve) => setTimeout(resolve, durationMs));
+        },
+        stopAudioPlayback: () => {
+          liveAudioPlayerRef.current?.stopAll();
+        },
+        onSpeakingStateChange: (speaking) => {
+          isAssistantSpeakingRef.current = speaking;
+          if (speaking) {
+            setAssistantState('speaking');
+          } else if (!isUnmountedRef.current) {
+            setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
+          }
+        },
+        onFirstAudibleSegment: (_segmentText, elapsedMs) => {
+          voiceLatencyTrackerRef.current.recordStageDurationMs('first_audible_tts', elapsedMs);
+          voiceLatencyTrackerRef.current.markStageEnd('voice_response');
+        },
+      });
+    }
+    return streamingTtsQueueRef.current;
+  }, []);
+
+  // Short immediate voice confirmation for verified local actions (non-blocking)
+  const speakShortLocalConfirmation = useCallback(
+    (feedbackText: string) => {
+      const clean = (feedbackText || '').trim();
+      if (!clean || voiceMutedRef.current || !voiceAutoPlayRef.current) return;
+      if (isAssistantSpeakingRef.current || liveAudioPlayerRef.current?.isPlaying()) return;
+      const apiKey = getGeminiApiKeyForRequest();
+      if (!apiKey) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      const queue = getStreamingTtsQueue();
+      queue.beginTurn();
+      queue.enqueue(clean);
+    },
+    [getStreamingTtsQueue]
+  );
+
   // Stop any ongoing spoken audio to prevent overlapping duplicate audio
   const stopAllSpeechPlayback = useCallback(() => {
     stopAllBrowserSpeech();
+    if (activeStreamAbortRef.current) {
+      try {
+        activeStreamAbortRef.current.abort();
+      } catch {
+        // ignore abort errors
+      }
+      activeStreamAbortRef.current = null;
+    }
+    streamingTtsQueueRef.current?.interrupt();
     if (liveAudioPlayerRef.current) {
       liveAudioPlayerRef.current.stopAll();
     }
+    isAssistantSpeakingRef.current = false;
   }, []);
 
   // Clear thinking timeout helper
@@ -1827,7 +1913,31 @@ export default function App() {
 
         if (userApiKey) {
           const compactMemory = getCompactLocalMemoryContext(cleanText);
-          const directRes = await sendDirectGeminiChat({
+          const streamMsgId = `${clientMsgId}-http-reply`;
+          const canStreamTts =
+            !voiceMutedRef.current && (isLiveActiveRef.current || voiceAutoPlayRef.current);
+          const ttsQueue = canStreamTts ? getStreamingTtsQueue() : null;
+          const turnStartMs =
+            typeof performance !== 'undefined' && typeof performance.now === 'function'
+              ? performance.now()
+              : Date.now();
+          if (ttsQueue) {
+            ttsQueue.beginTurn(turnStartMs);
+          }
+
+          if (activeStreamAbortRef.current) {
+            try {
+              activeStreamAbortRef.current.abort();
+            } catch {
+              // ignore
+            }
+          }
+          const streamAbort = new AbortController();
+          activeStreamAbortRef.current = streamAbort;
+          voiceLatencyTrackerRef.current.beginTurn();
+          voiceLatencyTrackerRef.current.markStageStart('voice_response');
+
+          const directRes = await streamDirectGeminiChat({
             apiKey: userApiKey,
             message: cleanText,
             history: historySnapshot,
@@ -1836,9 +1946,48 @@ export default function App() {
             lang: activeLanguageRef.current,
             preferredModel: preferredChatModelRef.current,
             memoryContext: compactMemory || undefined,
+            signal: streamAbort.signal,
+            onFirstToken: (latencyMs) => {
+              voiceLatencyTrackerRef.current.recordStageDurationMs('gemini_first_token', latencyMs);
+            },
+            onTextDelta: (_delta, fullText) => {
+              if (isUnmountedRef.current) return;
+              const cleanPartial = fullText.replace(/\[ACTION:[^\]]+\]/gi, '').trim();
+              if (!cleanPartial) return;
+              setLatestTranscript(cleanPartial);
+              setMessages((prev) => {
+                const idx = prev.findIndex((m) => m.id === streamMsgId);
+                if (idx >= 0) {
+                  const copy = prev.slice();
+                  copy[idx] = { ...copy[idx], text: cleanPartial };
+                  return copy;
+                }
+                return [
+                  ...prev,
+                  {
+                    id: streamMsgId,
+                    role: 'assistant',
+                    text: cleanPartial,
+                    timestamp: new Date(),
+                    lang: activeLanguageRef.current,
+                  },
+                ];
+              });
+            },
+            onSentenceSegment: (segment) => {
+              if (ttsQueue && !streamAbort.signal.aborted) {
+                ttsQueue.enqueue(segment);
+              }
+            },
           });
+          if (activeStreamAbortRef.current === streamAbort) {
+            activeStreamAbortRef.current = null;
+          }
           serverToolCalls = directRes.toolCalls;
           finalReply = directRes.reply.trim();
+          if (serverToolCalls.length > 0 && ttsQueue) {
+            ttsQueue.interrupt();
+          }
         } else if (serverManagedAvailableRef.current) {
           const res = await fetch(buildServerApiUrl('/api/chat'), {
             method: 'POST',
@@ -1981,7 +2130,12 @@ export default function App() {
         }
 
         setMessages((prev) => {
-          if (prev.some((m) => m.id === `${clientMsgId}-http-reply`)) return prev;
+          const existingIdx = prev.findIndex((m) => m.id === `${clientMsgId}-http-reply`);
+          if (existingIdx >= 0) {
+            const copy = prev.slice();
+            copy[existingIdx] = { ...copy[existingIdx], text: finalReply };
+            return copy;
+          }
           return [
             ...prev,
             {
@@ -2002,7 +2156,10 @@ export default function App() {
         if (!liveNonRetryableErrorRef.current) {
           setConnectionError(null);
         }
-        setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
+        voiceLatencyTrackerRef.current.finishTurn(false);
+        if (!streamingTtsQueueRef.current?.isActive()) {
+          setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
+        }
       } catch (err: any) {
         const errMessage =
           sanitizeGeminiSecret(err, userApiKey) ||
@@ -2035,7 +2192,7 @@ export default function App() {
         });
       }
     },
-    [clearTurnTimeout, executeValidatedAssistantTool, recordActionDiagnostic]
+    [clearTurnTimeout, executeValidatedAssistantTool, getStreamingTtsQueue, recordActionDiagnostic]
   );
 
   // Translate a generic ZONI Live command object into the wire format of the active transport
@@ -2249,18 +2406,55 @@ export default function App() {
             clearTimeout(voiceTranscriptDebounceRef.current);
           }
           const utteranceSnapshot = currentSpeechTranscriptRef.current;
+
+          // Stage 1: Inspect streaming partial safely WITHOUT executing incomplete commands
+          voiceLatencyTrackerRef.current.markStageStart('intent_classification');
+          const previewRoute = routeVoiceCommandLocalFirst(utteranceSnapshot, {
+            isFinal: false,
+          });
+          voiceLatencyTrackerRef.current.markStageEnd('intent_classification');
+
+          if (
+            previewRoute.decision === 'REQUIRES_EXPLICIT_AUTHORIZATION' ||
+            previewRoute.decision === 'BLOCKED_UNSAFE'
+          ) {
+            if (previewRoute.blockedReason) {
+              setLatestTranscript(previewRoute.blockedReason);
+            }
+            return;
+          }
+
+          // Never dispatch incomplete partials ("open", "whatsapp-এ", "call to", etc.)
+          if (!isFinal && previewRoute.decision === 'WAIT_FOR_MORE_SPEECH') {
+            return;
+          }
+
           voiceTranscriptDebounceRef.current = setTimeout(() => {
             if (isUnmountedRef.current || liveToolExecutedInTurnRef.current) return;
             const cleanSpoken = utteranceSnapshot.trim();
             if (!cleanSpoken) return;
 
-            const plan = buildStructuredTaskPlan(cleanSpoken);
-            if (plan.blockedReason) {
-              setLatestTranscript(plan.blockedReason);
+            voiceLatencyTrackerRef.current.markStageStart('command_classification');
+            const finalRoute = routeVoiceCommandLocalFirst(cleanSpoken, {
+              isFinal: true,
+              deduplicator: localCommandDeduplicatorRef.current,
+            });
+            voiceLatencyTrackerRef.current.markStageEnd('command_classification');
+
+            if (
+              finalRoute.decision === 'REQUIRES_EXPLICIT_AUTHORIZATION' ||
+              finalRoute.decision === 'BLOCKED_UNSAFE'
+            ) {
+              if (finalRoute.blockedReason) {
+                setLatestTranscript(finalRoute.blockedReason);
+              }
               return;
             }
-            if (plan.steps.length === 0) return;
+            if (finalRoute.decision !== 'LOCAL_DIRECT' || !finalRoute.plan?.steps.length) {
+              return;
+            }
 
+            const plan = finalRoute.plan;
             if (
               plan.steps.length === 1 &&
               (plan.steps[0].tool === 'approve_pending_action' ||
@@ -2269,8 +2463,13 @@ export default function App() {
               return;
             }
 
+            const primaryStage = finalRoute.primaryLatencyStage || 'local_action_dispatch';
             void (async () => {
+              voiceLatencyTrackerRef.current.markStageStart('local_action_dispatch');
+              voiceLatencyTrackerRef.current.markStageStart(primaryStage);
+              voiceLatencyTrackerRef.current.markStageStart('action_execution');
               const outcomes: string[] = [];
+              let shortVoiceAck = '';
               for (const step of plan.steps) {
                 const mapped = mapTaskStepToAssistantTool(step, cleanSpoken);
                 if (!mapped) continue;
@@ -2288,9 +2487,27 @@ export default function App() {
                     selectedAffectionNameRef.current
                   )
                 );
+                if (!shortVoiceAck) {
+                  const targetLabel = String(
+                    mapped.args.app_name ||
+                      mapped.args.contact_name ||
+                      mapped.args.recipient ||
+                      mapped.args.target ||
+                      mapped.args.element_text ||
+                      ''
+                  );
+                  shortVoiceAck = formatImmediateLocalFeedback(
+                    mapped.name,
+                    targetLabel,
+                    Boolean(report.success),
+                    activeLanguageRef.current
+                  );
+                }
               }
+              voiceLatencyTrackerRef.current.markStageEnd('action_execution');
+              voiceLatencyTrackerRef.current.markStageEnd(primaryStage);
+              voiceLatencyTrackerRef.current.markStageEnd('local_action_dispatch');
               if (outcomes.length > 0) {
-                voiceLatencyTrackerRef.current.markStageEnd('action_execution');
                 voiceLatencyTrackerRef.current.finishTurn(true);
                 const combined = outcomes.join(' ');
                 setLatestTranscript(combined);
@@ -2304,9 +2521,12 @@ export default function App() {
                     lang: activeLanguageRef.current,
                   },
                 ]);
+                if (shortVoiceAck) {
+                  speakShortLocalConfirmation(shortVoiceAck);
+                }
               }
             })();
-          }, isFinal ? 25 : 160);
+          }, isFinal ? 15 : 140);
 
           if (isFlashlightOnCommand(String(text))) {
             if (
@@ -2340,6 +2560,7 @@ export default function App() {
         const handleAudioChunkEvent = (audioB64: string) => {
           clearTurnTimeout();
           if (!receivedAudioInTurnRef.current) {
+            voiceLatencyTrackerRef.current.markStageEnd('first_audible_tts');
             voiceLatencyTrackerRef.current.markStageEnd('voice_response');
           }
           receivedAudioInTurnRef.current = true;
@@ -3013,6 +3234,7 @@ export default function App() {
       sendViaHttpChatFallback,
       serializeLivePayloadForTransport,
       settlePendingHandshake,
+      speakShortLocalConfirmation,
       stopAllSpeechPlayback,
       stopVoiceCapture,
     ]
@@ -3400,13 +3622,27 @@ export default function App() {
           const assistantTalking =
             isAssistantSpeakingRef.current || Boolean(liveAudioPlayerRef.current?.isPlaying());
 
-          // Near-field gate suppresses silence, steady ambient noise, and Zoni's playback echo (+260ms tail)
-          // while flushing 300ms pre-roll frames on speech onset so opening syllables are never clipped.
+          // Near-field gate suppresses silence, steady ambient noise, and Zoni's playback echo (+260ms tail),
+          // flushes 300ms pre-roll frames on speech onset, adapts EOS timeout to utterance length, and
+          // supports controlled near-field user barge-in interruption while assistant is speaking.
           const gateDecision = nearFieldGateRef.current.processFrame(
             pcm16k,
             frameDurationMs,
             assistantTalking
           );
+
+          if (gateDecision.shouldInterruptAssistant) {
+            stopAllSpeechPlayback();
+            receivedAudioInTurnRef.current = false;
+            setAssistantState('listening');
+            if (wsRef.current?.readyState === WebSocket.OPEN && liveTransportModeRef.current === 'server_managed') {
+              try {
+                wsRef.current.send(JSON.stringify({ type: 'interrupt' }));
+              } catch {
+                // ignore
+              }
+            }
+          }
 
           try {
             const weakNet =
@@ -3441,6 +3677,12 @@ export default function App() {
               wsRef.current?.readyState === WebSocket.OPEN
             ) {
               voiceLatencyTrackerRef.current.beginTurn();
+              voiceLatencyTrackerRef.current.recordStageDurationMs(
+                'speech_endpoint_detection',
+                gateDecision.endpointDetectionLatencyMs
+              );
+              voiceLatencyTrackerRef.current.markStageStart('gemini_first_token');
+              voiceLatencyTrackerRef.current.markStageStart('first_audible_tts');
               voiceLatencyTrackerRef.current.markStageStart('voice_response');
               // Immediately flush Gemini Live's audio buffer so Zoni replies right away
               if (liveTransportModeRef.current === 'byok_direct') {
@@ -3749,8 +3991,23 @@ export default function App() {
         return;
       }
 
-      // 2. Structured personal assistant task orchestration (contact SIM call, WhatsApp draft, screen awareness, notifications, accessibility, volume, camera, apps, flashlight)
-      const taskPlan = buildStructuredTaskPlan(cleanText);
+      // 2. Consequential-action authorization guard + Local-first structured task orchestration
+      const consequentialBlock = requiresExplicitConsequentialAuthorization(cleanText);
+      if (consequentialBlock) {
+        setMessages((prev) => [
+          ...prev,
+          { id: clientMsgId, role: 'user', text: cleanText, timestamp: new Date(), lang: activeLanguage },
+          { id: `${clientMsgId}-auth-guard`, role: 'assistant', text: consequentialBlock, timestamp: new Date(), lang: activeLanguage },
+        ]);
+        setLatestTranscript(consequentialBlock);
+        setAssistantState('idle');
+        return;
+      }
+
+      voiceLatencyTrackerRef.current.beginTurn();
+      voiceLatencyTrackerRef.current.markStageStart('intent_classification');
+      const taskPlan = buildEnhancedLocalTaskPlan(cleanText);
+      voiceLatencyTrackerRef.current.markStageEnd('intent_classification');
       if (taskPlan.blockedReason) {
         const blockedMsg: ChatMessage = {
           id: `${clientMsgId}-blocked`,
@@ -3797,6 +4054,8 @@ export default function App() {
         setAssistantState('thinking');
 
         const outcomes: string[] = [];
+        let shortLocalAck = '';
+        voiceLatencyTrackerRef.current.markStageStart('local_action_dispatch');
         for (const step of taskPlan.steps) {
           const mapped = mapTaskStepToAssistantTool(step, cleanText);
           if (mapped) {
@@ -3806,6 +4065,22 @@ export default function App() {
             outcomes.push(
               formatLocalizedActionOutcome(report, activeLanguage, selectedAffectionName)
             );
+            if (!shortLocalAck) {
+              const targetLabel = String(
+                mapped.args.app_name ||
+                  mapped.args.contact_name ||
+                  mapped.args.recipient ||
+                  mapped.args.target ||
+                  mapped.args.element_text ||
+                  ''
+              );
+              shortLocalAck = formatImmediateLocalFeedback(
+                mapped.name,
+                targetLabel,
+                Boolean(report.success),
+                activeLanguage
+              );
+            }
           } else if (step.tool === 'vibrate') {
             executeAssistantActionDirectly({ type: 'vibrate', label: 'Vibrate' });
             outcomes.push(activeLanguage === 'bn-BD' ? 'ভাইব্রেশন চালানো হয়েছে।' : 'Vibration triggered.');
@@ -3818,8 +4093,10 @@ export default function App() {
             );
           }
         }
+        voiceLatencyTrackerRef.current.markStageEnd('local_action_dispatch');
 
         if (outcomes.length > 0) {
+          voiceLatencyTrackerRef.current.finishTurn(true);
           const combined = outcomes.join(' ');
           setMessages((prev) => [
             ...prev,
@@ -3827,6 +4104,9 @@ export default function App() {
           ]);
           setLatestTranscript(combined);
           setAssistantState('idle');
+          if (shortLocalAck) {
+            speakShortLocalConfirmation(shortLocalAck);
+          }
           return;
         }
       }
@@ -4005,6 +4285,7 @@ export default function App() {
       executeValidatedAssistantTool,
       handleApprovePendingAction,
       recordActionDiagnostic,
+      speakShortLocalConfirmation,
     ]
   );
 
