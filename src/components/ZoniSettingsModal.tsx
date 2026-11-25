@@ -31,6 +31,7 @@ import {
   Play,
   Square,
   ShieldCheck,
+  Save,
 } from 'lucide-react';
 
 export type GeminiConnectionSnapshot = ServerHealthSnapshot;
@@ -95,12 +96,6 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
   const [customInput, setCustomInput] = useState(selectedAffectionName || 'Boss');
   const [wakePhraseInput, setWakePhraseInput] = useState(wakeWordStatus?.wakePhrase || 'Zoni');
   const [wakePhraseSavedNotice, setWakePhraseSavedNotice] = useState<string | null>(null);
-  const [geminiKeyDraft, setGeminiKeyDraft] = useState('');
-  const [showDraftKey, setShowDraftKey] = useState(false);
-  const [isEditingKey, setIsEditingKey] = useState(false);
-  const [keyBusy, setKeyBusy] = useState(false);
-  const [keyFeedback, setKeyFeedback] = useState<{ ok: boolean; text: string } | null>(null);
-  const [keyStatusVersion, setKeyStatusVersion] = useState(0);
 
   useEffect(() => {
     setCustomInput(selectedAffectionName || 'Boss');
@@ -113,22 +108,13 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
   }, [wakeWordStatus?.wakePhrase]);
 
   useEffect(() => {
-    if (!isOpen) {
-      setGeminiKeyDraft('');
-      setShowDraftKey(false);
-      setIsEditingKey(false);
-      setKeyFeedback(null);
-      return;
-    }
+    if (!isOpen) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
     };
-    const handleKeyUpdated = () => setKeyStatusVersion((v) => v + 1);
     window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('zoni:gemini-key-updated', handleKeyUpdated);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('zoni:gemini-key-updated', handleKeyUpdated);
     };
   }, [isOpen, onClose]);
 
@@ -161,70 +147,12 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
   );
   const isCustomNameActive = !isPredefinedMatch;
 
-  void keyStatusVersion;
-  const geminiKeyStatus = getGeminiApiKeyStatus();
-  const geminiConfigErr = getGeminiConfigError(undefined, vitals.activeLanguage);
-
-  const handleSaveGeminiKeyInline = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (vitals.soundFxEnabled) playProceduralSfx('click');
-    setKeyBusy(true);
-    setKeyFeedback(null);
-    const saved = saveGeminiApiKey(geminiKeyDraft);
-    if (!saved.ok) {
-      setKeyBusy(false);
-      setKeyFeedback({ ok: false, text: saved.error || 'Invalid Gemini API key.' });
-      return;
-    }
-    const verifyRes = await verifyDirectGeminiApiKey(
-      getGeminiApiKeyForRequest(),
-      fetch,
-      vitals.activeLanguage
-    );
-    // Clear draft immediately so the saved key is never displayed back in plain text
-    setGeminiKeyDraft('');
-    setShowDraftKey(false);
-    setIsEditingKey(false);
-    setKeyStatusVersion((v) => v + 1);
-    setKeyBusy(false);
-    setKeyFeedback({ ok: verifyRes.ok, text: verifyRes.message });
-    onGeminiKeyChanged?.();
-  };
-
-  const handleTestSavedGeminiKey = async () => {
-    if (vitals.soundFxEnabled) playProceduralSfx('click');
-    setKeyBusy(true);
-    setKeyFeedback(null);
-    const verifyRes = await verifyDirectGeminiApiKey(
-      getGeminiApiKeyForRequest(),
-      fetch,
-      vitals.activeLanguage
-    );
-    setKeyBusy(false);
-    setKeyFeedback({ ok: verifyRes.ok, text: verifyRes.message });
-    onGeminiKeyChanged?.();
-  };
-
-  const handleDeleteGeminiKeyInline = () => {
-    if (vitals.soundFxEnabled) playProceduralSfx('click');
-    deleteGeminiApiKey();
-    setGeminiKeyDraft('');
-    setShowDraftKey(false);
-    setIsEditingKey(false);
-    setKeyStatusVersion((v) => v + 1);
-    setKeyFeedback({
-      ok: true,
-      text: 'Gemini API key deleted. Enter a new key whenever you want to reconnect.',
-    });
-    onGeminiKeyChanged?.();
-  };
-
   const wsBadge = (() => {
-    if (!geminiKeyStatus.configured) {
-      return { label: 'GEMINI API KEY REQUIRED', cls: 'text-amber-400' };
+    if (backendHealth?.checked && !backendHealth.reachable) {
+      return { label: backendHealth.statusText || 'SERVER OFFLINE', cls: 'text-rose-400' };
     }
     if (backendHealth?.checked && !backendHealth.geminiConfigured) {
-      return { label: backendHealth.statusText || 'INVALID API KEY', cls: 'text-rose-400' };
+      return { label: backendHealth.statusText || 'AI SERVICE STANDBY', cls: 'text-amber-400' };
     }
     switch (wsStatus) {
       case 'connected':
@@ -237,7 +165,7 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
       case 'reconnecting':
         return { label: 'RECONNECTING...', cls: 'text-amber-300' };
       case 'error':
-        return { label: 'LIVE STANDBY (DIRECT CHAT READY)', cls: 'text-amber-300' };
+        return { label: 'LIVE STANDBY (SERVER CHAT READY)', cls: 'text-amber-300' };
       default:
         return { label: 'DISCONNECTED', cls: 'text-slate-400' };
     }

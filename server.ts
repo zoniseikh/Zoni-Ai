@@ -1176,6 +1176,18 @@ wss.on('connection', async (clientWs: WebSocket, request: any) => {
         return;
       }
 
+      // 3b. Explicit fast end-of-speech flush signal from client VAD
+      if (parsed.type === 'audio_stream_end' || parsed.audioStreamEnd === true) {
+        try {
+          if (typeof liveSession.sendRealtimeInput === 'function') {
+            liveSession.sendRealtimeInput({ audioStreamEnd: true });
+          }
+        } catch {
+          // Ignore if upstream session ignores explicit audioStreamEnd
+        }
+        return;
+      }
+
       // 4. Send typed Chat Box message through the shared Gemini Live session
       const incomingText =
         parsed.type === 'client_text' && typeof parsed.text === 'string'

@@ -199,86 +199,44 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
     };
   }, [isOpen]);
 
-  // Clean up obsolete legacy backend URL storage on mount
+  // Clean up obsolete legacy client-side key / backend URL storage on mount
   useEffect(() => {
-    cleanupLegacyBackendStorage();
+    cleanupLegacyClientStorage();
   }, []);
 
   useEffect(() => {
     if (backendHealth) {
-      setLocalGeminiHealth(backendHealth);
+      setLocalServerHealth(backendHealth);
     }
   }, [backendHealth]);
 
   useEffect(() => {
-    if (!isOpen) {
-      setGeminiKeyInput('');
-      setShowDraftKey(false);
-      setGeminiKeyError(null);
-      return;
-    }
+    if (!isOpen) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
     };
-    const handleKeyUpdated = () => setKeyStatusEpoch((v) => v + 1);
     window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('zoni:gemini-key-updated', handleKeyUpdated);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('zoni:gemini-key-updated', handleKeyUpdated);
     };
   }, [isOpen, onClose]);
 
-  const verifyGeminiKeyNow = async (): Promise<GeminiConnectionSnapshot> => {
-    setIsVerifyingKey(true);
+  const checkServerHealthNow = async (): Promise<GeminiConnectionSnapshot> => {
+    setIsCheckingServer(true);
     try {
-      if (onRefreshBackendHealth) {
-        const snapshot = await onRefreshBackendHealth();
-        setLocalGeminiHealth(snapshot);
-        return snapshot;
-      }
-      const keyStatus = getGeminiApiKeyStatus();
-      const rawKey = getGeminiApiKeyForRequest();
-      const lang =
-        activeLanguage === 'hi-IN' || activeLanguage === 'en-US' ? activeLanguage : 'bn-BD';
-      if (!keyStatus.configured || !rawKey) {
-        const missingSnap: GeminiConnectionSnapshot = {
-          checked: true,
-          reachable: false,
-          geminiConfigured: false,
-          statusText: 'API KEY REQUIRED',
-          configurationError: getGeminiConfigError(undefined, lang),
-          maskedKeyPreview: '',
-          storageLabel: keyStatus.storageLabel,
-        };
-        setLocalGeminiHealth(missingSnap);
-        return missingSnap;
-      }
-      const verify = await verifyDirectGeminiApiKey(rawKey, fetch, lang);
-      const snap: GeminiConnectionSnapshot = {
-        checked: true,
-        reachable: verify.ok,
-        geminiConfigured: verify.ok,
-        statusText: verify.statusText,
-        configurationError: verify.ok ? null : verify.message,
-        maskedKeyPreview: keyStatus.maskedPreview,
-        storageLabel: keyStatus.storageLabel,
-        preferredChatModel: verify.preferredChatModel,
-        preferredLiveModel: verify.preferredLiveModel,
-      };
-      setLocalGeminiHealth(snap);
+      const snap = onRefreshBackendHealth
+        ? await onRefreshBackendHealth()
+        : await fetchServerStatus();
+      setLocalServerHealth(snap);
       return snap;
     } finally {
-      setIsVerifyingKey(false);
+      setIsCheckingServer(false);
     }
   };
 
   useEffect(() => {
     if (!isOpen) return;
-    setKeyStatusEpoch((v) => v + 1);
-    if (getGeminiApiKeyStatus().configured) {
-      void verifyGeminiKeyNow();
-    }
+    void checkServerHealthNow();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
@@ -298,67 +256,15 @@ export const PermissionsSetupModal: React.FC<PermissionsSetupModalProps> = ({
     }, 3500);
   };
 
-  void keyStatusEpoch;
-  const keyStatus = getGeminiApiKeyStatus();
-  const activeHealth = localGeminiHealth ?? backendHealth ?? null;
-  const configError = getGeminiConfigError(
-    undefined,
-    activeLanguage === 'hi-IN' || activeLanguage === 'en-US' ? activeLanguage : 'bn-BD'
-  );
+  const activeHealth = localServerHealth ?? backendHealth ?? null;
 
-  // --- Step 1 Handlers (Pure Gemini BYOK API Key Save / Replace / Verify / Delete) ---
-  const handleSaveAndVerifyGeminiKey = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
+  const handleRecheckServer = async () => {
     if (soundFxEnabled) playProceduralSfx('click');
-    setGeminiKeyError(null);
-
-    const saved = saveGeminiApiKey(geminiKeyInput);
-    if (!saved.ok) {
-      setGeminiKeyError(saved.error || 'Invalid Gemini API key.');
-      return;
-    }
-
-    // Never keep the raw key in form state after saving
-    setGeminiKeyInput('');
-    setShowDraftKey(false);
-    setKeyStatusEpoch((v) => v + 1);
-    onBackendUrlChanged?.();
-
-    const snap = await verifyGeminiKeyNow();
+    const snap = await checkServerHealthNow();
     if (snap.reachable && snap.geminiConfigured) {
-      showToast('Gemini API Key verified! Direct Google Gemini connection is ready.');
+      showToast('Zoni AI server and Gemini Live are ready!');
     } else {
-      showToast(snap.configurationError || 'Key saved, but Google Gemini rejected verification.');
-    }
-  };
-
-  const handleDeleteSavedGeminiKey = () => {
-    if (soundFxEnabled) playProceduralSfx('click');
-    setGeminiKeyError(null);
-    deleteGeminiApiKey();
-    setGeminiKeyInput('');
-    setShowDraftKey(false);
-    setKeyStatusEpoch((v) => v + 1);
-    setLocalGeminiHealth({
-      checked: true,
-      reachable: false,
-      geminiConfigured: false,
-      statusText: 'API KEY REQUIRED',
-      configurationError: getGeminiConfigError(),
-      maskedKeyPreview: '',
-      storageLabel: 'Not Configured',
-    });
-    onBackendUrlChanged?.();
-    showToast('Saved Gemini API Key deleted.');
-  };
-
-  const handleRecheckGeminiKey = async () => {
-    if (soundFxEnabled) playProceduralSfx('click');
-    const snap = await verifyGeminiKeyNow();
-    if (snap.reachable && snap.geminiConfigured) {
-      showToast('Your Gemini API Key is valid and ready!');
-    } else {
-      showToast(snap.configurationError || 'Gemini API Key verification failed.');
+      showToast(snap.configurationError || 'Zoni AI server is temporarily unavailable.');
     }
   };
 

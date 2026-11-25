@@ -134,6 +134,19 @@ export function sanitizeErrorText(input: unknown): string {
 }
 
 /**
+ * Redacts an explicit secret token (if provided) and any accidental Google API key
+ * patterns from error or diagnostic strings.
+ */
+export function sanitizeGeminiSecret(input: unknown, explicitKey?: string): string {
+  let cleaned = sanitizeErrorText(input);
+  const trimmedKey = typeof explicitKey === 'string' ? explicitKey.trim() : '';
+  if (trimmedKey && trimmedKey.length >= 6) {
+    cleaned = cleaned.split(trimmedKey).join('[REDACTED]');
+  }
+  return cleaned;
+}
+
+/**
  * Queries the Zoni AI server's `/api/status` health endpoint to verify server
  * availability and server-side Gemini readiness.
  */
