@@ -29,6 +29,7 @@ sealed class VoiceCommand {
     data class OpenSettings(val settingsAction: String, val label: String) : VoiceCommand()
     data class ScreenQuery(val question: String) : VoiceCommand()
     data class SwitchLanguage(val languageCode: String, val label: String) : VoiceCommand()
+    data class StopCommandMode(val rawText: String) : VoiceCommand()
     data class GeminiGeneralQuery(val rawQuery: String) : VoiceCommand()
     data class Unknown(val rawText: String) : VoiceCommand()
 }

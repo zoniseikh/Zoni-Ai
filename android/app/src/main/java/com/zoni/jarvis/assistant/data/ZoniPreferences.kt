@@ -75,18 +75,22 @@ class ZoniPreferences(private val context: Context) {
 
     suspend fun setAffectionName(name: String) {
         val clean = name.trim().ifEmpty { return }
+        syncPrefs.edit().putString(SYNC_AFFECTION_NAME, clean).apply()
         context.zoniDataStore.edit { it[Keys.AFFECTION_NAME] = clean }
     }
 
     suspend fun setLanguage(lang: SupportedLanguage) {
+        syncPrefs.edit().putString(SYNC_ACTIVE_LANGUAGE, lang.code).apply()
         context.zoniDataStore.edit { it[Keys.ACTIVE_LANGUAGE] = lang.code }
     }
 
     suspend fun setMode(mode: CompanionMode) {
+        syncPrefs.edit().putString(SYNC_ACTIVE_MODE, mode.id).apply()
         context.zoniDataStore.edit { it[Keys.ACTIVE_MODE] = mode.id }
     }
 
     suspend fun setVoice(voice: VoiceProfile) {
+        syncPrefs.edit().putString(SYNC_SELECTED_VOICE, voice.id).apply()
         context.zoniDataStore.edit { it[Keys.SELECTED_VOICE] = voice.id }
     }
 
@@ -95,6 +99,7 @@ class ZoniPreferences(private val context: Context) {
     }
 
     suspend fun setVoiceMuted(muted: Boolean) {
+        syncPrefs.edit().putBoolean(SYNC_VOICE_MUTED, muted).apply()
         context.zoniDataStore.edit { it[Keys.VOICE_MUTED] = muted }
     }
 
@@ -144,6 +149,36 @@ class ZoniPreferences(private val context: Context) {
     fun setWakePhraseSync(phrase: String) {
         val clean = phrase.trim().ifBlank { "Zoni" }
         syncPrefs.edit().putString(SYNC_WAKE_PHRASE, clean).apply()
+    }
+
+    fun getUserSettingsSync(): ZoniUserSettings {
+        return ZoniUserSettings(
+            selectedAffectionName = syncPrefs.getString(SYNC_AFFECTION_NAME, "Boss")
+                ?.trim()?.ifBlank { "Boss" } ?: "Boss",
+            activeLanguage = SupportedLanguage.fromCode(syncPrefs.getString(SYNC_ACTIVE_LANGUAGE, null)),
+            activeMode = CompanionMode.fromId(syncPrefs.getString(SYNC_ACTIVE_MODE, null)),
+            selectedVoice = VoiceProfile.fromId(syncPrefs.getString(SYNC_SELECTED_VOICE, null)),
+            voiceMuted = syncPrefs.getBoolean(SYNC_VOICE_MUTED, false),
+            wakeWordEnabled = isWakeWordEnabledSync(),
+            backgroundListeningEnabled = isBackgroundListeningEnabledSync(),
+            wakePhrase = getWakePhraseSync()
+        )
+    }
+
+    fun syncAssistantSettingsSync(
+        affectionName: String? = null,
+        languageCode: String? = null,
+        modeId: String? = null,
+        voiceId: String? = null,
+        voiceMuted: Boolean? = null
+    ) {
+        val editor = syncPrefs.edit()
+        affectionName?.trim()?.takeIf { it.isNotEmpty() }?.let { editor.putString(SYNC_AFFECTION_NAME, it) }
+        languageCode?.trim()?.takeIf { it.isNotEmpty() }?.let { editor.putString(SYNC_ACTIVE_LANGUAGE, it) }
+        modeId?.trim()?.takeIf { it.isNotEmpty() }?.let { editor.putString(SYNC_ACTIVE_MODE, it) }
+        voiceId?.trim()?.takeIf { it.isNotEmpty() }?.let { editor.putString(SYNC_SELECTED_VOICE, it) }
+        voiceMuted?.let { editor.putBoolean(SYNC_VOICE_MUTED, it) }
+        editor.apply()
     }
 
     fun getGeminiApiKey(): String = secureKeyManager.getApiKey().orEmpty()
@@ -214,6 +249,11 @@ class ZoniPreferences(private val context: Context) {
         private const val SYNC_WAKE_WORD_ENABLED = "zoni_sync_wake_word_enabled"
         private const val SYNC_BG_LISTENING_ENABLED = "zoni_sync_bg_listening_enabled"
         private const val SYNC_WAKE_PHRASE = "zoni_sync_wake_phrase"
+        private const val SYNC_AFFECTION_NAME = "zoni_sync_affection_name"
+        private const val SYNC_ACTIVE_LANGUAGE = "zoni_sync_active_language"
+        private const val SYNC_ACTIVE_MODE = "zoni_sync_active_mode"
+        private const val SYNC_SELECTED_VOICE = "zoni_sync_selected_voice"
+        private const val SYNC_VOICE_MUTED = "zoni_sync_voice_muted"
         private const val SYNC_SPEAKER_VERIFY_ENABLED = "zoni_sync_speaker_verify_enabled"
         private const val SYNC_SPEAKER_VERIFY_STRICT = "zoni_sync_speaker_verify_strict"
         private const val SYNC_SPEAKER_ACCEPT_THRESHOLD = "zoni_sync_speaker_accept_threshold"

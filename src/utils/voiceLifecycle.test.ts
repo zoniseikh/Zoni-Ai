@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import {
   ALL_VOICE_LIFECYCLE_STATES,
   DEFAULT_WAKE_WORD_CONFIG,
+  WAKE_RESPONSE_PHRASE_BN,
   deriveVoiceLifecycleState,
   evaluateWakeWordCandidate,
+  isStopCommandModePhrase,
   stripWakePhraseFromCommand,
 } from './voiceLifecycle.ts';
 
@@ -92,6 +94,41 @@ test('WakeWordMatcher supports future custom configurable wake phrase', () => {
   assert.equal(evaluateWakeWordCandidate('Zoni', 0.9, customCfg).matched, false);
 });
 
+test('Background Command Mode wake response constant and stop-phrase detection', () => {
+  assert.equal(WAKE_RESPONSE_PHRASE_BN, 'হ্যাঁ, বলো শুনছি।');
+
+  const validStopPhrases = [
+    'ধন্যবাদ জোনি',
+    'ধন্যবাদ জোনি।',
+    'অনেক ধন্যবাদ জোনি',
+    'ঠিক আছে ধন্যবাদ জনি',
+    'Stop Listening',
+    'stop listening zoni',
+    'Please stop listening',
+    'Thank you Zoni',
+    'শোনা বন্ধ করো',
+    'কমান্ড মোড বন্ধ করো',
+    'धन्यवाद ज़ोनी',
+  ];
+  for (const phrase of validStopPhrases) {
+    assert.equal(isStopCommandModePhrase(phrase), true, `Expected stop phrase: ${phrase}`);
+  }
+
+  const nonStopCommands = [
+    '',
+    'Stop the video',
+    'Stop music',
+    'ভিডিওটি স্টপ করো',
+    'টর্চ বন্ধ করো',
+    'ইউটিউব খোলো',
+    'রহিমকে কল করো',
+    'Thank you for sending the message to Rahim',
+  ];
+  for (const cmd of nonStopCommands) {
+    assert.equal(isStopCommandModePhrase(cmd), false, `Should NOT stop command mode: ${cmd}`);
+  }
+});
+
 test('VoiceLifecycleState contains all 13 required states and never fakes CONNECTED', () => {
   assert.equal(ALL_VOICE_LIFECYCLE_STATES.length, 13);
   const notConnected = deriveVoiceLifecycleState({
@@ -116,6 +153,7 @@ test('VoiceLifecycleState contains all 13 required states and never fakes CONNEC
       wakeWordEnabled: true,
       backgroundServiceRunning: true,
       listening: true,
+      backgroundCommandMode: false,
       wakePhrase: 'Zoni',
       voiceState: 'WAKE_WORD_LISTENING',
       micPermissionGranted: true,
@@ -127,4 +165,46 @@ test('VoiceLifecycleState contains all 13 required states and never fakes CONNEC
     },
   });
   assert.equal(wakeArmed, 'WAKE_WORD_LISTENING');
+
+  const bgCommandListening = deriveVoiceLifecycleState({
+    wsStatus: 'disconnected',
+    assistantState: 'idle',
+    isLiveActive: false,
+    wakeWordStatus: {
+      wakeWordEnabled: true,
+      backgroundServiceRunning: true,
+      listening: false,
+      backgroundCommandMode: true,
+      wakePhrase: 'Zoni',
+      voiceState: 'LISTENING',
+      micPermissionGranted: true,
+      notificationPermissionGranted: true,
+      detectorEngine: 'on_device_two_stage_acoustic_gate',
+      lastDetectedAtMs: 12345,
+      lastConfidence: 0.94,
+      lastError: '',
+    },
+  });
+  assert.equal(bgCommandListening, 'LISTENING');
+
+  const bgCommandSpeaking = deriveVoiceLifecycleState({
+    wsStatus: 'disconnected',
+    assistantState: 'idle',
+    isLiveActive: false,
+    wakeWordStatus: {
+      wakeWordEnabled: true,
+      backgroundServiceRunning: true,
+      listening: false,
+      backgroundCommandMode: true,
+      wakePhrase: 'Zoni',
+      voiceState: 'SPEAKING',
+      micPermissionGranted: true,
+      notificationPermissionGranted: true,
+      detectorEngine: 'on_device_two_stage_acoustic_gate',
+      lastDetectedAtMs: 12345,
+      lastConfidence: 0.94,
+      lastError: '',
+    },
+  });
+  assert.equal(bgCommandSpeaking, 'SPEAKING');
 });

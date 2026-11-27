@@ -16,7 +16,7 @@ import com.zoni.jarvis.assistant.ui.MainActivity
 /**
  * Compliant Boot & App-Update Recovery Receiver for Zoni AI Background Wake Word.
  *
- * Android 14+ (targetSdk 34) strictly prohibits launching `FOREGROUND_SERVICE_TYPE_MICROPHONE`
+ * Android 14–16 (API 34–36) strictly prohibits launching `FOREGROUND_SERVICE_TYPE_MICROPHONE`
  * directly from `ACTION_BOOT_COMPLETED` while the app is in the background.
  * Rather than crashing with `ForegroundServiceStartNotAllowedException` or attempting deceptive
  * workarounds, this receiver checks whether the user explicitly opted into Background Wake Word
@@ -36,17 +36,21 @@ class ZoniBootReceiver : BroadcastReceiver() {
             return
         }
 
+        if (!ZoniForegroundService.hasMicPermission(context)) {
+            Log.i(TAG, "Skipping boot wake-word resume because RECORD_AUDIO permission is not granted.")
+            return
+        }
+
         val phrase = prefs.getWakePhraseSync()
 
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R &&
-            ZoniForegroundService.hasMicPermission(context)
-        ) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             Log.i(TAG, "Resuming Zoni wake-word service after $action on Android < 11")
             ZoniForegroundService.startWakeWordListening(context, phrase)
             return
         }
 
-        // Android 11–14+: Post a transparent, user-controlled resume notification
+        // Android 11–16: Post a single transparent, user-controlled resume notification
+        // (never attempts illegal silent microphone FGS start from BOOT_COMPLETED).
         postResumeListeningNotification(context, phrase)
     }
 
@@ -68,7 +72,7 @@ class ZoniBootReceiver : BroadcastReceiver() {
         val notif = NotificationCompat.Builder(context, ZoniApplication.CHANNEL_ASSISTANT_ALERTS)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle("Zoni AI Wake Word Ready to Resume")
-            .setContentText("Device restarted. Tap to resume listening for \"$wakePhrase\" (Android privacy policy requires foreground start).")
+            .setContentText("ফোন রিস্টার্ট হয়েছে — \"$wakePhrase\" ব্যাকগ্রাউন্ড লিসেনিং চালু করতে ট্যাপ করুন।")
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setAutoCancel(true)
             .setContentIntent(pi)

@@ -35,6 +35,7 @@ export interface NativeAndroidBridge {
   notifyVoiceSessionState?: (state: string) => boolean;
   pauseWakeWordForVoiceSession?: () => boolean;
   resumeWakeWordAfterVoiceSession?: () => boolean;
+  syncAssistantSettingsJson?: (settingsJson: string) => boolean;
 
   // Incoming & Active Phone Call Control (TelecomManager / InCallService)
   getIncomingCallStatusJson?: () => string;
@@ -939,6 +940,22 @@ export function resumeNativeWakeWordAfterVoice(): boolean {
   if (!bridge?.resumeWakeWordAfterVoiceSession) return false;
   try {
     return Boolean(bridge.resumeWakeWordAfterVoiceSession());
+  } catch {
+    return false;
+  }
+}
+
+export function syncAssistantSettingsToNative(settings: {
+  affectionName?: string;
+  languageCode?: string;
+  modeId?: string;
+  voiceId?: string;
+  voiceMuted?: boolean;
+}): boolean {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.syncAssistantSettingsJson) return false;
+  try {
+    return Boolean(bridge.syncAssistantSettingsJson(JSON.stringify(settings)));
   } catch {
     return false;
   }

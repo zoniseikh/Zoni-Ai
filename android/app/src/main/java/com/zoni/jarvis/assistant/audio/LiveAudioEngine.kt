@@ -18,9 +18,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -485,7 +487,8 @@ data class AudioEffectDiagnostics(
 class LiveAudioEngine(
     private val context: Context? = null,
     private val onAmplitudeChanged: (Float) -> Unit = {},
-    private val onAudioFocusLost: (Int) -> Unit = {}
+    private val onAudioFocusLost: (Int) -> Unit = {},
+    private val preferSpeakerAssistantUsage: Boolean = false
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -501,6 +504,7 @@ class LiveAudioEngine(
 
     private var audioTrack: AudioTrack? = null
     private val playbackLock = Any()
+    private val playbackGeneration = AtomicLong(0L)
 
     @Volatile
     private var isAssistantSpeakingNow: Boolean = false
@@ -544,11 +548,21 @@ class LiveAudioEngine(
         if (hasAudioFocus) return true
         return try {
             val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val usage = if (preferSpeakerAssistantUsage) {
+                    AudioAttributes.USAGE_ASSISTANT
+                } else {
+                    AudioAttributes.USAGE_VOICE_COMMUNICATION
+                }
+                val focusGain = if (preferSpeakerAssistantUsage) {
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                } else {
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
+                }
                 val attrs = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(usage)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
-                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                val req = AudioFocusRequest.Builder(focusGain)
                     .setAudioAttributes(attrs)
                     .setAcceptsDelayedFocusGain(false)
                     .setOnAudioFocusChangeListener(focusChangeListener)
@@ -559,7 +573,7 @@ class LiveAudioEngine(
                 @Suppress("DEPRECATION")
                 am.requestAudioFocus(
                     focusChangeListener,
-                    AudioManager.STREAM_VOICE_CALL,
+                    if (preferSpeakerAssistantUsage) AudioManager.STREAM_MUSIC else AudioManager.STREAM_VOICE_CALL,
                     AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
                 )
             }
@@ -798,12 +812,18 @@ class LiveAudioEngine(
             )
             if (minBuf <= 0) return null
 
-            // Pair USAGE_VOICE_COMMUNICATION with VOICE_COMMUNICATION AudioRecord so Android HAL AEC
-            // receives a clean speaker reference signal on supported devices.
+            // Pair USAGE_VOICE_COMMUNICATION with VOICE_COMMUNICATION AudioRecord for foreground HAL AEC,
+            // or USAGE_ASSISTANT for background/screen-locked voice so audio routes clearly to loudspeaker
+            // (or connected Bluetooth/wired headset) instead of the quiet earpiece.
+            val playbackUsage = if (preferSpeakerAssistantUsage) {
+                AudioAttributes.USAGE_ASSISTANT
+            } else {
+                AudioAttributes.USAGE_VOICE_COMMUNICATION
+            }
             val trackBuilder = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setUsage(playbackUsage)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
@@ -831,14 +851,19 @@ class LiveAudioEngine(
 
     fun playPcm24kBase64(base64Pcm: String) {
         if (isVoiceMuted || base64Pcm.isBlank()) return
+        val expectedGen = playbackGeneration.get()
         scope.launch(playbackDispatcher) {
+            if (playbackGeneration.get() != expectedGen) return@launch
             try {
                 val pcmBytes = Base64.decode(base64Pcm, Base64.DEFAULT)
-                if (pcmBytes.isEmpty()) return@launch
+                if (pcmBytes.isEmpty() || playbackGeneration.get() != expectedGen) return@launch
                 onAmplitudeChanged(computeRmsAmplitude(pcmBytes, pcmBytes.size))
                 val track = ensureAudioTrack() ?: return@launch
                 synchronized(playbackLock) {
-                    if (!isVoiceMuted && track.state == AudioTrack.STATE_INITIALIZED) {
+                    if (!isVoiceMuted &&
+                        playbackGeneration.get() == expectedGen &&
+                        track.state == AudioTrack.STATE_INITIALIZED
+                    ) {
                         track.write(pcmBytes, 0, pcmBytes.size, AudioTrack.WRITE_BLOCKING)
                     }
                 }
@@ -848,7 +873,26 @@ class LiveAudioEngine(
         }
     }
 
+    /**
+     * Waits strictly in FIFO order on [playbackDispatcher] until all previously queued PCM chunks
+     * finish writing to AudioTrack, plus a short hardware buffer drain cushion, before notifying
+     * that assistant speech has actually completed.
+     */
+    fun notifyTurnCompleteWhenDrained(onDrained: () -> Unit) {
+        val expectedGen = playbackGeneration.get()
+        scope.launch(playbackDispatcher) {
+            if (playbackGeneration.get() != expectedGen) return@launch
+            delay(140L)
+            if (playbackGeneration.get() != expectedGen) return@launch
+            isAssistantSpeakingNow = false
+            resetEosRequested = true
+            onAmplitudeChanged(0f)
+            onDrained()
+        }
+    }
+
     fun stopAllPlayback() {
+        playbackGeneration.incrementAndGet()
         isAssistantSpeakingNow = false
         resetEosRequested = true
         synchronized(playbackLock) {

@@ -3,7 +3,6 @@ package com.zoni.jarvis.assistant.ui
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,7 +10,6 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import android.view.WindowManager
 import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
@@ -99,7 +97,10 @@ class MainActivity : ComponentActivity() {
     private val micPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        viewModel.refreshSystemStatus()
+        val hasWebDashboard = hasBundledReactDashboard()
+        if (!hasWebDashboard) {
+            viewModel.refreshSystemStatus()
+        }
         pendingWebPermissionRequest?.let { req ->
             if (granted) req.grant(req.resources) else req.deny()
             pendingWebPermissionRequest = null
@@ -109,7 +110,7 @@ class MainActivity : ComponentActivity() {
             "zoni:wake-word-status",
             ZoniForegroundService.getCurrentStatusSnapshot(applicationContext).toJson()
         )
-        if (granted && !hasBundledReactDashboard()) {
+        if (granted && !hasWebDashboard) {
             viewModel.startLiveVoice()
         }
     }
@@ -117,7 +118,9 @@ class MainActivity : ComponentActivity() {
     private val multiPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        viewModel.refreshSystemStatus()
+        if (!hasBundledReactDashboard()) {
+            viewModel.refreshSystemStatus()
+        }
         simCallManager.startCallStateMonitoring { callJson ->
             dispatchNativeEvent("zoni:call-state-changed", callJson)
         }
@@ -144,7 +147,9 @@ class MainActivity : ComponentActivity() {
     private val defaultAssistantRoleLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        viewModel.refreshSystemStatus()
+        if (!hasBundledReactDashboard()) {
+            viewModel.refreshSystemStatus()
+        }
         val isDefault = hardwareController.isDefaultDigitalAssistant()
         dispatchNativeEvent("zoni:native-permissions-updated", "{}")
         dispatchNativeEvent(
@@ -156,7 +161,9 @@ class MainActivity : ComponentActivity() {
     private val dialerRoleLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        viewModel.refreshSystemStatus()
+        if (!hasBundledReactDashboard()) {
+            viewModel.refreshSystemStatus()
+        }
         dispatchNativeEvent("zoni:native-permissions-updated", "{}")
         dispatchNativeEvent("zoni:call-state-changed", simCallManager.getIncomingCallStatusAsJson())
     }
@@ -231,10 +238,11 @@ class MainActivity : ComponentActivity() {
                     .put("detectedAtMs", event.detectedAtMs)
                     .put("verificationLatencyMs", event.verificationLatencyMs)
                     .put("recognitionMode", event.recognitionMode)
+                    .put("handledInBackgroundService", event.handledInBackgroundService)
                     .toString()
                 if (dashboardWebView != null) {
                     dispatchNativeEvent("zoni:wake-word-detected", payload)
-                } else {
+                } else if (!event.handledInBackgroundService) {
                     pendingWakePayloadJson = payload
                 }
             }
@@ -609,7 +617,9 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         isActivityInForeground = true
         ZoniForegroundService.cancelWakeActivationNotification(applicationContext)
-        viewModel.refreshSystemStatus()
+        if (!hasBundledReactDashboard()) {
+            viewModel.refreshSystemStatus()
+        }
         simCallManager.startCallStateMonitoring { callJson ->
             dispatchNativeEvent("zoni:call-state-changed", callJson)
         }
@@ -642,33 +652,27 @@ class MainActivity : ComponentActivity() {
             ZoniForegroundService.startWakeWordListening(applicationContext)
         }
 
-        val wakeTriggered = intent.getBooleanExtra(EXTRA_WAKE_WORD_TRIGGERED, false)
-        val remainingCmd = intent.getStringExtra(EXTRA_WAKE_REMAINING_COMMAND).orEmpty()
-        val shouldAutoVoice = intent.action == Intent.ACTION_ASSIST ||
+        // Only explicit manual system assistant shortcuts (Power/Home assist or VOICE_COMMAND)
+        // trigger foreground voice capture; wake-word detection runs silently in ZoniForegroundService
+        // without ever auto-opening MainActivity, Dashboard, or WebView.
+        val isManualAssistLaunch = intent.action == Intent.ACTION_ASSIST ||
             intent.action == Intent.ACTION_VOICE_COMMAND ||
-            intent.getBooleanExtra(EXTRA_AUTO_VOICE, false) ||
-            wakeTriggered
+            intent.getBooleanExtra(EXTRA_AUTO_VOICE, false)
 
-        if (wakeTriggered || shouldAutoVoice) {
-            applyWakeLockScreenFlags()
-        }
-
-        if (shouldAutoVoice) {
+        if (isManualAssistLaunch) {
+            val remainingCmd = intent.getStringExtra(EXTRA_WAKE_REMAINING_COMMAND).orEmpty()
             val eventTs = intent.getLongExtra(EXTRA_WAKE_EVENT_TIMESTAMP, 0L)
-            if (wakeTriggered && eventTs > 0L && eventTs == lastDispatchedWakeEventAtMs) {
-                // Already delivered via ZoniForegroundService.wakeWordEvents — avoid duplicate activation
-                return
-            }
             if (eventTs > 0L) {
                 lastDispatchedWakeEventAtMs = eventTs
             }
             if (hasBundledReactDashboard()) {
                 val payload = JSONObject()
                     .put("wakePhrase", "Zoni")
-                    .put("matchedVariant", if (wakeTriggered) "zoni" else "assist_intent")
+                    .put("matchedVariant", "assist_intent")
                     .put("confidence", 1.0)
                     .put("remainingCommand", remainingCmd)
                     .put("detectedAtMs", if (eventTs > 0L) eventTs else System.currentTimeMillis())
+                    .put("handledInBackgroundService", false)
                     .toString()
                 if (dashboardWebView != null) {
                     dispatchNativeEvent("zoni:wake-word-detected", payload)
@@ -681,27 +685,6 @@ class MainActivity : ComponentActivity() {
                     viewModel.sendTextMessage(remainingCmd)
                 }
             }
-        }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun applyWakeLockScreenFlags() {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                setShowWhenLocked(true)
-                setTurnScreenOn(true)
-            } else {
-                window.addFlags(
-                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
-                )
-            }
-            val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-            if (km != null && km.isKeyguardLocked) {
-                km.requestDismissKeyguard(this, null)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Lock-screen wake flags skipped: ${e.message}")
         }
     }
 

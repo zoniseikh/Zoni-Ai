@@ -41,10 +41,15 @@ class CommandDispatcher {
             return VoiceCommand.Unknown(trimmed)
         }
 
+        // 0. Continuous Command Mode Stop phrases ("ধন্যবাদ জোনি", "Stop Listening")
+        if (com.zoni.jarvis.assistant.service.BackgroundCommandPolicy.isStopCommandModePhrase(trimmed)) {
+            return VoiceCommand.StopCommandMode(trimmed)
+        }
+
         val cleaned = stripWakeWord(trimmed).ifBlank { trimmed }
         val lower = cleaned.lowercase()
 
-        // 0. Pending draft review, cancellation & explicit approval commands
+        // 0a. Pending draft review, cancellation & explicit approval commands
         if (isCancelCurrentTaskCommand(lower)) {
             return VoiceCommand.CancelCurrentTask(cleaned)
         }

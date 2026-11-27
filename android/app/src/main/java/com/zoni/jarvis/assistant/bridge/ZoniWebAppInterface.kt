@@ -129,26 +129,48 @@ class ZoniWebAppInterface(
     @JavascriptInterface
     fun notifyVoiceSessionState(state: String): Boolean {
         val parsed = com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.fromString(state)
+        val bgCommandActive = com.zoni.jarvis.assistant.service.ZoniForegroundService.isBackgroundCommandModeActive()
         when (parsed) {
-            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.ACTIVATING,
             com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.CONNECTING,
-            com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.CONNECTED,
             com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.LISTENING,
             com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.PROCESSING,
             com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.SPEAKING -> {
-                com.zoni.jarvis.assistant.service.ZoniForegroundService.pauseWakeWordForConversation(context, parsed)
+                if (!bgCommandActive) {
+                    com.zoni.jarvis.assistant.service.ZoniForegroundService.pauseWakeWordForConversation(context, parsed)
+                }
             }
             com.zoni.jarvis.assistant.wakeword.VoiceLifecycleState.IDLE -> {
-                com.zoni.jarvis.assistant.service.ZoniForegroundService.updateVoiceState(context, parsed)
-                if (preferences.isWakeWordEnabledSync() && preferences.isBackgroundListeningEnabledSync()) {
-                    com.zoni.jarvis.assistant.service.ZoniForegroundService.resumeWakeWordAfterConversation(context)
+                if (!bgCommandActive) {
+                    com.zoni.jarvis.assistant.service.ZoniForegroundService.updateVoiceState(context, parsed)
+                    if (preferences.isWakeWordEnabledSync() && preferences.isBackgroundListeningEnabledSync()) {
+                        com.zoni.jarvis.assistant.service.ZoniForegroundService.resumeWakeWordAfterConversation(context)
+                    }
                 }
             }
             else -> {
-                com.zoni.jarvis.assistant.service.ZoniForegroundService.updateVoiceState(context, parsed)
+                if (!bgCommandActive) {
+                    com.zoni.jarvis.assistant.service.ZoniForegroundService.updateVoiceState(context, parsed)
+                }
             }
         }
         return true
+    }
+
+    @JavascriptInterface
+    fun syncAssistantSettingsJson(settingsJson: String): Boolean {
+        return try {
+            val obj = JSONObject(settingsJson)
+            preferences.syncAssistantSettingsSync(
+                affectionName = obj.optString("affectionName", "").takeIf { it.isNotBlank() },
+                languageCode = obj.optString("languageCode", "").takeIf { it.isNotBlank() },
+                modeId = obj.optString("modeId", "").takeIf { it.isNotBlank() },
+                voiceId = obj.optString("voiceId", "").takeIf { it.isNotBlank() },
+                voiceMuted = if (obj.has("voiceMuted")) obj.optBoolean("voiceMuted", false) else null
+            )
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     @JavascriptInterface

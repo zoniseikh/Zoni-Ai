@@ -96,7 +96,8 @@ data class WakeWordDetectionEvent(
     val detectedAtMs: Long = System.currentTimeMillis(),
     val verificationLatencyMs: Double = 0.0,
     val recognitionMode: String = "on_device_offline",
-    val speakerSimilarity: Float = -1f
+    val speakerSimilarity: Float = -1f,
+    val handledInBackgroundService: Boolean = false
 )
 
 data class WakeWordStatusSnapshot(
@@ -112,7 +113,8 @@ data class WakeWordStatusSnapshot(
     val lastDetectedAtMs: Long = 0L,
     val lastConfidence: Float = 0f,
     val lastVerificationLatencyMs: Double = 0.0,
-    val lastError: String = ""
+    val lastError: String = "",
+    val backgroundCommandMode: Boolean = false
 ) {
     fun toJson(): String = JSONObject()
         .put("wakeWordEnabled", wakeWordEnabled)
@@ -128,6 +130,7 @@ data class WakeWordStatusSnapshot(
         .put("lastConfidence", lastConfidence.toDouble())
         .put("lastVerificationLatencyMs", lastVerificationLatencyMs)
         .put("lastError", lastError)
+        .put("backgroundCommandMode", backgroundCommandMode)
         .toString()
 }
 
@@ -778,6 +781,7 @@ class ZoniWakeWordEngine(
     @SuppressLint("MissingPermission")
     private fun startAcousticGateLoop(): Boolean {
         if (!isRunning || isPausedForConversation) return false
+        isVerifyingPhrase = false
         recoveryJob?.cancel()
         recoveryJob = null
         stopAcousticRecorderOnly()
@@ -1245,7 +1249,7 @@ class ZoniWakeWordEngine(
 
     private fun destroyVerifierOnMain() {
         closeActiveAudioPipe()
-        mainHandler.post {
+        val cleanup = Runnable {
             val sr = speechRecognizer
             speechRecognizer = null
             speechRecognizerIsOnDevice = false
@@ -1253,6 +1257,11 @@ class ZoniWakeWordEngine(
                 try { sr.cancel() } catch (_: Exception) {}
                 try { sr.destroy() } catch (_: Exception) {}
             }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            cleanup.run()
+        } else {
+            mainHandler.post(cleanup)
         }
     }
 

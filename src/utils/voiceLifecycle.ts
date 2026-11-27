@@ -60,6 +60,7 @@ export interface WakeWordStatusSnapshot {
   wakeWordEnabled: boolean;
   backgroundServiceRunning: boolean;
   listening: boolean;
+  backgroundCommandMode?: boolean;
   wakePhrase: string;
   voiceState: VoiceLifecycleState;
   micPermissionGranted: boolean;
@@ -70,6 +71,81 @@ export interface WakeWordStatusSnapshot {
   lastConfidence: number;
   lastVerificationLatencyMs?: number;
   lastError: string;
+}
+
+export const WAKE_RESPONSE_PHRASE_BN = 'হ্যাঁ, বলো শুনছি।';
+
+const EXACT_STOP_COMMAND_PHRASES = new Set([
+  // Bengali stop phrases
+  'ধন্যবাদ জোনি',
+  'ধন্যবাদ জনি',
+  'ধন্যবাদ জোনী',
+  'ধন্যবাদ জনী',
+  'ধন্যবাদ জুনি',
+  'ধন্যবাদ জোনি এআই',
+  'ধন্যবাদ জনি এআই',
+  'অনেক ধন্যবাদ জোনি',
+  'অনেক ধন্যবাদ জনি',
+  'জোনি ধন্যবাদ',
+  'জনি ধন্যবাদ',
+  'থ্যাংক ইউ জোনি',
+  'থ্যাঙ্ক ইউ জোনি',
+  'থ্যাংক ইউ জনি',
+  'থ্যাঙ্ক ইউ জনি',
+  'থ্যাংকস জোনি',
+  'থ্যাংকস জনি',
+  'শোনা বন্ধ করো',
+  'শোনা বন্ধ কর',
+  'জোনি শোনা বন্ধ করো',
+  'জনি শোনা বন্ধ করো',
+  'কমান্ড মোড বন্ধ করো',
+  'কমান্ড মোড অফ করো',
+  'স্টপ লিসেনিং',
+  'স্টপ লিসেনিং জোনি',
+  'বাই জোনি',
+  'বাই জনি',
+  // English stop phrases
+  'stop listening',
+  'stop listening zoni',
+  'stop listening zoni ai',
+  'zoni stop listening',
+  'zoni ai stop listening',
+  'please stop listening',
+  'stop command mode',
+  'exit command mode',
+  'close command mode',
+  'end command mode',
+  'thank you zoni',
+  'thank you zoni ai',
+  'thanks zoni',
+  'thanks zoni ai',
+  'thank you joni',
+  'thanks joni',
+  'zoni thank you',
+  'bye zoni',
+  'goodbye zoni',
+  // Hindi stop phrases
+  'धन्यवाद ज़ोनी',
+  'धन्यवाद जोनी',
+  'शुक्रिया ज़ोनी',
+  'शुक्रिया जोनी',
+  'सुनना बंद करो',
+  'कमांड मोड बंद करो',
+]);
+
+const STOP_COMMAND_REGEX =
+  /^(?:(?:ok|okay|alright|please|ঠিক\s*আছে|আচ্ছা|ওকে)\s+)?(?:(?:অনেক\s+)?(?:ধন্যবাদ|থ্যাংক\s*ইউ|থ্যাঙ্ক\s*ইউ|থ্যাংকস)\s+(?:জোনি|জনি|জোনী|জনী|জুনি|zoni|joni)(?:\s*(?:এআই|ai))?|(?:জোনি|জনি|zoni)\s+(?:অনেক\s+)?(?:ধন্যবাদ|শোনা\s*বন্ধ\s*করো?|কমান্ড\s*মোড\s*(?:বন্ধ|অফ)\s*করো?|stop\s+listening)|(?:শোনা\s*বন্ধ\s*করো?|কমান্ড\s*মোড\s*(?:বন্ধ|অফ)\s*করো?|স্টপ\s*লিসেনিং(?:\s+(?:জোনি|জনি|zoni))?)|(?:stop\s+listening|stop\s+command\s+mode|exit\s+command\s+mode|close\s+command\s+mode|end\s+command\s+mode)(?:\s+(?:zoni|joni|zoni\s+ai|please))?|(?:thank\s+you|thanks|bye|goodbye)\s+(?:zoni|joni|zonie|zony)(?:\s+ai)?|(?:धन्यवाद|शुक्रिया)\s+(?:ज़ोनी|जोनी)|(?:सुनना\s*बंद\s*करो|कमांड\s*मोड\s*बंद\s*करो))$/i;
+
+/**
+ * Strictly detects explicit Continuous Command Mode exit phrases
+ * ("ধন্যবাদ জোনি", "Stop Listening", etc.) while rejecting unrelated commands
+ * like "Stop the video", "ভিডিওটি স্টপ করো", or "টর্চ বন্ধ করো".
+ */
+export function isStopCommandModePhrase(rawText: string): boolean {
+  const normalized = normalizeWakeText(rawText);
+  if (!normalized) return false;
+  if (EXACT_STOP_COMMAND_PHRASES.has(normalized)) return true;
+  return STOP_COMMAND_REGEX.test(normalized);
 }
 
 export interface IncomingCallStatusSnapshot {
@@ -391,6 +467,19 @@ export function deriveVoiceLifecycleState(params: {
   }
 
   if (wakeWordStatus) {
+    if (wakeWordStatus.backgroundCommandMode) {
+      if (
+        wakeWordStatus.voiceState === 'SPEAKING' ||
+        wakeWordStatus.voiceState === 'LISTENING' ||
+        wakeWordStatus.voiceState === 'PROCESSING' ||
+        wakeWordStatus.voiceState === 'CONNECTING' ||
+        wakeWordStatus.voiceState === 'ACTIVATING' ||
+        wakeWordStatus.voiceState === 'WAKE_WORD_DETECTED'
+      ) {
+        return wakeWordStatus.voiceState;
+      }
+      return 'LISTENING';
+    }
     if (wakeWordStatus.voiceState === 'WAKE_WORD_DETECTED') return 'WAKE_WORD_DETECTED';
     if (wakeWordStatus.voiceState === 'ACTIVATING') return 'ACTIVATING';
     if (wakeWordStatus.wakeWordEnabled && wakeWordStatus.listening) {

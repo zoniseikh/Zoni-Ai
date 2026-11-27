@@ -4,7 +4,6 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.zoni.jarvis.assistant.ZoniApplication
-import com.zoni.jarvis.assistant.action.AllowedActionType
 import com.zoni.jarvis.assistant.action.TypedActionRequest
 import com.zoni.jarvis.assistant.audio.LiveAudioEngine
 import com.zoni.jarvis.assistant.data.ZoniUserSettings
@@ -289,6 +288,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         list.add(ChatMessage(id = speechId, role = MessageRole.USER, text = mergedTranscript, lang = state.settings.activeLanguage))
                     }
                     state.copy(messages = list)
+                }
+
+                // Exit live voice mode cleanly if user says "ধন্যবাদ জোনি" / "Stop Listening"
+                if (com.zoni.jarvis.assistant.service.BackgroundCommandPolicy.isStopCommandModePhrase(mergedTranscript)) {
+                    pendingVoiceDispatchJob?.cancel()
+                    stopLiveVoice()
+                    return
                 }
 
                 // Stage 1: Inspect streaming partial safely WITHOUT executing incomplete fragments.
@@ -746,76 +752,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun mapVoiceCommandToLocalTypedRequest(cmd: VoiceCommand): TypedActionRequest? {
-        fun build(type: AllowedActionType, args: Map<String, String> = emptyMap()) = TypedActionRequest(
-            actionId = "loc_${UUID.randomUUID().toString().take(10)}",
-            actionType = type,
-            arguments = args,
-            requiredPermissions = type.requiredPermissions,
-            requiresConfirmation = false,
-            timeoutMs = type.defaultTimeoutMs
-        )
-        return when (cmd) {
-            is VoiceCommand.OpenApp -> build(AllowedActionType.OPEN_APP, mapOf("app_name" to cmd.appQuery))
-            is VoiceCommand.ScrollScreen -> build(AllowedActionType.SCROLL_SCREEN, mapOf("direction" to cmd.direction))
-            is VoiceCommand.NavigateGlobal -> when (cmd.action.lowercase()) {
-                "home", "go_home" -> build(AllowedActionType.GO_HOME)
-                "back", "go_back" -> build(AllowedActionType.GO_BACK)
-                else -> null
-            }
-            is VoiceCommand.TapVisibleElement -> build(AllowedActionType.CLICK_VISIBLE_ELEMENT, mapOf("target" to cmd.targetLabel))
-            is VoiceCommand.ClickYouTubeVideo -> build(
-                AllowedActionType.CLICK_YOUTUBE_VIDEO,
-                buildMap {
-                    cmd.index?.let { put("index", it.toString()) }
-                    if (cmd.targetHint.isNotBlank()) put("target", cmd.targetHint)
-                    if (cmd.query.isNotBlank()) put("query", cmd.query)
-                }
-            )
-            is VoiceCommand.ClickYouTubeSearchResult -> build(
-                AllowedActionType.CLICK_YOUTUBE_SEARCH_RESULT,
-                mapOf("index" to cmd.index.toString(), "query" to cmd.query)
-            )
-            is VoiceCommand.ClickWhatsAppContact -> build(
-                AllowedActionType.CLICK_WHATSAPP_CONTACT,
-                buildMap {
-                    if (cmd.contactName.isNotBlank()) put("contact_name", cmd.contactName)
-                    cmd.index?.let { put("index", it.toString()) }
-                }
-            )
-            is VoiceCommand.OpenWhatsAppChat -> build(
-                AllowedActionType.OPEN_WHATSAPP_CHAT,
-                buildMap {
-                    if (cmd.contactName.isNotBlank()) put("contact_name", cmd.contactName)
-                    cmd.index?.let { put("index", it.toString()) }
-                }
-            )
-            is VoiceCommand.TypeWhatsAppMessage -> build(
-                AllowedActionType.TYPE_WHATSAPP_MESSAGE,
-                mapOf("recipient" to cmd.recipient, "message" to cmd.message)
-            )
-            is VoiceCommand.PrepareWhatsAppMessage -> build(
-                AllowedActionType.SEND_WHATSAPP_MESSAGE,
-                mapOf("recipient" to cmd.recipient, "message" to cmd.message)
-            )
-            is VoiceCommand.VerifyWhatsAppSend -> build(
-                AllowedActionType.VERIFY_WHATSAPP_SEND,
-                mapOf("recipient" to cmd.recipient, "message" to cmd.message)
-            )
-            is VoiceCommand.SendSms -> build(
-                AllowedActionType.PREPARE_SMS,
-                mapOf("recipient" to cmd.recipient, "message" to cmd.message)
-            )
-            is VoiceCommand.CallContact -> build(AllowedActionType.CALL_CONTACT, mapOf("recipient" to cmd.contactName))
-            is VoiceCommand.CallDirectNumber -> build(AllowedActionType.CALL_CONTACT, mapOf("phone_number" to cmd.phoneNumber))
-            is VoiceCommand.AnswerIncomingCall -> build(AllowedActionType.ANSWER_INCOMING_CALL)
-            is VoiceCommand.RejectIncomingCall -> build(AllowedActionType.REJECT_INCOMING_CALL)
-            is VoiceCommand.EndActiveCall -> build(AllowedActionType.END_ACTIVE_CALL)
-            is VoiceCommand.ToggleFlashlight -> build(AllowedActionType.FLASHLIGHT_CONTROL, mapOf("enable" to cmd.enable.toString()))
-            is VoiceCommand.OpenSettings -> build(AllowedActionType.OPEN_SYSTEM_SETTINGS, mapOf("target" to cmd.label))
-            else -> null
-        }
-    }
+    private fun mapVoiceCommandToLocalTypedRequest(cmd: VoiceCommand): TypedActionRequest? =
+        com.zoni.jarvis.assistant.service.VoiceCommandActionMapper.toTypedActionRequest(cmd)
 
     fun updateAffectionName(newName: String) {
         val clean = newName.trim().ifEmpty { return }

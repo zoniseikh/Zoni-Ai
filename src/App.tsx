@@ -120,6 +120,7 @@ import {
   notifyNativeVoiceSessionState,
   pauseNativeWakeWordForVoice,
   resumeNativeWakeWordAfterVoice,
+  syncAssistantSettingsToNative,
   getNativeIncomingCallStatus,
   answerNativeIncomingCall,
   rejectNativeIncomingCall,
@@ -128,6 +129,7 @@ import {
 } from './utils/androidBridge';
 import {
   deriveVoiceLifecycleState,
+  isStopCommandModePhrase,
   stripWakePhraseFromCommand,
   type WakeWordStatusSnapshot,
   type IncomingCallStatusSnapshot,
@@ -2480,6 +2482,17 @@ export default function App() {
           }
           const utteranceSnapshot = currentSpeechTranscriptRef.current;
 
+          if (isLiveActiveRef.current && isStopCommandModePhrase(utteranceSnapshot)) {
+            currentSpeechTranscriptRef.current = '';
+            setLatestTranscript(
+              activeLanguageRef.current === 'bn-BD'
+                ? 'কমান্ড মোড বন্ধ হয়েছে — ওয়েক ওয়ার্ড লিসেনিং চালু আছে।'
+                : 'Command mode stopped — returning to wake word listening.'
+            );
+            stopVoiceCapture(false);
+            return;
+          }
+
           // Stage 1: Inspect streaming partial safely WITHOUT executing incomplete commands
           voiceLatencyTrackerRef.current.markStageStart('intent_classification');
           const previewRoute = routeVoiceCommandLocalFirst(utteranceSnapshot, {
@@ -4726,8 +4739,25 @@ export default function App() {
   });
 
   useEffect(() => {
+    syncAssistantSettingsToNative({
+      affectionName: selectedAffectionName,
+      languageCode: activeLanguage,
+      modeId: vitals.activeMode,
+      voiceId: vitals.selectedVoice,
+      voiceMuted,
+    });
+  }, [selectedAffectionName, activeLanguage, vitals.activeMode, vitals.selectedVoice, voiceMuted]);
+
+  useEffect(() => {
+    if (
+      wakeWordStatus?.backgroundCommandMode &&
+      !isLiveActive &&
+      (voiceLifecycleState === 'IDLE' || voiceLifecycleState === 'DISABLED')
+    ) {
+      return;
+    }
     notifyNativeVoiceSessionState(voiceLifecycleState);
-  }, [voiceLifecycleState]);
+  }, [voiceLifecycleState, wakeWordStatus?.backgroundCommandMode, isLiveActive]);
 
   useEffect(() => {
     const syncNativeStatuses = () => {
@@ -4776,6 +4806,7 @@ export default function App() {
             confidence?: number;
             remainingCommand?: string;
             detectedAtMs?: number;
+            handledInBackgroundService?: boolean;
           }>
         ).detail || {};
 
@@ -4789,6 +4820,14 @@ export default function App() {
         return;
       }
       lastHandledWakeEventRef.current = { detectedAtMs: eventTs, handledAtMs: nowMs };
+
+      // Background Voice Assistant mode: ZoniForegroundService handles voice-only greeting
+      // ("হ্যাঁ, বলো শুনছি।") and Continuous Command Mode natively without opening UI or mic here.
+      if (detail.handledInBackgroundService) {
+        const fresh = getNativeWakeWordStatus();
+        if (fresh) setWakeWordStatus(fresh);
+        return;
+      }
 
       const phrase = detail.wakePhrase || detail.wakeWord || wakeWordStatus?.wakePhrase || 'Zoni';
       const cleanedRemainder = stripWakePhraseFromCommand(detail.remainingCommand || '', phrase);
