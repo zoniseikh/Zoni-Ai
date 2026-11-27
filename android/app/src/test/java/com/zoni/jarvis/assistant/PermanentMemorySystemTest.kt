@@ -88,7 +88,7 @@ class PermanentMemorySystemTest {
         val bnRecall = LocalMemoryLogic.answerMemoryRecallLocally(
             query = "১৫ দিন আগে ডাক্তারের ব্যাপারে কী বলেছিলাম?",
             memories = emptyList(),
-            recentMessages = history,
+            candidateMessages = history,
             language = "bn-BD",
             nowMs = nowMs
         )
@@ -112,7 +112,7 @@ class PermanentMemorySystemTest {
         val res = LocalMemoryLogic.answerMemoryRecallLocally(
             query = "১৫ দিন আগে কী কথা হয়েছিল?",
             memories = emptyList(),
-            recentMessages = history,
+            candidateMessages = history,
             language = "bn-BD",
             nowMs = nowMs
         )

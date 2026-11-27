@@ -764,6 +764,10 @@ class ZoniForegroundService : Service() {
                 }
             }
 
+            is LiveServerEvent.Flashlight -> {
+                hardwareController.setFlashlight(event.enable)
+            }
+
             is LiveServerEvent.Error -> {
                 Log.w(TAG, "Background Gemini Live error (retryable=${event.retryable}, code=${event.code}): ${event.message}")
                 if (!event.retryable && isInBackgroundCommandLifecycle()) {
@@ -940,7 +944,7 @@ class ZoniForegroundService : Service() {
             voiceState = VoiceLifecycleState.SPEAKING
         )
 
-        val onOutcomeSpoken = {
+        val onOutcomeSpoken: () -> Unit = {
             serviceHandler.postDelayed({
                 if (backgroundMode == BackgroundAssistantMode.CONTINUOUS_COMMAND_MODE) {
                     val transition = BackgroundCommandPolicy.reduce(
