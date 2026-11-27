@@ -18,6 +18,10 @@ export interface ChatMessage {
   audioData?: string;
   mood?: string;
   lang?: SupportedLanguage;
+  conversationId?: string;
+  inputType?: 'voice' | 'text';
+  commandName?: string;
+  executionStatus?: string;
 }
 
 export interface SystemVitals {

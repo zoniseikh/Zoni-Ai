@@ -89,8 +89,9 @@ import {
   clearAllLocalConversationHistory,
   clearAllLocalLongTermMemory,
   getCompactLocalMemoryContext,
+  hydrateWebPermanentArchiveCache,
   loadLocalConversationHistory,
-  persistLocalConversationTurn,
+  persistVerifiedConversationRecord,
   tryOfflineLocalMemoryRecall,
 } from './utils/localMemory';
 import { deduplicateContactCandidates } from './utils/simCalling';
@@ -561,6 +562,10 @@ export default function App() {
             row.language === 'en-US' || row.language === 'hi-IN' || row.language === 'bn-BD'
               ? row.language
               : 'bn-BD',
+          conversationId: row.conversationId,
+          inputType: row.inputType,
+          commandName: row.commandName,
+          executionStatus: row.executionStatus,
         }));
       }
     }
@@ -575,17 +580,112 @@ export default function App() {
     ];
   });
 
-  // Persist finalized conversation messages locally (Room v2 on Android APK, localStorage on web)
+  // Permanent conversation session ID & verified write tracking (ZERO auto-deletion)
+  const activeConversationIdRef = useRef<string>(
+    `conv_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  );
+  const archiveMessagesRef = useRef<ChatMessage[]>(messages);
+  archiveMessagesRef.current = messages;
   const persistedMessageIdsRef = useRef<Set<string>>(new Set(messages.map((m) => m.id)));
+
+  const persistSingleFinalizedMessage = useCallback(
+    (msg: ChatMessage, forcedInputType?: 'voice' | 'text', stableIdOverride?: string) => {
+      const cleanText = String(msg.text || '').trim();
+      if (!msg.id || msg.id === 'welcome-1' || !cleanText) return;
+      const dedupeKey = stableIdOverride || msg.id;
+      if (persistedMessageIdsRef.current.has(dedupeKey)) return;
+      persistedMessageIdsRef.current.add(dedupeKey);
+
+      void persistVerifiedConversationRecord({
+        id: dedupeKey,
+        conversationId: msg.conversationId || activeConversationIdRef.current,
+        role: msg.role,
+        text: cleanText,
+        language: msg.lang || activeLanguageRef.current || 'bn-BD',
+        createdAtMs:
+          msg.timestamp instanceof Date ? msg.timestamp.getTime() : Date.now(),
+        inputType: forcedInputType || msg.inputType || (msg.id.startsWith('live-') ? 'voice' : 'text'),
+        commandName: msg.commandName || '',
+        executionStatus: msg.executionStatus || '',
+      }).then((res) => {
+        if (!res.success && res.errorCode === 'WRITE_FAILED') {
+          persistedMessageIdsRef.current.delete(dedupeKey);
+          setLatestTranscript(
+            activeLanguageRef.current === 'bn-BD'
+              ? `সতর্কতা: লোকাল স্টোরেজে মেসেজ সংরক্ষণ ব্যর্থ হয়েছে (${res.queuedForRecovery ? 'রিকভারি কিউতে রাখা হয়েছে' : res.errorMessage})।`
+              : `Storage warning: failed to save message (${res.queuedForRecovery ? 'queued for recovery' : res.errorMessage}).`
+          );
+        }
+      });
+    },
+    []
+  );
+
+  // Flush active Gemini Live voice user & assistant transcripts into permanent archive
+  const flushLiveVoiceTurnToArchive = useCallback(
+    (userTurnId?: number, assistantTurnId?: number) => {
+      const list = archiveMessagesRef.current;
+      const convId = activeConversationIdRef.current;
+      for (const msg of list) {
+        if (!msg.id.startsWith('live-')) continue;
+        const matchesUser =
+          typeof userTurnId === 'number' && msg.id === `live-user-speech-${userTurnId}`;
+        const matchesAssistant =
+          typeof assistantTurnId === 'number' && msg.id === `live-assistant-turn-${assistantTurnId}`;
+        const flushAll = userTurnId === undefined && assistantTurnId === undefined;
+        if (flushAll || matchesUser || matchesAssistant) {
+          const permanentVoiceId = `${convId}_${msg.id}`;
+          persistSingleFinalizedMessage(msg, 'voice', permanentVoiceId);
+        }
+      }
+    },
+    [persistSingleFinalizedMessage]
+  );
+
+  // Hydrate permanent IndexedDB archive on web startup so full history survives reloads
+  useEffect(() => {
+    let active = true;
+    void hydrateWebPermanentArchiveCache().then(() => {
+      if (!active) return;
+      const restored = loadLocalConversationHistory(60, 0);
+      if (restored.length > 0 && archiveMessagesRef.current.length <= 1 && archiveMessagesRef.current[0]?.id === 'welcome-1') {
+        const mapped: ChatMessage[] = restored.map((row) => ({
+          id: row.id,
+          role: row.role,
+          text: row.text,
+          timestamp: new Date(row.createdAtMs || Date.now()),
+          lang:
+            row.language === 'en-US' || row.language === 'hi-IN' || row.language === 'bn-BD'
+              ? row.language
+              : 'bn-BD',
+          conversationId: row.conversationId,
+          inputType: row.inputType,
+          commandName: row.commandName,
+          executionStatus: row.executionStatus,
+        }));
+        mapped.forEach((m) => persistedMessageIdsRef.current.add(m.id));
+        setMessages(mapped);
+      }
+    });
+
+    const handlePageHide = () => {
+      flushLiveVoiceTurnToArchive();
+    };
+    window.addEventListener('beforeunload', handlePageHide);
+    return () => {
+      active = false;
+      window.removeEventListener('beforeunload', handlePageHide);
+      flushLiveVoiceTurnToArchive();
+    };
+  }, [flushLiveVoiceTurnToArchive]);
+
+  // Persist finalized non-streaming text conversation messages immediately (verified write)
   useEffect(() => {
     for (const msg of messages) {
       if (!msg.id || msg.id === 'welcome-1' || msg.id.startsWith('live-')) continue;
-      if (persistedMessageIdsRef.current.has(msg.id)) continue;
-      if (!msg.text || !msg.text.trim()) continue;
-      persistedMessageIdsRef.current.add(msg.id);
-      persistLocalConversationTurn(msg.role, msg.text, msg.lang || 'bn-BD');
+      persistSingleFinalizedMessage(msg, msg.inputType || 'text');
     }
-  }, [messages]);
+  }, [messages, persistSingleFinalizedMessage]);
 
   // Shared WebSocket & Audio refs (using useRef to avoid stale closures inside callbacks)
   const liveAudioPlayerRef = useRef<LiveAudioPlayer | null>(null);
@@ -2721,6 +2821,8 @@ export default function App() {
 
         const handleInterruptedEvent = () => {
           clearTurnTimeout();
+          // Flush any partial/finalized live voice transcripts before advancing turn counter
+          flushLiveVoiceTurnToArchive(userSpeechTurnIdRef.current, currentTurnIdRef.current);
           stopAllSpeechPlayback('ws_interrupted');
           isAssistantSpeakingRef.current = false;
           fastEosDetectorRef.current.reset();
@@ -2732,6 +2834,8 @@ export default function App() {
 
         const handleTurnCompleteEvent = () => {
           clearTurnTimeout();
+          // Permanently persist finalized Gemini Live voice user & assistant messages
+          flushLiveVoiceTurnToArchive(userSpeechTurnIdRef.current, currentTurnIdRef.current);
           const turnCompleteTs = Date.now();
           const prevSpeaking = isAssistantSpeakingRef.current;
           const activeSourceCount = liveAudioPlayerRef.current?.getActiveSourceCount() ?? 0;
@@ -5128,7 +5232,7 @@ export default function App() {
         />
       </footer>
 
-      {/* Transcript Archive Drawer */}
+      {/* Transcript Archive Drawer (Searchable Permanent History, Date Navigation & Encrypted Backup) */}
       <ChatTranscriptDrawer
         isOpen={isChatDrawerOpen}
         onClose={() => setIsChatDrawerOpen(false)}
@@ -5136,8 +5240,29 @@ export default function App() {
         onReplayAudio={handleReplayAudio}
         onClearMessages={() => {
           setMessages([]);
+          persistedMessageIdsRef.current.clear();
           clearAllLocalConversationHistory();
         }}
+        onArchiveRestored={() => {
+          const restored = loadLocalConversationHistory(60, 0);
+          const mapped: ChatMessage[] = restored.map((row) => ({
+            id: row.id,
+            role: row.role,
+            text: row.text,
+            timestamp: new Date(row.createdAtMs || Date.now()),
+            lang:
+              row.language === 'en-US' || row.language === 'hi-IN' || row.language === 'bn-BD'
+                ? row.language
+                : 'bn-BD',
+            conversationId: row.conversationId,
+            inputType: row.inputType,
+            commandName: row.commandName,
+            executionStatus: row.executionStatus,
+          }));
+          persistedMessageIdsRef.current = new Set(mapped.map((m) => m.id));
+          setMessages(mapped);
+        }}
+        activeLanguage={activeLanguage}
         selectedAffectionName={selectedAffectionName}
         userNickname={selectedAffectionName}
       />
@@ -5225,6 +5350,10 @@ export default function App() {
           onOpenBackendSetup={() => {
             setIsSettingsModalOpen(false);
             setIsPermissionsModalOpen(true);
+          }}
+          onOpenArchiveDrawer={() => {
+            setIsSettingsModalOpen(false);
+            setIsChatDrawerOpen(true);
           }}
           onGeminiKeyChanged={handleManualReconnectLive}
         />

@@ -9,6 +9,7 @@ import com.zoni.jarvis.assistant.data.ZoniPreferences
 import com.zoni.jarvis.assistant.db.LocalMemoryRepository
 import com.zoni.jarvis.assistant.db.ZoniDatabase
 import com.zoni.jarvis.assistant.hardware.AndroidHardwareController
+import kotlinx.coroutines.launch
 
 class ZoniApplication : Application() {
 
@@ -23,8 +24,12 @@ class ZoniApplication : Application() {
     }
 
     val localMemoryRepository: LocalMemoryRepository by lazy {
-        LocalMemoryRepository(database, SecureKeyManager(this))
+        LocalMemoryRepository(database, SecureKeyManager(this), this)
     }
+
+    private val appStartupScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+    )
 
     override fun onCreate() {
         super.onCreate()
@@ -32,6 +37,13 @@ class ZoniApplication : Application() {
         preferences = ZoniPreferences(this)
         hardwareController = AndroidHardwareController(this)
         createNotificationChannels()
+        appStartupScope.launch {
+            try {
+                localMemoryRepository.recoverPendingWrites()
+            } catch (_: Exception) {
+                // Handled gracefully on next write or health check
+            }
+        }
     }
 
     private fun createNotificationChannels() {

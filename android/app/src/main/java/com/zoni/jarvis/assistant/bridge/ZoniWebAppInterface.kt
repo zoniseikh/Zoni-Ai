@@ -42,7 +42,12 @@ class ZoniWebAppInterface(
 ) {
     private val preferences by lazy { com.zoni.jarvis.assistant.data.ZoniPreferences(context.applicationContext) }
     private val localMemoryRepo by lazy {
-        LocalMemoryRepository(ZoniDatabase.getInstance(context.applicationContext), keyManager)
+        (context.applicationContext as? com.zoni.jarvis.assistant.ZoniApplication)?.localMemoryRepository
+            ?: LocalMemoryRepository(
+                ZoniDatabase.getInstance(context.applicationContext),
+                keyManager,
+                context.applicationContext
+            )
     }
 
     // --- Typed Allowlisted Action Engine (36 tools) ---
@@ -555,7 +560,7 @@ class ZoniWebAppInterface(
             .toString()
     }
 
-    // --- Local Conversation Memory & Encrypted Long-Term Memory (Room ZoniDatabase v2) ---
+    // --- Permanent Local Conversation Memory & Encrypted Long-Term Memory (Room ZoniDatabase v3) ---
 
     @JavascriptInterface
     fun saveLocalConversationMessage(role: String, text: String, language: String): Boolean = runBlocking {
@@ -567,6 +572,42 @@ class ZoniWebAppInterface(
     }
 
     @JavascriptInterface
+    fun saveLocalConversationRecordJson(recordJson: String): String = runBlocking {
+        try {
+            val obj = JSONObject(recordJson)
+            val res = localMemoryRepo.saveMessageVerified(
+                role = obj.optString("role", "user").ifBlank { "user" },
+                text = obj.optString("text", ""),
+                language = obj.optString("language", "bn-BD").ifBlank { "bn-BD" },
+                id = obj.optString("id", "").ifBlank { java.util.UUID.randomUUID().toString() },
+                createdAtMs = obj.optLong("createdAtMs", System.currentTimeMillis()).let {
+                    if (it > 0L) it else System.currentTimeMillis()
+                },
+                conversationId = obj.optString("conversationId", "default").ifBlank { "default" },
+                inputType = obj.optString("inputType", "text").ifBlank { "text" },
+                commandName = obj.optString("commandName", ""),
+                executionStatus = obj.optString("executionStatus", "")
+            )
+            JSONObject()
+                .put("success", res.success)
+                .put("verified", res.verified)
+                .put("messageId", res.messageId)
+                .put("conversationId", res.conversationId)
+                .put("errorCode", res.errorCode)
+                .put("errorMessage", res.errorMessage)
+                .put("queuedForRecovery", res.queuedForRecovery)
+                .toString()
+        } catch (e: Exception) {
+            JSONObject()
+                .put("success", false)
+                .put("verified", false)
+                .put("errorCode", "INVALID_PAYLOAD")
+                .put("errorMessage", e.javaClass.simpleName)
+                .toString()
+        }
+    }
+
+    @JavascriptInterface
     fun getLocalConversationHistoryJson(limit: Int, offset: Int): String = runBlocking {
         val rows = localMemoryRepo.loadRecentConversations(limit.coerceIn(1, 200), offset.coerceAtLeast(0))
         val arr = JSONArray()
@@ -574,16 +615,140 @@ class ZoniWebAppInterface(
             arr.put(
                 JSONObject()
                     .put("id", row.id)
+                    .put("conversationId", row.conversationId)
                     .put("role", row.role)
                     .put("text", row.text)
                     .put("language", row.language)
                     .put("createdAtMs", row.createdAtMs)
+                    .put("inputType", row.inputType)
+                    .put("commandName", row.commandName)
+                    .put("executionStatus", row.executionStatus)
+                    .put("dateBucket", row.dateBucket)
             )
         }
         JSONObject()
             .put("success", true)
             .put("count", rows.size)
             .put("messages", arr)
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun searchLocalConversationsJson(paramsJson: String): String = runBlocking {
+        try {
+            val obj = JSONObject(paramsJson.ifBlank { "{}" })
+            val res = localMemoryRepo.searchConversationsPaged(
+                query = obj.optString("query", ""),
+                dateBucket = obj.optString("dateBucket", ""),
+                startMs = obj.optLong("startMs", 0L),
+                endMs = obj.optLong("endMs", 0L),
+                inputType = obj.optString("inputType", ""),
+                limit = obj.optInt("limit", 40).coerceIn(1, 100),
+                offset = obj.optInt("offset", 0).coerceAtLeast(0)
+            )
+            val arr = JSONArray()
+            res.messages.forEach { row ->
+                arr.put(
+                    JSONObject()
+                        .put("id", row.id)
+                        .put("conversationId", row.conversationId)
+                        .put("role", row.role)
+                        .put("text", row.text)
+                        .put("language", row.language)
+                        .put("createdAtMs", row.createdAtMs)
+                        .put("inputType", row.inputType)
+                        .put("commandName", row.commandName)
+                        .put("executionStatus", row.executionStatus)
+                        .put("dateBucket", row.dateBucket)
+                )
+            }
+            JSONObject()
+                .put("success", true)
+                .put("count", res.totalReturned)
+                .put("hasMore", res.hasMore)
+                .put("dateRangeLabel", res.dateRangeApplied?.label ?: "")
+                .put("messages", arr)
+                .toString()
+        } catch (e: Exception) {
+            JSONObject()
+                .put("success", false)
+                .put("count", 0)
+                .put("hasMore", false)
+                .put("error", e.javaClass.simpleName)
+                .put("messages", JSONArray())
+                .toString()
+        }
+    }
+
+    @JavascriptInterface
+    fun getLocalConversationDatesJson(limit: Int, offset: Int): String = runBlocking {
+        val rows = localMemoryRepo.getConversationDateBuckets(limit.coerceIn(1, 365), offset.coerceAtLeast(0))
+        val arr = JSONArray()
+        rows.forEach { row ->
+            arr.put(
+                JSONObject()
+                    .put("dateBucket", row.dateBucket)
+                    .put("messageCount", row.messageCount)
+                    .put("firstTimestampMs", row.firstTimestampMs)
+                    .put("lastTimestampMs", row.lastTimestampMs)
+            )
+        }
+        JSONObject()
+            .put("success", true)
+            .put("dates", arr)
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun exportEncryptedBackupJson(passphrase: String): String = runBlocking {
+        val res = localMemoryRepo.exportEncryptedBackup(passphrase)
+        JSONObject()
+            .put("success", res.success)
+            .put("encryptedArchiveJson", res.encryptedArchiveJson)
+            .put("messageCount", res.messageCount)
+            .put("memoryCount", res.memoryCount)
+            .put("error", res.error)
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun restoreEncryptedBackupJson(
+        encryptedArchiveJson: String,
+        passphrase: String,
+        replaceExisting: Boolean
+    ): String = runBlocking {
+        val res = localMemoryRepo.restoreEncryptedBackup(encryptedArchiveJson, passphrase, replaceExisting)
+        JSONObject()
+            .put("success", res.success)
+            .put("restoredMessages", res.restoredMessages)
+            .put("restoredMemories", res.restoredMemories)
+            .put("skippedSensitive", res.skippedSensitive)
+            .put("error", res.error)
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun getDatabaseHealthJson(): String = runBlocking {
+        val h = localMemoryRepo.getDatabaseHealth()
+        JSONObject()
+            .put("healthy", h.healthy)
+            .put("integrityStatus", h.integrityStatus)
+            .put("lowStorage", h.lowStorage)
+            .put("availableBytes", h.availableBytes)
+            .put("pendingRecoveryCount", h.pendingRecoveryCount)
+            .put("totalConversations", h.totalConversations)
+            .put("totalMemories", h.totalMemories)
+            .put("encryptedAtRest", h.encryptedAtRest)
+            .put("lastWriteError", h.lastWriteError)
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun recoverPendingWritesJson(): String = runBlocking {
+        val recovered = localMemoryRepo.recoverPendingWrites()
+        JSONObject()
+            .put("success", true)
+            .put("recoveredCount", recovered)
             .toString()
     }
 
@@ -598,6 +763,7 @@ class ZoniWebAppInterface(
         JSONObject()
             .put("isMemoryQuery", res.isMemoryQuery)
             .put("handledOffline", res.handledOffline)
+            .put("foundEvidence", res.foundEvidence)
             .put("replyText", res.replyText)
             .put("matchedFactCount", res.matchedFacts.size)
             .put("matchedMessageCount", res.matchedMessages.size)

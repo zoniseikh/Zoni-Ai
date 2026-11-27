@@ -43,7 +43,10 @@ import {
   Eye,
   EyeOff,
   Trash2,
+  Database,
 } from 'lucide-react';
+import { getPermanentStorageHealth } from '../utils/localMemory';
+import type { PermanentStorageHealth } from '../utils/permanentMemoryBackup';
 
 export type GeminiConnectionSnapshot = ServerHealthSnapshot;
 export type BackendHealthSnapshot = ServerHealthSnapshot;
@@ -74,6 +77,7 @@ interface ZoniSettingsModalProps {
   onToggleLiveMode?: () => void;
   onOpenBatterySettings?: () => void;
   onRequestMicPermission?: () => void;
+  onOpenArchiveDrawer?: () => void;
 }
 
 export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
@@ -102,6 +106,7 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
   onToggleLiveMode,
   onOpenBatterySettings,
   onRequestMicPermission,
+  onOpenArchiveDrawer,
 }) => {
   const [isEditingCustom, setIsEditingCustom] = useState(false);
   const [customInput, setCustomInput] = useState(selectedAffectionName || 'Boss');
@@ -113,10 +118,22 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
   const [keyBusy, setKeyBusy] = useState(false);
   const [keyFeedback, setKeyFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const [keyStatusVersion, setKeyStatusVersion] = useState(0);
+  const [archiveHealth, setArchiveHealth] = useState<PermanentStorageHealth | null>(null);
 
   useEffect(() => {
     setCustomInput(selectedAffectionName || 'Boss');
   }, [selectedAffectionName]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let mounted = true;
+    void getPermanentStorageHealth().then((h) => {
+      if (mounted) setArchiveHealth(h);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [isOpen]);
 
   useEffect(() => {
     if (wakeWordStatus?.wakePhrase) {
@@ -1148,6 +1165,64 @@ export const ZoniSettingsModal: React.FC<ZoniSettingsModalProps> = ({
                   <span>OPEN ACCESSIBILITY SETTINGS</span>
                 </button>
               </div>
+            )}
+          </section>
+
+          {/* Permanent Conversation Memory & Encrypted Backup Summary */}
+          <section
+            data-testid="settings-permanent-memory-section"
+            className="p-3.5 sm:p-4 rounded-xl bg-slate-900/70 border border-cyan-500/25 space-y-2.5"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Database className="w-4 h-4 text-cyan-400" />
+                <h4 className="font-sci-fi text-xs font-bold tracking-wider text-cyan-200">
+                  PERMANENT CONVERSATION MEMORY &amp; BACKUP
+                </h4>
+              </div>
+              <span className="text-[10px] font-mono text-emerald-300 font-bold">
+                NO AUTO-DELETE
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-[11px] font-mono">
+              <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800">
+                <div className="text-[10px] text-slate-400">ARCHIVED TURNS</div>
+                <div className="text-cyan-200 font-bold">
+                  {archiveHealth?.totalConversations ?? 0}
+                </div>
+              </div>
+              <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800">
+                <div className="text-[10px] text-slate-400">LONG-TERM FACTS</div>
+                <div className="text-pink-200 font-bold">
+                  {archiveHealth?.totalMemories ?? 0}
+                </div>
+              </div>
+              <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800 col-span-2 sm:col-span-1">
+                <div className="text-[10px] text-slate-400">PROTECTION</div>
+                <div className="text-emerald-300 font-bold truncate">
+                  {archiveHealth?.encryptedAtRest ? 'KEYSTORE AES-256' : 'AES-256 BACKUP'}
+                </div>
+              </div>
+            </div>
+
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Every finalized voice and text conversation is permanently saved on-device without a
+              500-message cap. Local storage alone cannot survive app uninstall or Clear Data —
+              export an encrypted <span className="text-cyan-300 font-mono">.zonibak</span> archive
+              before reinstalling or switching phones.
+            </p>
+
+            {onOpenArchiveDrawer && (
+              <button
+                type="button"
+                data-testid="settings-open-archive-button"
+                onClick={onOpenArchiveDrawer}
+                className="px-3.5 py-2 rounded-lg border border-cyan-500/40 bg-cyan-950/50 hover:bg-cyan-900/60 text-cyan-100 font-hud text-xs font-bold tracking-wider flex items-center gap-2 cursor-pointer"
+              >
+                <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                <span>OPEN ARCHIVE SEARCH &amp; ENCRYPTED BACKUP</span>
+              </button>
             )}
           </section>
         </div>

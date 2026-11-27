@@ -93,9 +93,20 @@ export interface NativeAndroidBridge {
   getGeminiApiKeyForRequest?: () => string;
   openOnboardingWizard?: () => boolean;
 
-  // Local Conversation Memory & Encrypted Long-Term Memory (Room v2)
+  // Permanent Local Conversation Memory & Encrypted Long-Term Memory (Room v3)
   saveLocalConversationMessage?: (role: string, text: string, language: string) => boolean;
+  saveLocalConversationRecordJson?: (recordJson: string) => string;
   getLocalConversationHistoryJson?: (limit: number, offset: number) => string;
+  searchLocalConversationsJson?: (paramsJson: string) => string;
+  getLocalConversationDatesJson?: (limit: number, offset: number) => string;
+  exportEncryptedBackupJson?: (passphrase: string) => string;
+  restoreEncryptedBackupJson?: (
+    encryptedArchiveJson: string,
+    passphrase: string,
+    replaceExisting: boolean
+  ) => string;
+  getDatabaseHealthJson?: () => string;
+  recoverPendingWritesJson?: () => string;
   getLocalMemorySummaryJson?: () => string;
   recallLocalMemoryJson?: (query: string, language: string) => string;
   buildCompactMemoryContext?: (query: string) => string;
@@ -1129,6 +1140,64 @@ export interface NativeNetworkQualitySnapshot {
   weak: boolean;
 }
 
+export interface NativeConversationRecordDto {
+  id: string;
+  conversationId?: string;
+  role: 'user' | 'assistant';
+  text: string;
+  language: string;
+  createdAtMs: number;
+  inputType?: 'voice' | 'text';
+  commandName?: string;
+  executionStatus?: string;
+  dateBucket?: string;
+}
+
+export interface NativeWriteVerificationDto {
+  success: boolean;
+  verified: boolean;
+  messageId: string;
+  conversationId: string;
+  errorCode: string;
+  errorMessage: string;
+  queuedForRecovery: boolean;
+}
+
+export interface NativeConversationDateBucketDto {
+  dateBucket: string;
+  messageCount: number;
+  firstTimestampMs: number;
+  lastTimestampMs: number;
+}
+
+export interface NativeDatabaseHealthDto {
+  healthy: boolean;
+  integrityStatus: string;
+  lowStorage: boolean;
+  availableBytes: number;
+  pendingRecoveryCount: number;
+  totalConversations: number;
+  totalMemories: number;
+  encryptedAtRest: boolean;
+  lastWriteError: string;
+}
+
+export interface NativeBackupExportDto {
+  success: boolean;
+  encryptedArchiveJson: string;
+  messageCount: number;
+  memoryCount: number;
+  error: string;
+}
+
+export interface NativeBackupRestoreDto {
+  success: boolean;
+  restoredMessages: number;
+  restoredMemories: number;
+  skippedSensitive: number;
+  error: string;
+}
+
 export function saveLocalConversationMessageViaNativeBridge(
   role: 'user' | 'assistant',
   text: string,
@@ -1143,15 +1212,167 @@ export function saveLocalConversationMessageViaNativeBridge(
   }
 }
 
+export function saveLocalConversationRecordViaNativeBridge(record: {
+  id?: string;
+  conversationId?: string;
+  role: 'user' | 'assistant';
+  text: string;
+  language?: string;
+  createdAtMs?: number;
+  inputType?: 'voice' | 'text';
+  commandName?: string;
+  executionStatus?: string;
+}): NativeWriteVerificationDto | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.saveLocalConversationRecordJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.saveLocalConversationRecordJson(JSON.stringify(record)));
+    return {
+      success: Boolean(parsed?.success),
+      verified: Boolean(parsed?.verified),
+      messageId: String(parsed?.messageId || record.id || ''),
+      conversationId: String(parsed?.conversationId || record.conversationId || 'default'),
+      errorCode: String(parsed?.errorCode || ''),
+      errorMessage: String(parsed?.errorMessage || ''),
+      queuedForRecovery: Boolean(parsed?.queuedForRecovery),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function getLocalConversationHistoryViaNativeBridge(
   limit: number = 60,
   offset: number = 0
-): Array<{ id: string; role: 'user' | 'assistant'; text: string; language: string; createdAtMs: number }> | null {
+): NativeConversationRecordDto[] | null {
   const bridge = getNativeAndroidBridge();
   if (!bridge?.getLocalConversationHistoryJson) return null;
   try {
     const parsed = JSON.parse(bridge.getLocalConversationHistoryJson(limit, offset));
-    return Array.isArray(parsed?.messages) ? parsed.messages : [];
+    return Array.isArray(parsed?.messages) ? (parsed.messages as NativeConversationRecordDto[]) : [];
+  } catch {
+    return null;
+  }
+}
+
+export function searchLocalConversationsViaNativeBridge(params: {
+  query?: string;
+  dateBucket?: string;
+  startMs?: number;
+  endMs?: number;
+  inputType?: '' | 'voice' | 'text';
+  limit?: number;
+  offset?: number;
+}): {
+  success: boolean;
+  count: number;
+  hasMore: boolean;
+  dateRangeLabel: string;
+  messages: NativeConversationRecordDto[];
+  error?: string;
+} | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.searchLocalConversationsJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.searchLocalConversationsJson(JSON.stringify(params)));
+    return {
+      success: Boolean(parsed?.success),
+      count: Number(parsed?.count || 0),
+      hasMore: Boolean(parsed?.hasMore),
+      dateRangeLabel: String(parsed?.dateRangeLabel || ''),
+      messages: Array.isArray(parsed?.messages)
+        ? (parsed.messages as NativeConversationRecordDto[])
+        : [],
+      error: typeof parsed?.error === 'string' ? parsed.error : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function getLocalConversationDatesViaNativeBridge(
+  limit: number = 90,
+  offset: number = 0
+): NativeConversationDateBucketDto[] | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getLocalConversationDatesJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.getLocalConversationDatesJson(limit, offset));
+    return Array.isArray(parsed?.dates) ? (parsed.dates as NativeConversationDateBucketDto[]) : [];
+  } catch {
+    return null;
+  }
+}
+
+export function exportEncryptedBackupViaNativeBridge(
+  passphrase: string
+): NativeBackupExportDto | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.exportEncryptedBackupJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.exportEncryptedBackupJson(passphrase));
+    return {
+      success: Boolean(parsed?.success),
+      encryptedArchiveJson: String(parsed?.encryptedArchiveJson || ''),
+      messageCount: Number(parsed?.messageCount || 0),
+      memoryCount: Number(parsed?.memoryCount || 0),
+      error: String(parsed?.error || ''),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function restoreEncryptedBackupViaNativeBridge(
+  encryptedArchiveJson: string,
+  passphrase: string,
+  replaceExisting: boolean = false
+): NativeBackupRestoreDto | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.restoreEncryptedBackupJson) return null;
+  try {
+    const parsed = JSON.parse(
+      bridge.restoreEncryptedBackupJson(encryptedArchiveJson, passphrase, replaceExisting)
+    );
+    return {
+      success: Boolean(parsed?.success),
+      restoredMessages: Number(parsed?.restoredMessages || 0),
+      restoredMemories: Number(parsed?.restoredMemories || 0),
+      skippedSensitive: Number(parsed?.skippedSensitive || 0),
+      error: String(parsed?.error || ''),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function getDatabaseHealthViaNativeBridge(): NativeDatabaseHealthDto | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.getDatabaseHealthJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.getDatabaseHealthJson());
+    return {
+      healthy: Boolean(parsed?.healthy),
+      integrityStatus: String(parsed?.integrityStatus || 'unknown'),
+      lowStorage: Boolean(parsed?.lowStorage),
+      availableBytes: Number(parsed?.availableBytes ?? -1),
+      pendingRecoveryCount: Number(parsed?.pendingRecoveryCount || 0),
+      totalConversations: Number(parsed?.totalConversations || 0),
+      totalMemories: Number(parsed?.totalMemories || 0),
+      encryptedAtRest: Boolean(parsed?.encryptedAtRest),
+      lastWriteError: String(parsed?.lastWriteError || ''),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function recoverPendingWritesViaNativeBridge(): number | null {
+  const bridge = getNativeAndroidBridge();
+  if (!bridge?.recoverPendingWritesJson) return null;
+  try {
+    const parsed = JSON.parse(bridge.recoverPendingWritesJson());
+    return Number(parsed?.recoveredCount || 0);
   } catch {
     return null;
   }
@@ -1179,7 +1400,12 @@ export function getLocalMemorySummaryViaNativeBridge(): {
 export function recallLocalMemoryViaNativeBridge(
   query: string,
   language: string = 'bn-BD'
-): { isMemoryQuery: boolean; handledOffline: boolean; replyText: string } | null {
+): {
+  isMemoryQuery: boolean;
+  handledOffline: boolean;
+  foundEvidence?: boolean;
+  replyText: string;
+} | null {
   const bridge = getNativeAndroidBridge();
   if (!bridge?.recallLocalMemoryJson) return null;
   try {
@@ -1187,6 +1413,8 @@ export function recallLocalMemoryViaNativeBridge(
     return {
       isMemoryQuery: Boolean(parsed?.isMemoryQuery),
       handledOffline: Boolean(parsed?.handledOffline),
+      foundEvidence:
+        typeof parsed?.foundEvidence === 'boolean' ? parsed.foundEvidence : undefined,
       replyText: String(parsed?.replyText || ''),
     };
   } catch {

@@ -106,6 +106,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private var userSpeechTurnId = 1
     private var currentAssistantTurnId = 1
+    private val sessionConversationId = "vm_conv_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}"
     private var initializedConnection = false
     private var pendingVoiceStart = false
     private val persistedLiveMessageIds = HashSet<String>()
@@ -431,12 +432,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 viewModelScope.launch {
                     snapshotMessages.firstOrNull { it.id == userMsgId }?.let { msg ->
                         if (persistedLiveMessageIds.add(msg.id)) {
-                            localMemoryRepository.saveMessage("user", msg.text, msg.lang.code, msg.id, msg.timestampMillis)
+                            localMemoryRepository.saveMessage(
+                                role = "user",
+                                text = msg.text,
+                                language = msg.lang.code,
+                                id = msg.id,
+                                createdAtMs = msg.timestampMillis,
+                                conversationId = sessionConversationId,
+                                inputType = "voice"
+                            )
                         }
                     }
                     snapshotMessages.firstOrNull { it.id == assistantMsgId }?.let { msg ->
                         if (persistedLiveMessageIds.add(msg.id)) {
-                            localMemoryRepository.saveMessage("assistant", msg.text, msg.lang.code, msg.id, msg.timestampMillis)
+                            localMemoryRepository.saveMessage(
+                                role = "assistant",
+                                text = msg.text,
+                                language = msg.lang.code,
+                                id = msg.id,
+                                createdAtMs = msg.timestampMillis,
+                                conversationId = sessionConversationId,
+                                inputType = "voice"
+                            )
                         }
                     }
                 }
@@ -936,7 +953,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 text = text,
                 language = lang.code,
                 id = msgId,
-                createdAtMs = now
+                createdAtMs = now,
+                conversationId = sessionConversationId,
+                inputType = "text"
             )
         }
     }

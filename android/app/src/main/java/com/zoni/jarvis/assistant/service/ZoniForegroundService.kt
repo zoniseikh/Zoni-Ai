@@ -117,6 +117,9 @@ class ZoniForegroundService : Service() {
     @Volatile
     private var lastHandledStopAtMs: Long = 0L
 
+    @Volatile
+    private var activeBackgroundConversationId: String = ""
+
     override fun onCreate() {
         super.onCreate()
         val zoniApp = application as? ZoniApplication
@@ -365,6 +368,7 @@ class ZoniForegroundService : Service() {
 
         lastAcceptedWakeAtMs = nowMs
         backgroundMode = transition.nextMode
+        activeBackgroundConversationId = "bg_conv_${nowMs}_${java.util.UUID.randomUUID().toString().take(6)}"
         pendingInitialWakeCommand = event.remainingCommand.trim()
         suppressedGeminiAudioTurnId = -1
         turnUserTranscripts.clear()
@@ -701,6 +705,7 @@ class ZoniForegroundService : Service() {
 
             is LiveServerEvent.Interrupted -> {
                 if (backgroundMode != BackgroundAssistantMode.CONTINUOUS_COMMAND_MODE) return
+                flushPendingTranscriptsToMemory(executionStatus = "interrupted")
                 liveAudioEngine?.stopAllPlayback()
                 updateSnapshot(
                     listening = false,
@@ -796,6 +801,23 @@ class ZoniForegroundService : Service() {
             return true
         }
 
+        // Historical long-term archive recall BEFORE Gemini answers (15 days, 6 months, years ago)
+        val memoryRepo = (application as? ZoniApplication)?.localMemoryRepository
+        if (memoryRepo != null) {
+            val langCode = preferences.getUserSettingsSync().activeLanguage.code
+            val recall = memoryRepo.tryLocalMemoryRecall(clean, langCode)
+            if (recall.isMemoryQuery && recall.handledOffline && recall.replyText.isNotBlank()) {
+                persistTurnToLocalMemory(
+                    userText = clean,
+                    assistantText = recall.replyText,
+                    commandName = "memory_recall",
+                    executionStatus = if (recall.foundEvidence) "recalled" else "not_found"
+                )
+                suppressGeminiTurnAndSpeakOutcome(turnId, recall.replyText)
+                return true
+            }
+        }
+
         // Direct battery status shortcut
         val directIntent = MobileAssistantEngine.detectAssistantIntent(clean)
         if (directIntent?.type == ActionType.BATTERY) {
@@ -806,7 +828,7 @@ class ZoniForegroundService : Service() {
             } else {
                 "Your battery is currently at ${bat.level}% (${if (bat.charging) "charging" else "not charging"})."
             }
-            persistTurnToLocalMemory(clean, batMsg)
+            persistTurnToLocalMemory(clean, batMsg, commandName = "battery_status", executionStatus = "executed")
             suppressGeminiTurnAndSpeakOutcome(turnId, batMsg)
             return true
         }
@@ -820,6 +842,7 @@ class ZoniForegroundService : Service() {
             LocalRouteDecisionKind.BLOCKED_UNSAFE -> {
                 val msg = finalRoute.blockedReason
                     ?: "এই কাজটির জন্য সরাসরি অনুমোদন প্রয়োজন।"
+                persistTurnToLocalMemory(clean, msg, commandName = "safety_guard", executionStatus = "blocked")
                 suppressGeminiTurnAndSpeakOutcome(turnId, msg)
                 return true
             }
@@ -831,7 +854,7 @@ class ZoniForegroundService : Service() {
                     BengaliDateTimeEngine.DateTimeQueryType.DATE -> BengaliDateTimeEngine.formatBengaliDate()
                     BengaliDateTimeEngine.DateTimeQueryType.WEEKDAY -> BengaliDateTimeEngine.formatBengaliWeekday()
                 }
-                persistTurnToLocalMemory(clean, reply)
+                persistTurnToLocalMemory(clean, reply, commandName = "datetime_${dt.name.lowercase()}", executionStatus = "executed")
                 suppressGeminiTurnAndSpeakOutcome(turnId, reply)
                 return true
             }
@@ -843,7 +866,12 @@ class ZoniForegroundService : Service() {
                     hardwareController.deviceActionExecutor.executeTypedAction(typedReq)
                 }
                 recordFrequentCommandSafe(clean)
-                persistTurnToLocalMemory(clean, result.message)
+                persistTurnToLocalMemory(
+                    userText = clean,
+                    assistantText = result.message,
+                    commandName = typedReq.actionType.name.lowercase(),
+                    executionStatus = if (result.success) "executed" else "failed"
+                )
                 suppressGeminiTurnAndSpeakOutcome(turnId, result.message)
                 return true
             }
@@ -857,7 +885,12 @@ class ZoniForegroundService : Service() {
                             hardwareController.deviceActionExecutor.executeTypedAction(typedReq)
                         }
                         recordFrequentCommandSafe(clean)
-                        persistTurnToLocalMemory(clean, result.message)
+                        persistTurnToLocalMemory(
+                            userText = clean,
+                            assistantText = result.message,
+                            commandName = typedReq.actionType.name.lowercase(),
+                            executionStatus = if (result.success) "executed" else "failed"
+                        )
                         suppressGeminiTurnAndSpeakOutcome(turnId, result.message)
                         return true
                     }
@@ -983,6 +1016,7 @@ class ZoniForegroundService : Service() {
 
     private fun teardownBackgroundLiveAndAudio() {
         cancelConnectTimeout()
+        flushPendingTranscriptsToMemory(executionStatus = "session_ended")
         pendingBackgroundMicStart = false
         pendingInitialWakeCommand = ""
         suppressedGeminiAudioTurnId = -1
@@ -996,6 +1030,22 @@ class ZoniForegroundService : Service() {
         liveClient?.disconnect(clearApiKey = false)
     }
 
+    private fun flushPendingTranscriptsToMemory(executionStatus: String) {
+        val turnIds = (turnUserTranscripts.keys + turnAssistantTranscripts.keys).toSet()
+        for (tid in turnIds) {
+            val uText = turnUserTranscripts.remove(tid).orEmpty()
+            val aText = turnAssistantTranscripts.remove(tid).orEmpty()
+            if (uText.isNotBlank() || aText.isNotBlank()) {
+                persistTurnToLocalMemory(
+                    userText = uText,
+                    assistantText = aText,
+                    commandName = "",
+                    executionStatus = executionStatus
+                )
+            }
+        }
+    }
+
     private suspend fun buildMemoryEnrichedPayload(userText: String): String {
         val repo = (application as? ZoniApplication)?.localMemoryRepository ?: return userText
         return try {
@@ -1006,27 +1056,59 @@ class ZoniForegroundService : Service() {
         }
     }
 
-    private fun persistTurnToLocalMemory(userText: String, assistantText: String) {
+    private fun persistTurnToLocalMemory(
+        userText: String,
+        assistantText: String,
+        commandName: String = "",
+        executionStatus: String = "completed"
+    ) {
         val repo = (application as? ZoniApplication)?.localMemoryRepository ?: return
         val langCode = preferences.getUserSettingsSync().activeLanguage.code
+        val convId = activeBackgroundConversationId.ifBlank {
+            "bg_conv_${System.currentTimeMillis()}"
+        }
         serviceScope.launch {
             try {
                 if (userText.isNotBlank()) {
-                    repo.saveMessage("user", userText, langCode)
+                    val userRes = repo.saveMessageVerified(
+                        role = "user",
+                        text = userText,
+                        language = langCode,
+                        conversationId = convId,
+                        inputType = "voice",
+                        commandName = commandName,
+                        executionStatus = executionStatus
+                    )
+                    if (!userRes.success && userRes.errorCode != "SENSITIVE_OR_EMPTY_BLOCKED") {
+                        Log.w(TAG, "Background user message persistence failed: code=${userRes.errorCode} queued=${userRes.queuedForRecovery}")
+                    }
                 }
                 if (assistantText.isNotBlank()) {
-                    repo.saveMessage("assistant", assistantText, langCode)
+                    val assistantRes = repo.saveMessageVerified(
+                        role = "assistant",
+                        text = assistantText,
+                        language = langCode,
+                        conversationId = convId,
+                        inputType = "voice",
+                        commandName = commandName,
+                        executionStatus = executionStatus
+                    )
+                    if (!assistantRes.success && assistantRes.errorCode != "SENSITIVE_OR_EMPTY_BLOCKED") {
+                        Log.w(TAG, "Background assistant message persistence failed: code=${assistantRes.errorCode} queued=${assistantRes.queuedForRecovery}")
+                    }
                 }
             } catch (_: Exception) {
+                Log.w(TAG, "Background memory persistence encountered an unexpected exception.")
             }
         }
     }
 
     private fun recordFrequentCommandSafe(commandText: String) {
         val repo = (application as? ZoniApplication)?.localMemoryRepository ?: return
+        val convId = activeBackgroundConversationId
         serviceScope.launch {
             try {
-                repo.recordFrequentCommand(commandText)
+                repo.recordFrequentCommand(commandText, sourceConversationId = convId)
             } catch (_: Exception) {
             }
         }
