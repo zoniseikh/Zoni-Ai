@@ -23,6 +23,7 @@ import {
   resampleFloat32Pcm,
   stopAllBrowserSpeech,
 } from './utils/audio';
+import { audioDiagnostics } from './utils/audioDiagnostics';
 import { VoiceLatencyTracker } from './utils/voiceLatency';
 import {
   detectAssistantIntent,
@@ -651,6 +652,12 @@ export default function App() {
   const recentActionDeduplicatorRef = useRef<RecentActionDeduplicator>(
     new RecentActionDeduplicator(5000)
   );
+  // Diagnostic-only WebSocket frame ordering sequence refs (do not alter message processing)
+  const wsFrameSeqRef = useRef<number>(0);
+  const wsDecodeCompletionOrderRef = useRef<number>(0);
+  const wsLastDecodeCompletedSeqRef = useRef<number>(0);
+  const wsAudioEnqueueOrderRef = useRef<number>(0);
+  const wsLastAudioEnqueueSeqRef = useRef<number>(0);
 
   // Latest state refs for WebSocket / Audio callbacks
   const messagesRef = useRef<ChatMessage[]>(messages);
@@ -713,16 +720,53 @@ export default function App() {
         },
         playAudioBase64: async (audioBase64) => {
           if (voiceMutedRef.current) return;
-          liveAudioPlayerRef.current?.playPcmChunk(audioBase64, 24000);
+          const activeSourcesBefore = liveAudioPlayerRef.current?.getActiveSourceCount() ?? 0;
+          const queuedAheadBeforeMs = liveAudioPlayerRef.current?.getQueuedAheadMs() ?? 0;
+          const overlapsLiveAudio =
+            activeSourcesBefore > 0 || queuedAheadBeforeMs > 0 || receivedAudioInTurnRef.current;
+          if (overlapsLiveAudio) {
+            audioDiagnostics.recordTtsOverlap({
+              source: 'streaming_tts_playAudioBase64',
+              activeSourcesBefore,
+              queuedAheadBeforeMs,
+              receivedAudioInLiveTurn: receivedAudioInTurnRef.current,
+              isLiveActive: isLiveActiveRef.current,
+            });
+          }
+          audioDiagnostics.recordAudioChunkReceived(Date.now());
+          liveAudioPlayerRef.current?.playPcmChunk(audioBase64, 24000, 'streaming_tts');
           // Estimate PCM duration (~24kHz 16-bit mono = 48000 bytes/sec) so queued segments serialize cleanly
           const approxBytes = Math.floor((audioBase64.length * 3) / 4);
           const durationMs = Math.max(120, Math.min(12000, Math.round((approxBytes / 48000) * 1000)));
           await new Promise<void>((resolve) => setTimeout(resolve, durationMs));
+          const activeSourcesAfterTimer = liveAudioPlayerRef.current?.getActiveSourceCount() ?? 0;
+          const queuedAheadAfterTimerMs = liveAudioPlayerRef.current?.getQueuedAheadMs() ?? 0;
+          audioDiagnostics.emit(
+            'tts_timer_resolved',
+            {
+              estimatedDurationMs: durationMs,
+              approxBytes,
+              stillPlayingInAudioPlayer: activeSourcesAfterTimer > 0,
+              activeSourceCount: activeSourcesAfterTimer,
+              queuedAheadMs: queuedAheadAfterTimerMs,
+            },
+            { level: activeSourcesAfterTimer > 0 ? 'warn' : 'info' }
+          );
         },
         stopAudioPlayback: () => {
-          liveAudioPlayerRef.current?.stopAll();
+          liveAudioPlayerRef.current?.stopAll('tts_queue_interrupt');
         },
         onSpeakingStateChange: (speaking) => {
+          const prevSpeaking = isAssistantSpeakingRef.current;
+          const activeSourceCount = liveAudioPlayerRef.current?.getActiveSourceCount() ?? 0;
+          const queuedAheadMs = liveAudioPlayerRef.current?.getQueuedAheadMs() ?? 0;
+          audioDiagnostics.recordSpeakingStateTransition({
+            source: 'streaming_tts',
+            prevSpeaking,
+            nextSpeaking: speaking,
+            activeSourceCount,
+            queuedAheadMs,
+          });
           isAssistantSpeakingRef.current = speaking;
           if (speaking) {
             setAssistantState('speaking');
@@ -743,11 +787,30 @@ export default function App() {
   const speakShortLocalConfirmation = useCallback(
     (feedbackText: string) => {
       const clean = (feedbackText || '').trim();
+      const activeSources = liveAudioPlayerRef.current?.getActiveSourceCount() ?? 0;
+      const blockedBySpeaking =
+        isAssistantSpeakingRef.current || Boolean(liveAudioPlayerRef.current?.isPlaying());
       if (!clean || voiceMutedRef.current || !voiceAutoPlayRef.current) return;
-      if (isAssistantSpeakingRef.current || liveAudioPlayerRef.current?.isPlaying()) return;
+      if (blockedBySpeaking) {
+        audioDiagnostics.emit('local_confirmation_skipped_active_audio', {
+          isLiveActive: isLiveActiveRef.current,
+          isAssistantSpeaking: isAssistantSpeakingRef.current,
+          activeSourceCount: activeSources,
+        });
+        return;
+      }
       const apiKey = getGeminiApiKeyForRequest();
       if (!apiKey) return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      audioDiagnostics.emit(
+        'local_confirmation_enqueued',
+        {
+          isLiveActive: isLiveActiveRef.current,
+          receivedAudioInLiveTurn: receivedAudioInTurnRef.current,
+          activeSourceCount: activeSources,
+        },
+        { level: isLiveActiveRef.current ? 'warn' : 'info' }
+      );
       const queue = getStreamingTtsQueue();
       queue.beginTurn();
       queue.enqueue(clean);
@@ -756,7 +819,7 @@ export default function App() {
   );
 
   // Stop any ongoing spoken audio to prevent overlapping duplicate audio
-  const stopAllSpeechPlayback = useCallback(() => {
+  const stopAllSpeechPlayback = useCallback((reason: string = 'unspecified') => {
     stopAllBrowserSpeech();
     if (activeStreamAbortRef.current) {
       try {
@@ -768,9 +831,19 @@ export default function App() {
     }
     streamingTtsQueueRef.current?.interrupt();
     if (liveAudioPlayerRef.current) {
-      liveAudioPlayerRef.current.stopAll();
+      liveAudioPlayerRef.current.stopAll(reason);
     }
+    const prevSpeaking = isAssistantSpeakingRef.current;
     isAssistantSpeakingRef.current = false;
+    if (prevSpeaking) {
+      audioDiagnostics.recordSpeakingStateTransition({
+        source: `stop_all:${reason}`,
+        prevSpeaking,
+        nextSpeaking: false,
+        activeSourceCount: liveAudioPlayerRef.current?.getActiveSourceCount() ?? 0,
+        queuedAheadMs: liveAudioPlayerRef.current?.getQueuedAheadMs() ?? 0,
+      });
+    }
   }, []);
 
   // Clear thinking timeout helper
@@ -1768,7 +1841,7 @@ export default function App() {
             }
             setPendingActionDraft(null);
           }
-          stopAllSpeechPlayback();
+          stopAllSpeechPlayback('cancel_current_task');
           setAssistantState('idle');
           return {
             actionId: req.actionId,
@@ -2557,14 +2630,32 @@ export default function App() {
           }
         };
 
-        const handleAudioChunkEvent = (audioB64: string) => {
+        const handleAudioChunkEvent = (audioB64: string, receivedTs?: number) => {
           clearTurnTimeout();
+          audioDiagnostics.recordAudioChunkReceived(receivedTs ?? Date.now());
           if (!receivedAudioInTurnRef.current) {
             voiceLatencyTrackerRef.current.markStageEnd('first_audible_tts');
             voiceLatencyTrackerRef.current.markStageEnd('voice_response');
           }
           receivedAudioInTurnRef.current = true;
+          const prevSpeaking = isAssistantSpeakingRef.current;
           isAssistantSpeakingRef.current = true;
+          if (!prevSpeaking) {
+            audioDiagnostics.recordSpeakingStateTransition({
+              source: 'live_ws_audio_chunk',
+              prevSpeaking,
+              nextSpeaking: true,
+              activeSourceCount: liveAudioPlayerRef.current?.getActiveSourceCount() ?? 0,
+              queuedAheadMs: liveAudioPlayerRef.current?.getQueuedAheadMs() ?? 0,
+            });
+          }
+          if (streamingTtsQueueRef.current?.isActive()) {
+            audioDiagnostics.recordTtsOverlap({
+              source: 'live_ws_chunk_during_streaming_tts',
+              activeSourceCount: liveAudioPlayerRef.current?.getActiveSourceCount() ?? 0,
+              queuedAheadMs: liveAudioPlayerRef.current?.getQueuedAheadMs() ?? 0,
+            });
+          }
           fastEosDetectorRef.current.reset();
           nearFieldGateRef.current.reset();
           if (pendingChatFallbackRef.current) {
@@ -2575,7 +2666,7 @@ export default function App() {
             (isLiveActiveRef.current || voiceAutoPlayRef.current)
           ) {
             setAssistantState('speaking');
-            liveAudioPlayerRef.current?.playPcmChunk(audioB64, 24000);
+            liveAudioPlayerRef.current?.playPcmChunk(audioB64, 24000, 'live_ws');
           }
         };
 
@@ -2617,7 +2708,7 @@ export default function App() {
 
         const handleInterruptedEvent = () => {
           clearTurnTimeout();
-          stopAllSpeechPlayback();
+          stopAllSpeechPlayback('ws_interrupted');
           isAssistantSpeakingRef.current = false;
           fastEosDetectorRef.current.reset();
           nearFieldGateRef.current.reset();
@@ -2628,10 +2719,30 @@ export default function App() {
 
         const handleTurnCompleteEvent = () => {
           clearTurnTimeout();
+          const turnCompleteTs = Date.now();
+          const prevSpeaking = isAssistantSpeakingRef.current;
+          const activeSourceCount = liveAudioPlayerRef.current?.getActiveSourceCount() ?? 0;
+          const queuedAheadMs = liveAudioPlayerRef.current?.getQueuedAheadMs() ?? 0;
+          audioDiagnostics.recordTurnComplete({
+            turnId: currentTurnIdRef.current,
+            prevSpeaking,
+            activeSourceCount,
+            queuedAheadMs,
+            ts: turnCompleteTs,
+          });
+          audioDiagnostics.recordSpeakingStateTransition({
+            source: 'turn_complete',
+            prevSpeaking,
+            nextSpeaking: false,
+            activeSourceCount,
+            queuedAheadMs,
+            ts: turnCompleteTs,
+          });
           isAssistantSpeakingRef.current = false;
           fastEosDetectorRef.current.reset();
           nearFieldGateRef.current.reset();
           voiceLatencyTrackerRef.current.finishTurn(false);
+          audioDiagnostics.logSessionSummary('turn_complete');
           currentTurnIdRef.current += 1;
           userSpeechTurnIdRef.current += 1;
           receivedAudioInTurnRef.current = false;
@@ -2670,6 +2781,11 @@ export default function App() {
         try {
           const ws = new WebSocket(wsUrl);
           wsRef.current = ws;
+          wsFrameSeqRef.current = 0;
+          wsDecodeCompletionOrderRef.current = 0;
+          wsLastDecodeCompletedSeqRef.current = 0;
+          wsAudioEnqueueOrderRef.current = 0;
+          wsLastAudioEnqueueSeqRef.current = 0;
 
           ws.onopen = () => {
             if (isUnmountedRef.current || wsRef.current !== ws) return;
@@ -2716,11 +2832,51 @@ export default function App() {
 
           ws.onmessage = async (event) => {
             if (isUnmountedRef.current || wsRef.current !== ws) return;
-            wsLastActivityAtRef.current = Date.now();
+            const frameArrivalTs = Date.now();
+            const frameSeq = ++wsFrameSeqRef.current;
+            const payloadType =
+              typeof event.data === 'string'
+                ? 'string'
+                : typeof Blob !== 'undefined' && event.data instanceof Blob
+                ? 'blob'
+                : event.data instanceof ArrayBuffer
+                ? 'arraybuffer'
+                : 'other';
+            const decodeStartTs = Date.now();
+            const decodeStartPerf =
+              typeof performance !== 'undefined' ? performance.now() : decodeStartTs;
+            wsLastActivityAtRef.current = frameArrivalTs;
 
             try {
               if (targetTransport === 'byok_direct') {
                 const decoded = await decodeDirectLiveFrame(event.data);
+                const decodeCompleteTs = Date.now();
+                const decodeDurationMs =
+                  typeof performance !== 'undefined'
+                    ? Math.round((performance.now() - decodeStartPerf) * 100) / 100
+                    : decodeCompleteTs - decodeStartTs;
+                const completionOrder = ++wsDecodeCompletionOrderRef.current;
+                const outOfOrderDecode = frameSeq < wsLastDecodeCompletedSeqRef.current;
+                if (outOfOrderDecode) {
+                  audioDiagnostics.recordFrameOrderAnomaly(
+                    'ws_frame_order_anomaly',
+                    {
+                      transport: 'byok_direct',
+                      payloadType,
+                      frameSeq,
+                      prevMaxCompletedSeq: wsLastDecodeCompletedSeqRef.current,
+                      completionOrder,
+                      arrivalTs: frameArrivalTs,
+                      decodeStartTs,
+                      decodeCompleteTs,
+                      decodeDurationMs,
+                    },
+                    frameSeq
+                  );
+                }
+                if (frameSeq > wsLastDecodeCompletedSeqRef.current) {
+                  wsLastDecodeCompletedSeqRef.current = frameSeq;
+                }
                 if (!decoded) return;
                 const parsedEvents = parseDirectLiveServerMessage(decoded);
 
@@ -2842,7 +2998,46 @@ export default function App() {
                   } else if (ev.type === 'user_transcript' && ev.text) {
                     handleUserTranscriptEvent(ev.text, Boolean(ev.isFinal));
                   } else if (ev.type === 'audio' && ev.audio) {
-                    handleAudioChunkEvent(ev.audio);
+                    const audioEnqueueOrder = ++wsAudioEnqueueOrderRef.current;
+                    const outOfOrderAudio = frameSeq < wsLastAudioEnqueueSeqRef.current;
+                    if (outOfOrderAudio) {
+                      audioDiagnostics.recordFrameOrderAnomaly(
+                        'ws_audio_order_anomaly',
+                        {
+                          transport: 'byok_direct',
+                          payloadType,
+                          frameSeq,
+                          prevMaxAudioFrameSeq: wsLastAudioEnqueueSeqRef.current,
+                          audioEnqueueOrder,
+                          completionOrder,
+                          arrivalTs: frameArrivalTs,
+                          decodeStartTs,
+                          decodeCompleteTs,
+                          decodeDurationMs,
+                        },
+                        frameSeq
+                      );
+                    } else {
+                      audioDiagnostics.emit(
+                        'ws_audio_frame_order',
+                        {
+                          transport: 'byok_direct',
+                          payloadType,
+                          frameSeq,
+                          completionOrder,
+                          audioEnqueueOrder,
+                          arrivalTs: frameArrivalTs,
+                          decodeStartTs,
+                          decodeCompleteTs,
+                          decodeDurationMs,
+                        },
+                        { seq: frameSeq, ts: decodeCompleteTs }
+                      );
+                    }
+                    if (frameSeq > wsLastAudioEnqueueSeqRef.current) {
+                      wsLastAudioEnqueueSeqRef.current = frameSeq;
+                    }
+                    handleAudioChunkEvent(ev.audio, frameArrivalTs);
                   } else if ((ev.type === 'output_transcript' || ev.type === 'text') && ev.text) {
                     handleAssistantTextEvent(ev.text);
                   } else if (ev.type === 'interrupted') {
@@ -2861,6 +3056,32 @@ export default function App() {
                   : event.data instanceof Blob
                   ? await event.data.text()
                   : '';
+              const managedDecodeCompleteTs = Date.now();
+              const managedDecodeDurationMs =
+                typeof performance !== 'undefined'
+                  ? Math.round((performance.now() - decodeStartPerf) * 100) / 100
+                  : managedDecodeCompleteTs - decodeStartTs;
+              const managedCompletionOrder = ++wsDecodeCompletionOrderRef.current;
+              if (frameSeq < wsLastDecodeCompletedSeqRef.current) {
+                audioDiagnostics.recordFrameOrderAnomaly(
+                  'ws_frame_order_anomaly',
+                  {
+                    transport: 'server_managed',
+                    payloadType,
+                    frameSeq,
+                    prevMaxCompletedSeq: wsLastDecodeCompletedSeqRef.current,
+                    completionOrder: managedCompletionOrder,
+                    arrivalTs: frameArrivalTs,
+                    decodeStartTs,
+                    decodeCompleteTs: managedDecodeCompleteTs,
+                    decodeDurationMs: managedDecodeDurationMs,
+                  },
+                  frameSeq
+                );
+              }
+              if (frameSeq > wsLastDecodeCompletedSeqRef.current) {
+                wsLastDecodeCompletedSeqRef.current = frameSeq;
+              }
               if (!rawText) return;
 
               const ev = JSON.parse(rawText);
@@ -3066,7 +3287,45 @@ export default function App() {
               }
 
               if (ev.type === 'audio' && typeof ev.audio === 'string' && ev.audio) {
-                handleAudioChunkEvent(ev.audio);
+                const audioEnqueueOrder = ++wsAudioEnqueueOrderRef.current;
+                if (frameSeq < wsLastAudioEnqueueSeqRef.current) {
+                  audioDiagnostics.recordFrameOrderAnomaly(
+                    'ws_audio_order_anomaly',
+                    {
+                      transport: 'server_managed',
+                      payloadType,
+                      frameSeq,
+                      prevMaxAudioFrameSeq: wsLastAudioEnqueueSeqRef.current,
+                      audioEnqueueOrder,
+                      completionOrder: managedCompletionOrder,
+                      arrivalTs: frameArrivalTs,
+                      decodeStartTs,
+                      decodeCompleteTs: managedDecodeCompleteTs,
+                      decodeDurationMs: managedDecodeDurationMs,
+                    },
+                    frameSeq
+                  );
+                } else {
+                  audioDiagnostics.emit(
+                    'ws_audio_frame_order',
+                    {
+                      transport: 'server_managed',
+                      payloadType,
+                      frameSeq,
+                      completionOrder: managedCompletionOrder,
+                      audioEnqueueOrder,
+                      arrivalTs: frameArrivalTs,
+                      decodeStartTs,
+                      decodeCompleteTs: managedDecodeCompleteTs,
+                      decodeDurationMs: managedDecodeDurationMs,
+                    },
+                    { seq: frameSeq, ts: managedDecodeCompleteTs }
+                  );
+                }
+                if (frameSeq > wsLastAudioEnqueueSeqRef.current) {
+                  wsLastAudioEnqueueSeqRef.current = frameSeq;
+                }
+                handleAudioChunkEvent(ev.audio, frameArrivalTs);
                 return;
               }
 
@@ -3632,7 +3891,7 @@ export default function App() {
           );
 
           if (gateDecision.shouldInterruptAssistant) {
-            stopAllSpeechPlayback();
+            stopAllSpeechPlayback('user_barge_in');
             receivedAudioInTurnRef.current = false;
             setAssistantState('listening');
             if (wsRef.current?.readyState === WebSocket.OPEN && liveTransportModeRef.current === 'server_managed') {
@@ -3793,7 +4052,7 @@ export default function App() {
       });
 
       if (voiceAutoPlay && !voiceMuted) {
-        stopAllSpeechPlayback();
+        stopAllSpeechPlayback('nickname_update');
         sendOverSharedWs({
           type: 'client_text',
           text: `[System directive: The user has chosen their nickname as "${trimmed}". Warmly acknowledge calling them "${trimmed}" in 1 short loving sentence using your Gemini Live voice.]`,
@@ -3827,7 +4086,7 @@ export default function App() {
       });
 
       if (voiceAutoPlay && !voiceMuted) {
-        stopAllSpeechPlayback();
+        stopAllSpeechPlayback('language_switch');
         const promptByLang: Record<string, string> = {
           'bn-BD': `[System directive: The conversation language is now Bengali (বাংলা). Warmly confirm this language change to ${selectedAffectionName} in 1 short, sweet sentence in Bengali using your Gemini Live voice.]`,
           'hi-IN': `[System directive: The conversation language is now Hindi (हिन्दी). Warmly confirm this language change to ${selectedAffectionName} in 1 short, sweet sentence in Hindi using your Gemini Live voice.]`,
@@ -3909,7 +4168,7 @@ export default function App() {
 
       setLatestTranscript(confirmSpeech);
       if (voiceAutoPlay && !voiceMuted) {
-        stopAllSpeechPlayback();
+        stopAllSpeechPlayback('mode_change');
         sendOverSharedWs({
           type: 'client_text',
           text: `[System directive: Companion mode is now ${mode}. Confirm this mode to ${selectedAffectionName} in 1 short sentence using your Gemini Live voice: "${confirmSpeech}"]`,
@@ -3952,7 +4211,7 @@ export default function App() {
       }
 
       setLatestTranscript(voiceNotice);
-      stopAllSpeechPlayback();
+      stopAllSpeechPlayback('voice_change');
 
       // Reconnect shared Live WebSocket with new voice config while preserving resumption handle if supported
       connectSharedLiveWs(true);
@@ -4180,7 +4439,7 @@ export default function App() {
 
       // Unlock audio context on user submit gesture so Gemini Live audio response plays seamlessly
       getAudioContext();
-      stopAllSpeechPlayback();
+      stopAllSpeechPlayback('new_user_message');
       receivedAudioInTurnRef.current = false;
       setAssistantState('thinking');
 
@@ -4292,7 +4551,7 @@ export default function App() {
   // Replay speech audio from transcript (uses active Live WS, Direct BYOK Gemini TTS, or Server /api/tts)
   const handleReplayAudio = async (text: string) => {
     if (vitals.soundFxEnabled) playProceduralSfx('click');
-    stopAllSpeechPlayback();
+    stopAllSpeechPlayback('replay_audio');
 
     if (
       wsRef.current &&
@@ -4318,7 +4577,8 @@ export default function App() {
           voice: vitals.selectedVoice,
           lang: activeLanguage,
         });
-        liveAudioPlayerRef.current?.playPcmChunk(audioB64, 24000);
+        audioDiagnostics.recordAudioChunkReceived(Date.now());
+        liveAudioPlayerRef.current?.playPcmChunk(audioB64, 24000, 'replay_direct_tts');
         setTimeout(() => {
           setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
         }, 1200);
@@ -4349,17 +4609,20 @@ export default function App() {
       }
       const mimeType = typeof data?.mimeType === 'string' ? data.mimeType : 'audio/wav';
       if (/pcm|l16/i.test(mimeType)) {
-        liveAudioPlayerRef.current?.playPcmChunk(data.audio, 24000);
+        audioDiagnostics.recordAudioChunkReceived(Date.now());
+        liveAudioPlayerRef.current?.playPcmChunk(data.audio, 24000, 'replay_server_pcm');
       } else {
         const audioEl = new Audio(`data:${mimeType};base64,${data.audio}`);
         audioEl.onended = () => {
           setAssistantState(isLiveActiveRef.current ? 'listening' : 'idle');
         };
         audioEl.onerror = () => {
-          liveAudioPlayerRef.current?.playPcmChunk(data.audio, 24000);
+          audioDiagnostics.recordAudioChunkReceived(Date.now());
+          liveAudioPlayerRef.current?.playPcmChunk(data.audio, 24000, 'replay_fallback_onerror');
         };
         await audioEl.play().catch(() => {
-          liveAudioPlayerRef.current?.playPcmChunk(data.audio, 24000);
+          audioDiagnostics.recordAudioChunkReceived(Date.now());
+          liveAudioPlayerRef.current?.playPcmChunk(data.audio, 24000, 'replay_fallback_play_catch');
         });
       }
       setTimeout(() => {
@@ -4376,7 +4639,7 @@ export default function App() {
   // Interruption
   const handleInterrupt = () => {
     clearTurnTimeout();
-    stopAllSpeechPlayback();
+    stopAllSpeechPlayback('user_interrupt_button');
     sendOverSharedWs({ type: 'interrupt' });
     setAssistantState(isLiveActive ? 'listening' : 'idle');
   };
@@ -4417,7 +4680,7 @@ export default function App() {
     setVoiceMuted(nextMute);
     localStorage.setItem('zoni_voice_muted', String(nextMute));
     if (nextMute) {
-      stopAllSpeechPlayback();
+      stopAllSpeechPlayback('voice_muted');
     }
   };
 

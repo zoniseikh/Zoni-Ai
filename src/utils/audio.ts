@@ -2,6 +2,8 @@
  * Audio processing and futuristic Web Audio synthesizer utilities for Zoni Jarvis
  */
 
+import { audioDiagnostics } from './audioDiagnostics';
+
 let sharedAudioContext: AudioContext | null = null;
 let sharedAnalyser: AnalyserNode | null = null;
 let sharedAnalyserConnected = false;
@@ -11,14 +13,27 @@ export function getAudioContext(): AudioContext {
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
     try {
       sharedAudioContext = new AudioContextClass({ latencyHint: 'interactive' });
-    } catch {
+    } catch (err) {
+      audioDiagnostics.recordAudioContextError('create_interactive_fallback', err);
       sharedAudioContext = new AudioContextClass();
     }
+    audioDiagnostics.emit('audiocontext_created', {
+      sampleRate: sharedAudioContext.sampleRate,
+      state: sharedAudioContext.state,
+      baseLatencyMs:
+        typeof (sharedAudioContext as any).baseLatency === 'number'
+          ? Math.round((sharedAudioContext as any).baseLatency * 100000) / 100
+          : null,
+    });
     sharedAnalyser = null;
     sharedAnalyserConnected = false;
   }
   if (sharedAudioContext.state === 'suspended') {
-    sharedAudioContext.resume().catch(() => {});
+    sharedAudioContext.resume().catch((err) => {
+      audioDiagnostics.recordAudioContextError('getAudioContext_resume', err, {
+        ctxState: sharedAudioContext?.state ?? 'unknown',
+      });
+    });
   }
   return sharedAudioContext;
 }
@@ -653,6 +668,9 @@ export class LiveAudioPlayer {
   private analyser: AnalyserNode | null = null;
   private nextPlayTime: number = 0;
   private activeSources: AudioBufferSourceNode[] = [];
+  private diagChunkSeq: number = 0;
+  private diagLastChunkArrivalTs: number | null = null;
+  private diagHasScheduledChunk: boolean = false;
 
   private ensureContext(): { ctx: AudioContext; analyser: AnalyserNode } {
     if (!this.audioCtx || this.audioCtx.state === 'closed') {
@@ -671,7 +689,11 @@ export class LiveAudioPlayer {
       }
     }
     if (this.audioCtx.state === 'suspended') {
-      this.audioCtx.resume().catch(() => {});
+      this.audioCtx.resume().catch((err) => {
+        audioDiagnostics.recordAudioContextError('ensureContext_resume', err, {
+          ctxState: this.audioCtx?.state ?? 'unknown',
+        });
+      });
     }
     return { ctx: this.audioCtx, analyser: this.analyser };
   }
@@ -680,41 +702,173 @@ export class LiveAudioPlayer {
     return this.activeSources.length > 0;
   }
 
-  public playPcmChunk(base64Pcm: string, sampleRate = 24000) {
+  public getActiveSourceCount(): number {
+    return this.activeSources.length;
+  }
+
+  public getQueuedAheadMs(): number {
+    if (!this.audioCtx) return 0;
+    const remainingSec = this.nextPlayTime - this.audioCtx.currentTime;
+    return remainingSec > 0 ? Math.round(remainingSec * 100000) / 100 : 0;
+  }
+
+  public playPcmChunk(base64Pcm: string, sampleRate = 24000, sourceTag = 'unknown') {
+    const arrivalTs = Date.now();
+    const seq = ++this.diagChunkSeq;
+    const interChunkArrivalMs =
+      this.diagLastChunkArrivalTs !== null ? arrivalTs - this.diagLastChunkArrivalTs : null;
+    this.diagLastChunkArrivalTs = arrivalTs;
+
+    let stage = 'ensure_context';
+    let decodedByteLength = 0;
+    let isOddByteLength = false;
+    let hasRiffHeader = false;
+
     try {
       const { ctx, analyser } = this.ensureContext();
+      stage = 'base64_decode';
       const binary = atob(base64Pcm);
+      decodedByteLength = binary.length;
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
       }
+
+      isOddByteLength = bytes.byteLength % 2 !== 0;
+      hasRiffHeader =
+        bytes.byteLength >= 4 &&
+        bytes[0] === 0x52 &&
+        bytes[1] === 0x49 &&
+        bytes[2] === 0x46 &&
+        bytes[3] === 0x46;
+
+      if (bytes.byteLength === 0) {
+        audioDiagnostics.recordInvalidPcmChunk({
+          seq,
+          sourceTag,
+          reason: 'empty_pcm_chunk',
+          byteLength: 0,
+          sampleRate,
+          channels: 1,
+          isOddByteLength: false,
+          hasRiffHeader: false,
+          ts: arrivalTs,
+        });
+      } else if (isOddByteLength) {
+        audioDiagnostics.emit(
+          'pcm_odd_byte_length_detected',
+          {
+            sourceTag,
+            byteLength: bytes.byteLength,
+            sampleRate,
+            channels: 1,
+            hasRiffHeader,
+          },
+          { level: 'warn', seq, ts: arrivalTs }
+        );
+      }
+
+      stage = 'pcm_int16_conversion';
       const int16Array = new Int16Array(bytes.buffer);
       const float32Array = new Float32Array(int16Array.length);
       for (let i = 0; i < int16Array.length; i++) {
         float32Array[i] = int16Array[i] / 32768.0;
       }
-      if (float32Array.length === 0) return;
+      if (float32Array.length === 0) {
+        if (bytes.byteLength > 0) {
+          audioDiagnostics.recordInvalidPcmChunk({
+            seq,
+            sourceTag,
+            reason: 'zero_float32_samples',
+            byteLength: bytes.byteLength,
+            sampleRate,
+            channels: 1,
+            isOddByteLength,
+            hasRiffHeader,
+            ts: arrivalTs,
+          });
+        }
+        return;
+      }
 
+      stage = 'audiobuffer_create';
       const buffer = ctx.createBuffer(1, float32Array.length, sampleRate);
       buffer.getChannelData(0).set(float32Array);
 
+      stage = 'schedule_source';
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(analyser);
 
       const currentTime = ctx.currentTime;
+      const prevNextPlayTime = this.nextPlayTime;
       const startTime = Math.max(currentTime, this.nextPlayTime);
+      const isLateChunk =
+        this.diagHasScheduledChunk && prevNextPlayTime > 0 && currentTime > prevNextPlayTime;
+      const schedulingGapMs = isLateChunk ? (currentTime - prevNextPlayTime) * 1000 : 0;
+      const queuedAheadMs = Math.max(0, (prevNextPlayTime - currentTime) * 1000);
+      const durationMs = buffer.duration * 1000;
+      const isTinyChunk = durationMs < 20;
+
       source.start(startTime);
       this.nextPlayTime = startTime + buffer.duration;
+      this.diagHasScheduledChunk = true;
 
       this.activeSources.push(source);
+      audioDiagnostics.recordValidPcmScheduled({
+        seq,
+        sourceTag,
+        byteLength: bytes.byteLength,
+        sampleRate,
+        channels: buffer.numberOfChannels,
+        durationMs,
+        isTinyChunk,
+        hasRiffHeader,
+        ctxState: ctx.state,
+        ctxSampleRate: ctx.sampleRate,
+        ctxCurrentTimeSec: currentTime,
+        prevNextPlayTimeSec: prevNextPlayTime,
+        scheduledStartTimeSec: startTime,
+        newNextPlayTimeSec: this.nextPlayTime,
+        interChunkArrivalMs,
+        schedulingGapMs,
+        isLateChunk,
+        queuedAheadMs,
+        queueDepth: this.activeSources.length,
+        ts: arrivalTs,
+      });
+
       source.onended = () => {
         const idx = this.activeSources.indexOf(source);
         if (idx !== -1) {
           this.activeSources.splice(idx, 1);
         }
+        if (this.activeSources.length === 0) {
+          audioDiagnostics.recordPlaybackDrained({
+            ctxCurrentTimeSec: this.audioCtx?.currentTime ?? 0,
+          });
+        }
       };
     } catch (e) {
+      audioDiagnostics.recordInvalidPcmChunk({
+        seq,
+        sourceTag,
+        reason: stage,
+        byteLength: decodedByteLength,
+        sampleRate,
+        channels: 1,
+        isOddByteLength,
+        hasRiffHeader,
+        errorName: e instanceof Error ? e.name : 'Error',
+        errorMessage: e instanceof Error ? e.message : String(e),
+        ts: arrivalTs,
+      });
+      if (stage === 'ensure_context' || stage === 'audiobuffer_create') {
+        audioDiagnostics.recordAudioContextError(stage, e, {
+          sampleRate,
+          byteLength: decodedByteLength,
+        });
+      }
       console.error('Error playing raw PCM chunk:', e);
     }
   }
@@ -738,6 +892,11 @@ export class LiveAudioPlayer {
         source.onended = () => {
           const idx = this.activeSources.indexOf(source);
           if (idx !== -1) this.activeSources.splice(idx, 1);
+          if (this.activeSources.length === 0) {
+            audioDiagnostics.recordPlaybackDrained({
+              ctxCurrentTimeSec: this.audioCtx?.currentTime ?? 0,
+            });
+          }
         };
       });
     } catch (e) {
@@ -745,7 +904,25 @@ export class LiveAudioPlayer {
     }
   }
 
-  public stopAll() {
+  public stopAll(reason: string = 'unspecified') {
+    const activeCount = this.activeSources.length;
+    const ctxCurrentTime = this.audioCtx?.currentTime ?? 0;
+    const remainingScheduledMs =
+      this.audioCtx && this.nextPlayTime > ctxCurrentTime
+        ? (this.nextPlayTime - ctxCurrentTime) * 1000
+        : 0;
+    const wasPlaying = activeCount > 0;
+    const interruptedActiveResponse = wasPlaying || remainingScheduledMs > 0;
+
+    audioDiagnostics.recordAudioStop({
+      reason,
+      activeSourceCount: activeCount,
+      wasPlaying,
+      ctxCurrentTimeSec: ctxCurrentTime,
+      remainingScheduledMs,
+      interruptedActiveResponse,
+    });
+
     for (const src of this.activeSources) {
       try {
         src.stop();
@@ -755,6 +932,7 @@ export class LiveAudioPlayer {
       }
     }
     this.activeSources = [];
+    this.diagHasScheduledChunk = false;
     if (this.audioCtx) {
       this.nextPlayTime = this.audioCtx.currentTime;
     }

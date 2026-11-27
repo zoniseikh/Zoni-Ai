@@ -6,6 +6,8 @@
  * sentence boundaries natural and supporting instant user barge-in interruption.
  */
 
+import { audioDiagnostics } from './audioDiagnostics';
+
 const COMMON_ABBREVIATIONS = new Set([
   'dr.',
   'mr.',
@@ -142,11 +144,17 @@ export interface StreamingTtsQueueCallbacks {
  */
 export class StreamingTtsQueue {
   private generationId = 0;
-  private queue: Array<{ text: string; audioPromise: Promise<string | null> }> = [];
+  private queue: Array<{
+    text: string;
+    audioPromise: Promise<string | null>;
+    enqueueTs: number;
+    segmentSeq: number;
+  }> = [];
   private draining = false;
   private activeAbortController: AbortController | null = null;
   private turnStartMs = 0;
   private emittedFirstAudible = false;
+  private diagSegmentSeq = 0;
 
   constructor(
     private readonly callbacks: StreamingTtsQueueCallbacks,
@@ -174,19 +182,32 @@ export class StreamingTtsQueue {
     }
     const signal = this.activeAbortController.signal;
     const currentGen = this.generationId;
+    const enqueueTs = Date.now();
+    const segmentSeq = ++this.diagSegmentSeq;
 
     // Kick off synthesis immediately (prefetching in order) so segment N+1 is ready as N finishes
     const audioPromise = this.callbacks
       .synthesizeSegment(clean, signal)
       .catch(() => null);
 
-    this.queue.push({ text: clean, audioPromise });
+    this.queue.push({ text: clean, audioPromise, enqueueTs, segmentSeq });
+    audioDiagnostics.emit(
+      'tts_queue_enqueue',
+      {
+        generationId: currentGen,
+        queueLength: this.queue.length,
+        draining: this.draining,
+      },
+      { seq: segmentSeq, ts: enqueueTs }
+    );
     if (!this.draining) {
       void this.drain(currentGen);
     }
   }
 
   public interrupt(): void {
+    const droppedCount = this.queue.length;
+    const wasDraining = this.draining;
     this.generationId += 1;
     this.queue = [];
     if (this.activeAbortController) {
@@ -196,6 +217,17 @@ export class StreamingTtsQueue {
         // ignore abort errors
       }
       this.activeAbortController = null;
+    }
+    if (droppedCount > 0 || wasDraining) {
+      audioDiagnostics.emit(
+        'tts_queue_interrupt',
+        {
+          newGenerationId: this.generationId,
+          droppedCount,
+          wasDraining,
+        },
+        { level: 'warn' }
+      );
     }
     this.callbacks.stopAudioPlayback();
     this.callbacks.onSpeakingStateChange?.(false);
@@ -212,8 +244,21 @@ export class StreamingTtsQueue {
       while (this.queue.length > 0 && this.generationId === expectedGen) {
         const item = this.queue.shift();
         if (!item) continue;
+        const dequeueTs = Date.now();
 
         const audioBase64 = await item.audioPromise;
+        const synthReadyTs = Date.now();
+        audioDiagnostics.emit(
+          'tts_queue_dequeue',
+          {
+            generationId: expectedGen,
+            queueLengthRemaining: this.queue.length,
+            synthWaitMs: Math.max(0, synthReadyTs - item.enqueueTs),
+            dequeueToReadyMs: Math.max(0, synthReadyTs - dequeueTs),
+            hasAudio: Boolean(audioBase64),
+          },
+          { seq: item.segmentSeq, ts: dequeueTs }
+        );
         if (this.generationId !== expectedGen) break;
         if (!audioBase64) continue;
 
@@ -224,7 +269,26 @@ export class StreamingTtsQueue {
           this.callbacks.onFirstAudibleSegment?.(item.text, elapsed);
         }
 
+        const playStartTs = Date.now();
+        audioDiagnostics.emit(
+          'tts_segment_play_start',
+          {
+            generationId: expectedGen,
+            queueLengthRemaining: this.queue.length,
+          },
+          { seq: item.segmentSeq, ts: playStartTs }
+        );
         await this.callbacks.playAudioBase64(audioBase64);
+        const playEndTs = Date.now();
+        audioDiagnostics.emit(
+          'tts_segment_play_complete',
+          {
+            generationId: expectedGen,
+            playDurationMs: Math.max(0, playEndTs - playStartTs),
+            queueLengthRemaining: this.queue.length,
+          },
+          { seq: item.segmentSeq, ts: playEndTs }
+        );
         if (this.generationId !== expectedGen) break;
       }
     } finally {

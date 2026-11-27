@@ -27,6 +27,9 @@ import {
 } from './bengaliDateTime';
 import { sanitizeGeminiSecret } from './apiConfig';
 import { StreamingSentenceChunker } from './streamingTts';
+import { audioDiagnostics } from './audioDiagnostics';
+
+let lastObservedLiveAudioMime: string | null = null;
 
 const CITY_TIMEZONE_MAP: Record<string, string> = {
   kolkata: 'Asia/Kolkata',
@@ -1348,10 +1351,20 @@ export async function synthesizeDirectGeminiTts(
     lang
   );
 
-  const audioBase64 = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  const inlineData = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+  const audioBase64 = inlineData?.data;
   if (typeof audioBase64 !== 'string' || !audioBase64) {
     throw new Error('Gemini TTS did not return audio data.');
   }
+  const mimeType = typeof inlineData?.mimeType === 'string' ? inlineData.mimeType : 'missing';
+  audioDiagnostics.emit(
+    'tts_direct_response_meta',
+    {
+      mimeType,
+      approxByteLength: Math.floor((audioBase64.length * 3) / 4),
+    },
+    { level: /^audio\/pcm/i.test(mimeType) ? 'info' : 'warn' }
+  );
   return audioBase64;
 }
 
@@ -1659,6 +1672,20 @@ export function parseDirectLiveServerMessage(
     if (Array.isArray(parts)) {
       for (const part of parts) {
         if (typeof part?.inlineData?.data === 'string' && part.inlineData.data.length > 0) {
+          const mimeType =
+            typeof part?.inlineData?.mimeType === 'string' ? part.inlineData.mimeType : 'missing';
+          const expectedPcm24k = /^audio\/pcm\s*;\s*rate=24000$/i.test(mimeType);
+          if (!expectedPcm24k || lastObservedLiveAudioMime !== mimeType) {
+            lastObservedLiveAudioMime = mimeType;
+            audioDiagnostics.emit(
+              expectedPcm24k ? 'live_inline_audio_mime' : 'live_inline_audio_mime_unexpected',
+              {
+                mimeType,
+                approxByteLength: Math.floor((part.inlineData.data.length * 3) / 4),
+              },
+              { level: expectedPcm24k ? 'info' : 'warn' }
+            );
+          }
           events.push({ type: 'audio', audio: part.inlineData.data });
         }
       }
